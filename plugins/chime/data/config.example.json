@@ -1,9 +1,0 @@
-{
-  "enabled": false,
-  "wav_path": "",
-  "min_seconds": 8,
-  "cooldown_seconds": 3,
-  "channels": [],
-  "log": "",
-  "sound_path": ""
-}

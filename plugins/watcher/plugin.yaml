@@ -1,5 +1,0 @@
-id: watcher
-name: 递话监听
-description: 两路盯着姐妹之间的通道——信匣有新信就记账，递出去的话没被取走就判定桥断
-version: 0.1.0
-apiVersion: "1"

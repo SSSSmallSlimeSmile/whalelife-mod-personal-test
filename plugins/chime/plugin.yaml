@@ -1,5 +1,0 @@
-id: chime
-name: 提示音
-description: 一轮任务跑完、回复真的发出后，在宿主电脑上响一声
-version: 0.1.0
-apiVersion: "1"
