@@ -1,7 +1,16 @@
 diff --git a/core/plugin-process.ts b/core/plugin-process.ts
-index bb49f28..d02c6e2 100644
+index bb49f28..4f4fd95 100644
 --- a/core/plugin-process.ts
 +++ b/core/plugin-process.ts
+@@ -8,7 +8,7 @@ import { PluginRPC } from "./plugin-rpc.ts";
+ import { forwardPluginHttp, type PluginHttpEndpoint } from "./plugin-http-bridge.ts";
+ 
+ export type PluginRuntimeOptions = { startupTimeoutMs?: number; callTimeoutMs?: number; heartbeatTimeoutMs?: number; stopTimeoutMs?: number; maxOldGenerationSizeMb?: number };
+-const defaults = { startupTimeoutMs: 15000, callTimeoutMs: 600000, heartbeatTimeoutMs: 5000, stopTimeoutMs: 1000, maxOldGenerationSizeMb: 256 };
++const defaults = { startupTimeoutMs: 15000, callTimeoutMs: 600000, heartbeatTimeoutMs: 20000, stopTimeoutMs: 1000, maxOldGenerationSizeMb: 256 };
+ export function pluginRuntimeOptions(input: PluginRuntimeOptions = {}) {
+   const result = { ...defaults };
+   for (const key of Object.keys(defaults) as Array<keyof typeof defaults>) if (input[key] !== undefined) {
 @@ -23,6 +23,7 @@ export class PluginProcess {
    private child: ChildProcess;
    private peer: PluginRPC;

@@ -92,13 +92,13 @@ copy plugins\watcher\data\config.example.json plugins\watcher\data\config.json
 
 | 文件 | 内容 | 基线 |
 |---|---|---|
-| `all-20261117.patch` | 全部改动，202,898 字节，44 文件 | `2ee7b09` |
-| `packages/01-generic.patch` | 只含插件看门狗（通用，谁都能用） | 同上 |
-| `packages/02-local.patch` | 其余全部（本地扩展） | 同上 |
+| `all-20261118.patch` | 全部改动，201,024 字节，34 文件 | `2ee7b09` |
+| `packages/01-generic.patch` | 只含插件看门狗（通用，谁都能用），3,126 字节 | 同上 |
+| `packages/02-local.patch` | 其余全部（本地扩展），197,898 字节，33 文件 | 同上 |
 
 `all` 就是两份包首尾拼接，应用一份即可。三份都在 `2ee7b09` 干净树上 `git apply --check` 通过。
 
-**注意**：这批量补丁截止到 2026-11-17，之后的改动（ENV 引用、念话按钮、账本插件化等）还没重打。
+**注意**：补丁截止 2026-11-18 01:30，含把密钥挪进环境变量的 ENV 引用、聊天页念话按钮、账本插件化、插件页若干修复。不含 10 个一次性调试脚本（`tools/kan-edit-*`、scripts/*-20261115.mjs 等），它们仍在本地仓库里，但没打进补丁，作者那边不需要。
 
 ---
 

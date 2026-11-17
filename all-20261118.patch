@@ -1,7 +1,16 @@
 diff --git a/core/plugin-process.ts b/core/plugin-process.ts
-index bb49f28..d02c6e2 100644
+index bb49f28..4f4fd95 100644
 --- a/core/plugin-process.ts
 +++ b/core/plugin-process.ts
+@@ -8,7 +8,7 @@ import { PluginRPC } from "./plugin-rpc.ts";
+ import { forwardPluginHttp, type PluginHttpEndpoint } from "./plugin-http-bridge.ts";
+ 
+ export type PluginRuntimeOptions = { startupTimeoutMs?: number; callTimeoutMs?: number; heartbeatTimeoutMs?: number; stopTimeoutMs?: number; maxOldGenerationSizeMb?: number };
+-const defaults = { startupTimeoutMs: 15000, callTimeoutMs: 600000, heartbeatTimeoutMs: 5000, stopTimeoutMs: 1000, maxOldGenerationSizeMb: 256 };
++const defaults = { startupTimeoutMs: 15000, callTimeoutMs: 600000, heartbeatTimeoutMs: 20000, stopTimeoutMs: 1000, maxOldGenerationSizeMb: 256 };
+ export function pluginRuntimeOptions(input: PluginRuntimeOptions = {}) {
+   const result = { ...defaults };
+   for (const key of Object.keys(defaults) as Array<keyof typeof defaults>) if (input[key] !== undefined) {
 @@ -23,6 +23,7 @@ export class PluginProcess {
    private child: ChildProcess;
    private peer: PluginRPC;
@@ -52,6 +61,229 @@ index 07b8678..40694e8 100644
 +chrome_err.txt
 +tests/*.live.out.txt
 +cdp_dump*.ps1
+diff --git a/cdp_chrome.cjs b/cdp_chrome.cjs
+new file mode 100644
+index 0000000..d984a12
+--- /dev/null
++++ b/cdp_chrome.cjs
+@@ -0,0 +1,59 @@
++// 常驻无头 Chrome 管理：node cdp_chrome.cjs start|status|stop [port]
++const { spawn, execSync } = require('child_process');
++const fs = require('fs');
++const path = require('path');
++
++const CHROME = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
++const cmd = (process.argv[2] || 'status').toLowerCase();
++const port = parseInt(process.argv[3] || '9222', 10);
++const prof = path.join(__dirname, 'cdp_prof_' + port);
++
++const sleep = ms => new Promise(r => setTimeout(r, ms));
++
++async function version() {
++  try {
++    const r = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(3000) });
++    return await r.json();
++  } catch (_) { return null; }
++}
++
++async function handleStart() {
++  const v0 = await version();
++  if (v0) {
++    console.log(`already running on ${port}: ${v0['Browser']}`);
++    return;
++  }
++  fs.mkdirSync(prof, { recursive: true });
++  const child = spawn(CHROME, [
++    '--headless=new',
++    '--remote-debugging-port=' + port,
++    '--remote-debugging-address=127.0.0.1',
++    '--disable-gpu',
++    '--no-first-run', '--no-default-browser-check', '--noerrdialogs',
++    '--disable-background-timer-throttling',
++    '--user-data-dir=' + prof,
++    'about:blank',
++  ], { detached: true, stdio: 'ignore' });
++  child.unref();
++  console.log('spawned pid=' + child.pid);
++
++  for (let i = 0; i < 40; i++) {
++    await sleep(250);
++    const v = await version();
++    if (v) { console.log(`up on ${port}: ${v['Browser']}`); return; }
++  }
++  console.log('TIMEOUT: port never opened');
++  process.exitCode = 1;
++}
++
++if (cmd === 'start') handleStart();
++else if (cmd === 'status') {
++  version().then(v => console.log(v ? `up ${port}: ${v['Browser']}\nws: ${v.webSocketDebuggerUrl}` : `down ${port}`));
++}
++else if (cmd === 'stop') {
++  try {
++    execSync(`powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \\"Name='chrome.exe'\\" | Where-Object { $_.CommandLine -like '*cdp_prof_${port}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"`, { stdio: 'ignore' });
++    console.log('stopped ' + port);
++  } catch (e) { console.log('stop err ' + e.message); }
++}
++else console.log('usage: start|status|stop [port]');
+diff --git a/cdp_fetch.cjs b/cdp_fetch.cjs
+new file mode 100644
+index 0000000..056e6a7
+--- /dev/null
++++ b/cdp_fetch.cjs
+@@ -0,0 +1,79 @@
++// 用无头 Chrome + CDP 取渲染后的 DOM。用法:
++//   node cdp_fetch.js <url> <outfile> [port] [waitMs]
++const { spawn } = require('child_process');
++const fs = require('fs');
++const path = require('path');
++
++const CHROME = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
++const url = process.argv[2];
++const out = process.argv[3] || 'page_dump.html';
++const port = parseInt(process.argv[4] || '9500', 10);
++const waitMs = parseInt(process.argv[5] || '9000', 10);
++
++if (!url) { console.error('need url'); process.exit(2); }
++
++const prof = path.join(__dirname, 'cdp_prof_' + port);
++const child = spawn(CHROME, [
++  '--headless=new',
++  '--remote-debugging-port=' + port,
++  '--disable-gpu', '--no-sandbox',
++  '--no-first-run', '--noerrdialogs',
++  '--user-data-dir=' + prof,
++  url,
++], { stdio: 'ignore', detached: false });
++
++const sleep = ms => new Promise(r => setTimeout(r, ms));
++
++async function getWs() {
++  for (let i = 0; i < 60; i++) {
++    await sleep(300);
++    try {
++      const r = await fetch(`http://127.0.0.1:${port}/json/list`);
++      const list = await r.json();
++      const pg = list.find(t => t.type === 'page' && t.webSocketDebuggerUrl);
++      if (pg) return pg.webSocketDebuggerUrl;
++    } catch (_) {}
++  }
++  return null;
++}
++
++(async () => {
++  try {
++    const wsUrl = await getWs();
++    if (!wsUrl) { console.error('no cdp target'); process.exitCode = 1; return; }
++
++    const ws = new WebSocket(wsUrl);
++    await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
++
++    const pending = new Map();
++    ws.onmessage = ev => {
++      const m = JSON.parse(ev.data);
++      if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); }
++    };
++    const send = (id, method, params) => new Promise(res => {
++      pending.set(id, res);
++      ws.send(JSON.stringify({ id, method, params }));
++    });
++
++    await sleep(waitMs);
++    const r = await send(1, 'Runtime.evaluate', {
++      expression: 'document.documentElement.outerHTML',
++      returnByValue: true,
++    });
++    const html = r?.result?.result?.value || '';
++    fs.writeFileSync(path.join(__dirname, out), html, 'utf8');
++    console.log(`len=${html.length} -> ${out}`);
++    ws.close();
++  } catch (e) {
++    console.error('ERR ' + e.message);
++    process.exitCode = 1;
++  } finally {
++    try { child.kill(); } catch (_) {}
++    await sleep(400);
++    // 收干净残留进程
++    try {
++      const { execSync } = require('child_process');
++      execSync(`powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \\"Name='chrome.exe'\\" | Where-Object { $_.CommandLine -like '*cdp_prof_${port}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"`, { stdio: 'ignore' });
++    } catch (_) {}
++  }
++})();
+diff --git a/cdp_get.cjs b/cdp_get.cjs
+new file mode 100644
+index 0000000..f3298f1
+--- /dev/null
++++ b/cdp_get.cjs
+@@ -0,0 +1,67 @@
++// 用常驻无头 Chrome（CDP）取渲染后的 DOM。
++// 用法: node cdp_get.cjs <url> <outfile> [port] [idleMs]
++// idleMs: 页面 complete 之后再等多久让 JS 灌数据，默认 2500
++const fs = require('fs');
++const path = require('path');
++
++const url = process.argv[2];
++const out = process.argv[3] || 'page_dump.html';
++const port = parseInt(process.argv[4] || '9222', 10);
++const idleMs = parseInt(process.argv[5] || '2500', 10);
++if (!url) { console.error('need url'); process.exit(2); }
++
++const sleep = ms => new Promise(r => setTimeout(r, ms));
++
++(async () => {
++  let targetId = null;
++  try {
++    const r = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, {
++      method: 'PUT', signal: AbortSignal.timeout(10000),
++    });
++    if (!r.ok) throw new Error('new tab failed: HTTP ' + r.status);
++    const t = await r.json();
++    targetId = t.id;
++    if (!t.webSocketDebuggerUrl) throw new Error('no ws url');
++
++    const ws = new WebSocket(t.webSocketDebuggerUrl);
++    await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error('ws error')); });
++
++    const pending = new Map();
++    ws.onmessage = ev => {
++      const m = JSON.parse(ev.data);
++      if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); }
++    };
++    let seq = 0;
++    const send = (method, params) => new Promise(res => {
++      const id = ++seq;
++      pending.set(id, res);
++      ws.send(JSON.stringify({ id, method, params }));
++    });
++
++    // 等 readyState=complete，最多 30s
++    let ready = false;
++    for (let i = 0; i < 120; i++) {
++      await sleep(250);
++      const r2 = await send('Runtime.evaluate', {
++        expression: 'document.readyState', returnByValue: true,
++      });
++      if (r2?.result?.result?.value === 'complete') { ready = true; break; }
++    }
++    await sleep(idleMs);
++
++    const r3 = await send('Runtime.evaluate', {
++      expression: 'document.documentElement.outerHTML', returnByValue: true,
++    });
++    const html = r3?.result?.result?.value || '';
++    fs.writeFileSync(path.join(__dirname, out), html, 'utf8');
++    console.log(`ready=${ready} len=${html.length} title=${JSON.stringify((await send('Runtime.evaluate', { expression: 'document.title', returnByValue: true }))?.result?.result?.value || '')} -> ${out}`);
++    ws.close();
++  } catch (e) {
++    console.error('ERR ' + e.message);
++    process.exitCode = 1;
++  } finally {
++    if (targetId) {
++      try { await fetch(`http://127.0.0.1:${port}/json/close/${targetId}`, { method: 'PUT' }); } catch (_) {}
++    }
++  }
++})();
 diff --git a/config.example.json b/config.example.json
 index c206df8..49f84f6 100644
 --- a/config.example.json
@@ -155,13 +387,14 @@ index 0000000..86753bf
 +$stream.Dispose()
 +$img.Dispose()
 diff --git a/core/index.ts b/core/index.ts
-index 8308121..4050106 100644
+index 8308121..4312106 100644
 --- a/core/index.ts
 +++ b/core/index.ts
-@@ -17,11 +17,13 @@ import { Sessions } from "./session.ts";
+@@ -17,14 +17,18 @@ import { Sessions } from "./session.ts";
  import { Channels } from "./channels.ts";
  import { startWeb } from "./web.ts";
  import { ModelConfig, resolveModel } from "./model-config.ts";
++import { loadEnvFile, expandSecret } from "./secrets.ts";
 +import { ModelRouter } from "./model-router.ts";
  import { PersonaFiles } from "./persona-config.ts";
  import { MemoryEngine } from "./memory-engine.ts";
@@ -172,7 +405,30 @@ index 8308121..4050106 100644
  export async function boot(
    root = resolve(dirname(fileURLToPath(import.meta.url)), ".."),
  ) {
-@@ -74,6 +76,11 @@ export async function boot(
++  const envLoaded = loadEnvFile(root);
+   const config = JSON.parse(
+     (await readFile(resolve(root, "config/config.json"), "utf8")).replace(
+       /^\uFEFF/,
+@@ -34,15 +38,16 @@ export async function boot(
+   const logger = new Logger(
+     resolve(root, "logs"),
+     config.log,
+-    config.providers.map((p: any) => p.api_key),
++    config.providers.map((p: any) => expandSecret(p.api_key)),
+   );
+   logger.info("WhaleLife 启动");
+   logger.info("配置加载与校验", {
+     providers: config.providers.map((p: any) => p.id),
+   });
++  if (envLoaded) logger.info("从 .env 注入环境变量", { variables: envLoaded });
+   const diagnostics = new Diagnostics(root, { ...config.diagnostics,
+     excluded_directories: [resolve(root, config.memory.root), resolve(root, "logs")],
+-  }, logger, () => config.providers.map((p: any) => p.api_key).filter(Boolean));
++  }, logger, () => config.providers.map((p: any) => expandSecret(p.api_key)).filter(Boolean));
+   await diagnostics.initialize();
+   diagnostics.event("coverage", {
+     supported: ["core_session_chat", "core_tools", "memory_diary", "legacy_memory_maintenance", "plugin_llm_chat", "model_config_http"],
+@@ -74,6 +79,11 @@ export async function boot(
        resolveModel(config, id),
      ),
      tools = new Tools(logger, config.permissions?.tools);
@@ -184,7 +440,7 @@ index 8308121..4050106 100644
    const executionArchive = new ExecutionArchive(resolve(root, "logs/executions"), logger);
    tools.executionArchive = executionArchive;
    llm.diagnostics = diagnostics;
-@@ -89,6 +96,7 @@ export async function boot(
+@@ -89,6 +99,7 @@ export async function boot(
      executionArchive,
      approval,
      modelConfig,
@@ -192,7 +448,7 @@ index 8308121..4050106 100644
      personaFiles: new PersonaFiles(root, config, logger),
    };
    const sessions = new Sessions(root, config, services);
-@@ -104,6 +112,7 @@ export async function boot(
+@@ -104,6 +115,7 @@ export async function boot(
      registerMemoryTools(ctx.tools, memoryEngine),
    );
    await runtime.builtin("execution_archive", {}, (ctx) => registerExecutionTools(ctx.tools, executionArchive));
@@ -261,10 +517,18 @@ index 03614a2..bfee965 100644
      const entry = this.memoryReservations.get(ticket.id);
      if (!entry) return; // Settled, foreign, or from a prior process: never refund again.
 diff --git a/core/model-config.ts b/core/model-config.ts
-index 1047ebf..b762a0e 100644
+index 1047ebf..5680807 100644
 --- a/core/model-config.ts
 +++ b/core/model-config.ts
-@@ -27,6 +27,7 @@ export const MODEL_TYPES = [
+@@ -5,6 +5,7 @@
+ import type { Diagnostics } from "./diagnostics.ts";
+ import { createHash, randomUUID } from "node:crypto";
+ import { timezone } from "./time.ts";
++import { expandSecret } from "./secrets.ts";
+ import { readFileSync } from "node:fs";
+ import { readFile, writeFile, rename, unlink, mkdir } from "node:fs/promises";
+ import { join, resolve, dirname } from "node:path";
+@@ -27,6 +28,7 @@ export const MODEL_TYPES = [
  export type ModelType = (typeof MODEL_TYPES)[number];
  export const MODEL_ROLES = [
    "chat",
@@ -272,7 +536,7 @@ index 1047ebf..b762a0e 100644
    "embedding",
    "rerank",
    "image",
-@@ -34,6 +35,16 @@ export const MODEL_ROLES = [
+@@ -34,6 +36,16 @@ export const MODEL_ROLES = [
    "tts",
  ] as const;
  type ModelRole = (typeof MODEL_ROLES)[number];
@@ -289,7 +553,7 @@ index 1047ebf..b762a0e 100644
  export interface ProviderConfig {
    id: string;
    name: string;
-@@ -387,6 +398,17 @@ function normalize(config: any) {
+@@ -387,6 +399,17 @@ function normalize(config: any) {
    };
  }
  
@@ -307,7 +571,25 @@ index 1047ebf..b762a0e 100644
  export function resolveChatModel(
    config: any,
    personaId?: string,
-@@ -739,7 +761,7 @@ export class ModelConfig {
+@@ -496,7 +519,7 @@ export class ModelConfig {
+       providers: this.source.providers.map(
+         ({ api_key, ...p }: ProviderConfig) => ({
+           ...p,
+-          has_key: Boolean(api_key),
++          has_key: Boolean(expandSecret(api_key)),
+         }),
+       ),
+       models: this.source.models.map((m: ModelDefinition) => ({
+@@ -544,7 +567,7 @@ export class ModelConfig {
+     return structuredClone({
+       id: model.id, name: model.name, model: model.model, type: model.type,
+       provider_id: provider.id, provider_name: provider.name, protocol: provider.protocol,
+-      base_url: provider.base_url, api_key: provider.api_key,
++      base_url: provider.base_url, api_key: expandSecret(provider.api_key),
+       timeout_seconds: provider.timeout_seconds, proxy_url: provider.proxy_url,
+       parameters: model.parameters, dimensions: model.dimensions,
+       context_window: model.context_window ?? null,
+@@ -739,7 +762,7 @@ export class ModelConfig {
        selected: unknown,
        type: ModelType,
      ): string | null => {
@@ -316,7 +598,7 @@ index 1047ebf..b762a0e 100644
        if (typeof selected !== "string")
          throw new ModelConfigError("每项模型用途需明确选择模型或留空");
        const model = models.find((m) => m.id === selected);
-@@ -760,7 +782,7 @@ export class ModelConfig {
+@@ -760,7 +783,7 @@ export class ModelConfig {
      const bindings = Object.fromEntries(
        MODEL_ROLES.map((role) => [
          role,
@@ -327,10 +609,10 @@ index 1047ebf..b762a0e 100644
      const personas = disk.personas ?? {};
 diff --git a/core/model-router.ts b/core/model-router.ts
 new file mode 100644
-index 0000000..917e3ee
+index 0000000..caa9353
 --- /dev/null
 +++ b/core/model-router.ts
-@@ -0,0 +1,611 @@
+@@ -0,0 +1,612 @@
 +/*! Copyright (c) 2026 iinukami and contributors.
 + * SPDX-License-Identifier: AGPL-3.0-only
 + * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
@@ -344,6 +626,7 @@ index 0000000..917e3ee
 + */
 +import { readFileSync } from "node:fs";
 +import { resolveModel } from "./model-config.ts";
++import { expandSecret } from "./secrets.ts";
 +import { requestUsage } from "./session-context.ts";
 +
 +export const DEFAULT_JUDGE_SYSTEM_PROMPT =
@@ -693,7 +976,7 @@ index 0000000..917e3ee
 +        method: "POST",
 +        headers: {
 +          "Content-Type": "application/json",
-+          ...(target.provider.api_key ? { Authorization: `Bearer ${target.provider.api_key}` } : {}),
++          ...(expandSecret(target.provider.api_key) ? { Authorization: `Bearer ${expandSecret(target.provider.api_key)}` } : {}),
 +        },
 +        body: JSON.stringify({ model: target.model, input: key }),
 +        signal: controller.signal,
@@ -1164,6 +1447,75 @@ index 0000000..141d4ed
 +  }
 +  return files;
 +}
+diff --git a/core/secrets.ts b/core/secrets.ts
+new file mode 100644
+index 0000000..0aad606
+--- /dev/null
++++ b/core/secrets.ts
+@@ -0,0 +1,63 @@
++/*! Copyright (c) 2026 iinukami and contributors.
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
++ */
++import { readFileSync } from "node:fs";
++
++/** 形如 ${ENV:NAME} 的引用，指向环境变量，不把凭据本身写进配置文件。 */
++const REFERENCE = /^\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}$/;
++
++/**
++ * 把 ${ENV:NAME} 换成环境变量的值。
++ * 不是引用形式的字符串原样返回；引用但变量为空时返回空串。
++ */
++export function expandSecret(
++  value: unknown,
++  env: NodeJS.ProcessEnv = process.env,
++): string {
++  const raw = typeof value === "string" ? value.trim() : "";
++  if (!raw) return "";
++  const match = REFERENCE.exec(raw);
++  if (!match) return raw;
++  return String(env[match[1]] ?? "").trim();
++}
++
++/** 配置里是否是环境变量引用（而不是明文凭据）。 */
++export function isSecretReference(value: unknown): boolean {
++  return typeof value === "string" && REFERENCE.test(value.trim());
++}
++
++/**
++ * 从 root/.env 读 KEY=VALUE 注入 process.env。
++ * 已存在的非空变量不覆盖；不打印任何值。返回注入条数。
++ */
++export function loadEnvFile(
++  root: string,
++  env: NodeJS.ProcessEnv = process.env,
++): number {
++  let raw: string;
++  try {
++    raw = readFileSync(`${root}/.env`, "utf8").replace(/^\uFEFF/, "");
++  } catch {
++    return 0;
++  }
++  let loaded = 0;
++  for (const line of raw.split(/\r?\n/)) {
++    const text = line.trim();
++    if (!text || text.startsWith("#")) continue;
++    const at = text.indexOf("=");
++    if (at <= 0) continue;
++    const name = text.slice(0, at).trim();
++    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
++    let value = text.slice(at + 1).trim();
++    if (
++      (value.startsWith('"') && value.endsWith('"') && value.length >= 2) ||
++      (value.startsWith("'") && value.endsWith("'") && value.length >= 2)
++    )
++      value = value.slice(1, -1);
++    if (env[name]) continue;
++    env[name] = value;
++    loaded += 1;
++  }
++  return loaded;
++}
 diff --git a/core/session.ts b/core/session.ts
 index 754b582..884d39f 100644
 --- a/core/session.ts
@@ -1519,23 +1871,11 @@ index 7d430e0..42d04f3 100644
    rerank: "重排序",
    image: "图像生成",
 diff --git a/core/ui/app.js b/core/ui/app.js
-index 55ade77..571e0f9 100644
+index 55ade77..db1888d 100644
 --- a/core/ui/app.js
 +++ b/core/ui/app.js
-@@ -19,6 +19,8 @@ import {
-   bindChat,
-   renderLogs,
-   bindLogs,
-+  renderUsage,
-+  bindUsage,
- } from "./views.js";
- 
- const pages = {
-@@ -29,8 +31,11 @@ const pages = {
-   bindings: { name: "使用配置", render: renderBindings, bind: bindBindings },
-   chat: { name: "对话", render: renderChat, bind: bindChat },
+@@ -31,6 +31,8 @@ const pages = {
    plugins: { name: "插件管理", render: renderPlugins, bind: bindPlugins },
-+  usage: { name: "账本", render: renderUsage, bind: bindUsage },
    logs: { name: "运行日志", render: renderLogs, bind: bindLogs },
  };
 +const thinkingFaces = ["(｡•ᴗ•｡)","(´｡• ᵕ •｡`)","(๑•̀ㅂ•́)و","(￣▽￣)","(＝ω＝)","(っ˘ω˘ς)","(๑´ω`๑)","(・ω・)","(๑•́ ₃ •̀๑)","( ˘ω˘ )","(´▽`)","(･ω･)ﾉ"];
@@ -1543,20 +1883,15 @@ index 55ade77..571e0f9 100644
  const $ = (id) => document.getElementById(id);
  document
    .querySelectorAll("[data-icon]")
-@@ -58,8 +63,12 @@ class ConsoleApp {
-     messages: [],
-     logs: [],
+@@ -60,6 +62,7 @@ class ConsoleApp {
      logFollow: true,
-+    usage: null,
-+    usageDays: 7,
-+    usageError: "",
      chatBusy: false,
      chatDraft: "",
 +    pendingImages: [],
      session: null,
      sessions: [],
      memorySession: null,
-@@ -78,7 +87,7 @@ class ConsoleApp {
+@@ -78,7 +81,7 @@ class ConsoleApp {
          if (this.state.page === "memory") loadMemory(this);
        }
      });
@@ -1565,7 +1900,7 @@ index 55ade77..571e0f9 100644
      $("login-form").onsubmit = (event) => {
        event.preventDefault();
        this.login();
-@@ -167,13 +176,34 @@ class ConsoleApp {
+@@ -167,13 +170,34 @@ class ConsoleApp {
        this.updateChatControls();
      }
    }
@@ -1602,7 +1937,7 @@ index 55ade77..571e0f9 100644
      ]);
      if (sequence !== this.sessionSync || this.state.chatBusy) return;
      this.sessionReady = true;
-@@ -187,14 +217,222 @@ class ConsoleApp {
+@@ -187,14 +211,222 @@ class ConsoleApp {
        this.state.memoryLoadedTab = null;
      }
      localStorage.whaleSession = id;
@@ -1826,7 +2161,7 @@ index 55ade77..571e0f9 100644
    async refreshSessionContext() {
      const id = this.state.session;
      try {
-@@ -210,6 +448,20 @@ class ConsoleApp {
+@@ -210,6 +442,20 @@ class ConsoleApp {
          $("chat-context").textContent = error.message;
      }
    }
@@ -1847,7 +2182,7 @@ index 55ade77..571e0f9 100644
    async syncView() {
      const page = this.state.page;
      if (this.authenticated && (page.startsWith("extension:") || page.startsWith("plugin:")) && !this.syncing) {
-@@ -364,17 +616,38 @@ class ConsoleApp {
+@@ -364,17 +610,38 @@ class ConsoleApp {
          if (this.state.page === "logs") this.renderLogs();
          return;
        }
@@ -1888,7 +2223,7 @@ index 55ade77..571e0f9 100644
          return;
        }
        if (data.type === "chunk") {
-@@ -387,6 +660,10 @@ class ConsoleApp {
+@@ -387,6 +654,10 @@ class ConsoleApp {
            this.state.messages.push(this.reply);
          }
          this.reply.text += data.text;
@@ -1899,7 +2234,7 @@ index 55ade77..571e0f9 100644
        } else if (data.type === "done" || data.type === "error") {
          if (data.type === "error") {
            this.state.messages.push({ role: "error", text: data.error });
-@@ -457,26 +734,35 @@ class ConsoleApp {
+@@ -457,26 +728,35 @@ class ConsoleApp {
            m.id === (persona?.model || this.state.config.bindings.chat) &&
            m.enabled,
        );
@@ -1944,7 +2279,7 @@ index 55ade77..571e0f9 100644
      this.replyPersonaName = this.state.status.personaName;
      this.chatWS.send(
        JSON.stringify({
-@@ -484,11 +770,98 @@ class ConsoleApp {
+@@ -484,11 +764,98 @@ class ConsoleApp {
          expectedSession: this.state.session,
          text,
          persona: this.state.status.persona,
@@ -2043,7 +2378,7 @@ index 55ade77..571e0f9 100644
    async newSession() {
      if (this.state.chatBusy || this.sessionChanging) return;
      this.sessionChanging = true;
-@@ -504,21 +877,60 @@ class ConsoleApp {
+@@ -504,21 +871,60 @@ class ConsoleApp {
        this.updateChatControls();
      }
    }
@@ -2063,7 +2398,7 @@ index 55ade77..571e0f9 100644
        .map(
          (m) =>
 -          `<div class="message ${m.role === "user" ? "user" : m.role === "error" ? "error" : ""}"><span class="mini-avatar" title="${e(m.personaName || "助手")}">${m.role === "user" ? "你" : m.role === "error" ? "!" : e((m.personaName || "助手").slice(0, 1))}</span><div class="bubble">${e(m.text)}</div></div>`,
-+          `<div class="message ${m.role === "user" ? "user" : m.role === "error" ? "error" : ""}${m.nudge ? " nudge" : ""}"><span class="mini-avatar" title="${e(m.personaName || "助手")}">${m.role === "user" ? "你" : m.role === "error" ? "!" : e((m.personaName || "助手").slice(0, 1))}</span><div class="bubble">${renderRich(m.text)}${(m.images || []).map((url) => `<img class="msg-media" src="${url}" alt="图片">`).join("")}${renderFiles(m.files)}</div></div>`,
++          `<div class="message ${m.role === "user" ? "user" : m.role === "error" ? "error" : ""}${m.nudge ? " nudge" : ""}"><span class="mini-avatar" title="${e(m.personaName || "助手")}">${m.role === "user" ? "你" : m.role === "error" ? "!" : e((m.personaName || "助手").slice(0, 1))}</span><div class="bubble">${renderRich(m.text)}${(m.images || []).map((url) => `<img class="msg-media" src="${url}" alt="图片">`).join("")}${renderFiles(m.files)}${m.role === "user" || m.role === "error" ? "" : '<div class="say-row"><button class="say-btn" title="念出来"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4V5Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg></button></div>'}</div></div>`,
        )
        .join("");
 -    box.scrollTop = box.scrollHeight;
@@ -2101,30 +2436,12 @@ index 55ade77..571e0f9 100644
 +      box.appendChild(wrap);
 +      this.replyEl = wrap.querySelector(".bubble");
 +    }
-+    this.replyEl.innerHTML = renderRich(this.reply.text) + renderFiles(this.reply.files);
++    this.replyEl.innerHTML = renderRich(this.reply.text) + renderFiles(this.reply.files) + '<div class="say-row"><button class="say-btn" title="念出来"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4V5Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg></button></div>';
 +    if (stick) box.scrollTop = box.scrollHeight;
    }
    filteredLogs() {
      return this.state.logs.filter(
-@@ -529,6 +941,17 @@ class ConsoleApp {
-         line.toLowerCase().includes((this.state.logSearch || "").toLowerCase()),
-     );
-   }
-+  async loadUsage() {
-+    const days = this.state.usageDays || 7;
-+    try {
-+      this.state.usage = await api("/api/usage?days=" + days);
-+      this.state.usageError = "";
-+    } catch (error) {
-+      this.state.usage = null;
-+      this.state.usageError = error.message;
-+    }
-+    if (this.state.page === "usage") this.render();
-+  }
-   renderLogs() {
-     const box = $("log-output");
-     if (!box) return;
-@@ -544,5 +967,343 @@ class ConsoleApp {
+@@ -544,5 +950,378 @@ class ConsoleApp {
        `显示 ${lines.length} / ${this.state.logs.length} 条 · ${this.logConnected ? "实时推送中" : "正在重新连接"}`;
    }
  }
@@ -2168,6 +2485,7 @@ index 55ade77..571e0f9 100644
  const app = new ConsoleApp();
 +installImageZoom();
  app.start();
++installSayButton();
 +
 +/** 浏览器解不开时，回头问系统剪贴板要图：服务端用 GDI+ 存成 PNG 再送回来。 */
 +async function clipboardImage() {
@@ -2468,6 +2786,40 @@ index 55ade77..571e0f9 100644
 +  flush();
 +  return out.join("\n");
 +}
++
++
++/** 每条回复旁的「念」按钮：交给嘴巴插件合成并播放。 */
++function installSayButton() {
++  document.addEventListener("click", async (evt) => {
++    const btn = evt.target.closest && evt.target.closest(".say-btn");
++    if (!btn || btn.disabled) return;
++    evt.preventDefault();
++    const holder = btn.closest(".message");
++    const bubble = holder && holder.querySelector(".bubble");
++    let text = "";
++    if (bubble) {
++      const copy = bubble.cloneNode(true);
++      copy.querySelectorAll(".say-btn, .msg-media, .msg-files").forEach((n) => n.remove());
++      text = (copy.innerText || "").trim();
++    }
++    if (!text) return;
++    const face = btn.textContent;
++    btn.disabled = true;
++    btn.textContent = "…";
++    try {
++      await api("/plugins/mouth/say", { text });
++      btn.textContent = "✓";
++    } catch (error) {
++      btn.textContent = "✕";
++      btn.title = String((error && error.message) || error);
++    } finally {
++      setTimeout(() => {
++        btn.textContent = face;
++        btn.disabled = false;
++      }, 2000);
++    }
++  });
++}
 diff --git a/core/ui/context.js b/core/ui/context.js
 index ea8ec82..94628f1 100644
 --- a/core/ui/context.js
@@ -2497,22 +2849,8 @@ index ea8ec82..94628f1 100644
  }
  export function renderContextPanel(app) {
    const s = app.state, current = s.memoryContext, selected = viewedSession(s);
-diff --git a/core/ui/index.html b/core/ui/index.html
-index e479d43..52a1868 100644
---- a/core/ui/index.html
-+++ b/core/ui/index.html
-@@ -67,6 +67,9 @@ Copyright (c) 2026 iinukami and contributors.
-           <a href="#plugins" data-page="plugins"
-             ><span data-icon="puzzle"></span>插件管理</a
-           >
-+          <a href="#usage" data-page="usage"
-+            ><span data-icon="bolt"></span>账本</a
-+          >
-           <a href="#logs" data-page="logs"
-             ><span data-icon="terminal"></span>运行日志</a
-           >
 diff --git a/core/ui/styles.css b/core/ui/styles.css
-index 5251c75..ab865de 100644
+index 5251c75..0d0d3ab 100644
 --- a/core/ui/styles.css
 +++ b/core/ui/styles.css
 @@ -812,7 +812,7 @@ main {
@@ -2524,7 +2862,7 @@ index 5251c75..ab865de 100644
  }
  .chat-empty {
    height: 100%;
-@@ -1393,3 +1393,318 @@ dialog::backdrop {
+@@ -1393,3 +1393,348 @@ dialog::backdrop {
  }
  .extension-panel { overflow: hidden; min-height: 480px; }
  .extension-frame { display: block; width: 100%; height: max(480px, calc(100dvh - 230px)); border: 0; background: white; }
@@ -2843,8 +3181,38 @@ index 5251c75..ab865de 100644
 +.msg-file { font-size: 12px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 999px; color: var(--accent); text-decoration: none; }
 +.msg-file:hover { border-color: var(--accent); }
 +.msg-file.failed { color: var(--muted); }
++
++
++/* 气泡末尾的「念」按钮 */
++.bubble .say-row { display: flex; justify-content: flex-end; margin-top: 8px; }
++.bubble .say-btn {
++  width: 26px;
++  height: 26px;
++  padding: 0;
++  display: grid;
++  place-items: center;
++  font-size: 13px;
++  line-height: 1;
++  border-radius: 8px;
++  border: 1px solid rgba(127, 127, 127, 0.3);
++  background: transparent;
++  color: var(--muted, #797e8c);
++  cursor: pointer;
++  opacity: 0.5;
++  transition: opacity 0.15s, border-color 0.15s, color 0.15s;
++}
++.bubble .say-btn svg { display: block; }
++.bubble .say-btn:hover {
++  opacity: 1;
++  color: #7c5cff;
++  border-color: rgba(124, 92, 255, 0.5);
++}
++.bubble .say-btn:disabled {
++  opacity: 1;
++  cursor: default;
++}
 diff --git a/core/ui/views.js b/core/ui/views.js
-index 7884c7e..fb5e162 100644
+index 7884c7e..cc5944b 100644
 --- a/core/ui/views.js
 +++ b/core/ui/views.js
 @@ -120,13 +120,15 @@ export function renderBindings(app) {
@@ -2908,352 +3276,6 @@ index 7884c7e..fb5e162 100644
    input.onkeydown = (event) => {
      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
        event.preventDefault();
-@@ -268,3 +275,345 @@ export function bindLogs(app) {
-   };
-   app.renderLogs();
- }
-+
-+const ledgerMoney = (value) => value.toFixed(4);
-+/** 一段区间的金额：峰谷或按量计价的区间原样给出，绝不给一个假的确切数。 */
-+const ledgerAmount = (row) => {
-+  if (!row.max.CNY && !row.max.USD) return "无价";
-+  return ["CNY", "USD"]
-+    .filter((currency) => row.max[currency] > 0)
-+    .map((currency) => {
-+      const sign = currency === "CNY" ? "¥" : "$";
-+      const low = sign + ledgerMoney(row.min[currency]);
-+      if (row.exact) return low;
-+      return low + "–" + sign + ledgerMoney(row.max[currency]);
-+    })
-+    .join(" / ");
-+};
-+const ledgerKilo = (value) => value.toLocaleString("en-US");
-+
-+/** 按天汇总，只收账本里真出现的日子，不补空天，避免画出一条尾巴。 */
-+const usageByDay = (rows) => {
-+  const map = new Map();
-+  for (const row of rows) {
-+    const item = map.get(row.day) || { day: row.day, input: 0, output: 0, requests: 0 };
-+    item.input += row.input;
-+    item.output += row.output;
-+    item.requests += row.requests;
-+    map.set(row.day, item);
-+  }
-+  return [...map.values()].sort((a, b) => a.day.localeCompare(b.day));
-+};
-+
-+/** 按 provider / 模型汇总，取输入 token 前八名。 */
-+const usageModels = (rows) => {
-+  const map = new Map();
-+  for (const row of rows) {
-+    const key = row.provider + " / " + row.model;
-+    const item = map.get(key) || { key, input: 0, output: 0, requests: 0 };
-+    item.input += row.input;
-+    item.output += row.output;
-+    item.requests += row.requests;
-+    map.set(key, item);
-+  }
-+  return [...map.values()].sort((a, b) => b.input - a.input).slice(0, 8);
-+};
-+
-+/** 把统计范围铺成连续日期轴，没有用量的日子也占一格，柱子才排得密。 */
-+const usageAxis = (days) => {
-+  const pad = (value) => String(value).padStart(2, "0");
-+  const list = [];
-+  for (let back = days - 1; back >= 0; back--) {
-+    const date = new Date();
-+    date.setDate(date.getDate() - back);
-+    list.push(date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" + pad(date.getDate()));
-+  }
-+  return list;
-+};
-+
-+/** token 数量在纵轴上的短写：4.4M / 200k / 12，省得一行宽到挤掉图。 */
-+const kiloShort = (value) => {
-+  const trim = (text) => text.replace(/\.0$/, "");
-+  if (value >= 1e9) return trim((value / 1e9).toFixed(1)) + "B";
-+  if (value >= 1e6) return trim((value / 1e6).toFixed(1)) + "M";
-+  if (value >= 1e3) return trim((value / 1e3).toFixed(1)) + "k";
-+  return String(Math.round(value));
-+};
-+
-+/** 纵轴顶抬到 1 / 2 / 2.5 / 5 / 10 这类刻度上。 */
-+const dayCeil = (value) => {
-+  if (!(value > 0)) return 1;
-+  const exp = Math.pow(10, Math.floor(Math.log10(value)));
-+  const ratio = value / exp;
-+  const nice = ratio <= 1 ? 1 : ratio <= 2 ? 2 : ratio <= 2.5 ? 2.5 : ratio <= 5 ? 5 : 10;
-+  return nice * exp;
-+};
-+
-+/** 每日输入 token：纵轴刻度、日期横轴、悬停给出当天的输入 / 输出 / 次数。 */
-+const usageBars = (series, days = 7) => {
-+  const map = new Map(series.map((item) => [item.day, item]));
-+  const axis = usageAxis(days).map((day) => map.get(day) || { day, input: 0, output: 0, requests: 0 });
-+  const raw = Math.max(...axis.map((item) => item.input), 0);
-+  const step = dayCeil(raw / 4);
-+  const top = step * 4;
-+  const ticks = [4, 3, 2, 1, 0].map((index) => kiloShort(step * index));
-+  const grid = [4, 3, 2, 1].map((index) => '<i style="bottom:' + index * 25 + '%"></i>').join("");
-+  const dense = axis.length > 14;
-+  const every = dense ? Math.ceil(axis.length / 6) : 1;
-+  const bars = axis
-+    .map((item, index) => {
-+      const height = item.input ? Math.max(1.5, (item.input / top) * 100) : 0;
-+      const flip = index > axis.length * 0.72 ? " flip" : "";
-+      const fill = height
-+        ? '<span class="hour-seg" style="height:' + height.toFixed(3) + '%;background:var(--accent)"></span>'
-+        : "";
-+      const tip = item.input
-+        ? '<div class="hour-tip' + flip + '"><strong>' + item.day + " · " + kiloShort(item.input) + "</strong>" +
-+          '<span class="hour-tip-row"><i style="background:var(--accent)"></i>输入<b>' + kiloShort(item.input) + "</b></span>" +
-+          '<span class="hour-tip-row"><i style="background:#8f88e8"></i>输出<b>' + kiloShort(item.output || 0) + "</b></span>" +
-+          '<span class="hour-tip-row">调用<b>' + item.requests + " 次</b></span></div>"
-+        : '<div class="hour-tip' + flip + '"><strong>' + item.day + '</strong><span class="hour-tip-row empty">无记录</span></div>';
-+      const mark = !dense || index % every === 0 ? '<em class="hour-mark">' + item.day.slice(5) + "</em>" : "";
-+      return (
-+        '<div class="hour-bar' + (item.input ? "" : " day-zero") + '">' +
-+        '<div class="hour-stack">' + fill + "</div>" + mark + tip + "</div>"
-+      );
-+    })
-+    .join("");
-+  return (
-+    '<div class="hour-chart"><div class="hour-yaxis">' +
-+    ticks.map((tick) => "<span>" + tick + "</span>").join("") +
-+    '</div><div class="hour-plot"><div class="hour-grid">' + grid +
-+    '</div><div class="hour-bars">' + bars + "</div></div></div>"
-+  );
-+};
-+const usageRanking = (models) => {
-+  const max = Math.max(...models.map((item) => item.input), 1);
-+  return (
-+    '<div class="usage-ranking">' +
-+    models
-+      .map((item) => {
-+        const width = Math.max(4, Math.round((item.input / max) * 100));
-+        return `<div class="usage-rank"><span class="usage-rank-name" title="${e(item.key)}">${e(item.key)}</span><div class="usage-rank-track"><div class="usage-rank-fill" style="width:${width}%"></div></div><span class="usage-rank-value">${ledgerKilo(item.requests)} 次 · ${ledgerKilo(item.input)}</span></div>`;
-+      })
-+      .join("") +
-+    "</div>"
-+  );
-+};
-+
-+const HOUR_COLORS = ["#5b7cfa", "#8b5cf6", "#22c55e", "#f59e0b", "#ef4444", "#06b6d4", "#e879f9", "#84cc16"];
-+
-+/** 把最大值抬到 1 / 2 / 2.5 / 5 / 10 这类刻度上，柱顶不贴边，纵轴数字好读。 */
-+const hourCeil = (value) => {
-+  if (!(value > 0)) return 0.01;
-+  const exp = Math.pow(10, Math.floor(Math.log10(value)));
-+  const ratio = value / exp;
-+  const nice = ratio <= 1 ? 1 : ratio <= 2 ? 2 : ratio <= 2.5 ? 2.5 : ratio <= 5 ? 5 : 10;
-+  return nice * exp;
-+};
-+
-+/** 24 小时按模型堆叠的金额图：纵轴刻度、整点横轴、悬停给出该小时的分解。 */
-+const usageHourly = (hourly) => {
-+  const rows = hourly && hourly.hours ? hourly.hours : [];
-+  if (!rows.length) return "";
-+  const models = [];
-+  for (const row of rows) {
-+    const key = row.provider + " / " + row.model;
-+    if (!models.includes(key)) models.push(key);
-+  }
-+  const colorOf = (key) => HOUR_COLORS[models.indexOf(key) % HOUR_COLORS.length];
-+  const sumOf = (currency) => rows.reduce((sum, row) => sum + (row.max[currency] || 0), 0);
-+  const currency = sumOf("CNY") > sumOf("USD") ? "CNY" : "USD";
-+  const other = currency === "CNY" ? "USD" : "CNY";
-+  const label = currency === "CNY" ? "¥" : "$";
-+  const cells = [];
-+  for (let hour = 0; hour < 24; hour++) {
-+    const inHour = rows.filter((row) => row.hour === hour);
-+    const segments = models
-+      .map((key) => {
-+        const own = inHour.filter((row) => row.provider + " / " + row.model === key);
-+        return {
-+          key,
-+          value: own.reduce((sum, row) => sum + (row.max[currency] || 0), 0),
-+          low: own.reduce((sum, row) => sum + (row.min[currency] || 0), 0),
-+        };
-+      })
-+      .filter((segment) => segment.value > 0)
-+      .sort((a, b) => b.value - a.value);
-+    const total = segments.reduce((sum, segment) => sum + segment.value, 0);
-+    const low = segments.reduce((sum, segment) => sum + segment.low, 0);
-+    cells.push({ hour, segments, total, low });
-+  }
-+  const raw = Math.max(...cells.map((cell) => cell.total), 0);
-+  const step = hourCeil(raw / 4);
-+  const top = step * 4;
-+  const digits = top >= 1 ? 2 : top >= 0.1 ? 3 : 4;
-+  const money = (value) => label + value.toFixed(digits);
-+  /** 峰谷或用量不完整的行只能给区间：高的那端画柱，低的那端一起写出来。 */
-+  const moneyRange = (low, high) => (high - low > 1e-9 ? money(low) + "–" + money(high) : money(high));
-+  const clock = (hour) => String(hour).padStart(2, "0") + ":00";
-+  const ticks = [4, 3, 2, 1, 0].map((index) => money(step * index));
-+  const grid = [4, 3, 2, 1].map((index) => '<i style="bottom:' + index * 25 + '%"></i>').join("");
-+  const bars = cells
-+    .map((cell) => {
-+      const flip = cell.hour >= 17 ? " flip" : "";
-+      const stack = cell.segments
-+        .map(
-+          (segment) =>
-+            '<span class="hour-seg" style="height:' +
-+            ((segment.value / top) * 100).toFixed(3) +
-+            "%;background:" +
-+            colorOf(segment.key) +
-+            '"></span>',
-+        )
-+        .join("");
-+      const tip = cell.total
-+        ? '<div class="hour-tip' +
-+          flip +
-+          '"><strong>' +
-+          clock(cell.hour) +
-+          " · " +
-+          moneyRange(cell.low, cell.total) +
-+          "</strong>" +
-+          cell.segments
-+            .map(
-+              (segment) =>
-+                '<span class="hour-tip-row"><i style="background:' +
-+                colorOf(segment.key) +
-+                '"></i>' +
-+                e(segment.key) +
-+                "<b>" +
-+                moneyRange(segment.low, segment.value) +
-+                "</b></span>",
-+            )
-+            .join("") +
-+          "</div>"
-+        : '<div class="hour-tip' +
-+          flip +
-+          '"><strong>' +
-+          clock(cell.hour) +
-+          '</strong><span class="hour-tip-row empty">无记录</span></div>';
-+      return (
-+        '<div class="hour-bar"><div class="hour-stack">' +
-+        stack +
-+        "</div>" +
-+        (cell.hour % 3 === 0 ? '<em class="hour-mark">' + clock(cell.hour) + "</em>" : "") +
-+        tip +
-+        "</div>"
-+      );
-+    })
-+    .join("");
-+  const legend = models
-+    .map(
-+      (key) =>
-+        '<span class="legend-item"><i style="background:' + colorOf(key) + '"></i>' + e(key) + "</span>",
-+    )
-+    .join("");
-+  const otherTotal = sumOf(other);
-+  const note = otherTotal
-+    ? "另有 " + (other === "CNY" ? "¥" : "$") + otherTotal.toFixed(4) + " 来自另一种币种的模型，未并入此图。"
-+    : "按当前价目重算，仅供参考，不是账单。柱高一律取上界；遇峰谷时段或用量不完整的记录，悬停给出的是区间。";
-+  return (
-+    '<section class="panel" style="margin-top:22px"><div class="panel-header"><h2>今日每小时消费</h2><span class="badge">' +
-+    e(hourly.day || "") +
-+    ' · 按模型堆叠</span></div><div class="panel-body"><div class="usage-legend">' +
-+    legend +
-+    '</div><div class="hour-chart"><div class="hour-yaxis">' +
-+    ticks.map((tick) => "<span>" + tick + "</span>").join("") +
-+    '</div><div class="hour-plot"><div class="hour-grid">' +
-+    grid +
-+    '</div><div class="hour-bars">' +
-+    bars +
-+    '</div></div></div><p class="hint">' +
-+    icon("info") +
-+    "<span>" +
-+    e(note) +
-+    "</span></p></div></section>"
-+  );
-+};
-+
-+export function renderUsage(app) {
-+  const days = app.state.usageDays || 7;
-+  const heading = `<div class="page-heading"><div><div class="eyebrow">LEDGER</div><h1>账本</h1><p>按天、按 provider 与模型统计 token 用量，金额按当前价目重算，仅供参考，不是账单。只统计，不拦请求。</p></div><div class="heading-actions"><select id="usage-days" aria-label="统计范围">${[
-+    [1, "今天"],
-+    [7, "最近 7 天"],
-+    [30, "最近 30 天"],
-+  ]
-+    .map(
-+      ([value, label]) =>
-+        `<option value="${value}" ${days === value ? "selected" : ""}>${label}</option>`,
-+    )
-+    .join("")}</select><button id="usage-refresh" class="btn small" type="button">${icon("refresh")}重算</button></div></div>`;
-+  if (app.state.usageError)
-+    return heading + `<section class="panel empty">读不到账本：${e(app.state.usageError)}</section>`;
-+  const data = app.state.usage;
-+  if (!data) return heading + '<section class="panel empty">正在读取账本…</section>';
-+  const rows = data.rows || [];
-+  const totals = { requests: 0, input: 0, output: 0, unpriced: 0, inexact: 0, min: { CNY: 0, USD: 0 }, max: { CNY: 0, USD: 0 }, exact: true };
-+  for (const row of rows) {
-+    totals.requests += row.requests;
-+    totals.input += row.input;
-+    totals.output += row.output;
-+    totals.unpriced += row.unpriced;
-+    for (const currency of ["CNY", "USD"]) {
-+      totals.min[currency] += row.min[currency];
-+      totals.max[currency] += row.max[currency];
-+    }
-+    if (!row.exact) {
-+      totals.exact = false;
-+      totals.inexact += 1;
-+    }
-+  }
-+  const cards = [
-+    ["请求", ledgerKilo(totals.requests) + " 次", "这段时间落盘的模型调用", "chat"],
-+    ["输入 token", ledgerKilo(totals.input), "每轮都要重发的上下文都在这里", "download"],
-+    ["输出 token", ledgerKilo(totals.output), "模型实际写出来的部分", "edit"],
-+    ["参考金额", ledgerAmount(totals), totals.exact ? "按当前价目重算" : "含峰谷区间，只能给范围", "bolt"],
-+  ]
-+    .map(
-+      ([name, value, foot, ico]) =>
-+        `<div class="panel stat-card"><span class="stat-icon">${icon(ico)}</span><small>${name}</small><div class="stat-value ${name === "请求" ? "" : "text"}">${e(value)}</div><div class="stat-foot">${e(foot)}</div></div>`,
-+    )
-+    .join("");
-+  const table = rows.length
-+    ? `<div class="ledger-table" role="table" aria-label="用量明细"><div class="ledger-row ledger-head" role="row"><span>日期</span><span>模型</span><span>次数</span><span>输入</span><span>输出</span><span>参考金额</span></div>${rows
-+        .map(
-+          (row) =>
-+            `<div class="ledger-row" role="row"><span>${e(row.day)}</span><span class="ledger-model" title="${e(row.provider + " / " + row.model)}">${e(row.provider)} / ${e(row.model)}</span><span>${ledgerKilo(row.requests)}</span><span>${ledgerKilo(row.input)}</span><span>${ledgerKilo(row.output)}</span><span class="ledger-money">${e(ledgerAmount(row))}</span></div>`,
-+        )
-+        .join("")}</div>`
-+    : '<div class="panel empty">这段时间还没有用量记录。</div>';
-+  const daySeries = usageByDay(rows);
-+  const modelRanks = usageModels(rows);
-+  const hourlyPanel = usageHourly(data.hourly);
-+  const charts = daySeries.length
-+    ? `<section class="panel" style="margin-top:22px"><div class="panel-header"><h2>每日输入 token</h2><span class="badge">${daySeries.length} 天</span></div><div class="panel-body">${usageBars(daySeries, days)}<p class="hint">${icon("info")}<span>输入是每轮重发的上下文，钱基本花在这里；输出 token 见下表。</span></p></div></section>` +
-+      (modelRanks.length
-+        ? `<section class="panel" style="margin-top:22px"><div class="panel-header"><h2>模型排名</h2><span class="badge">按输入 token</span></div><div class="panel-body">${usageRanking(modelRanks)}</div></section>`
-+        : "")
-+    : "";
-+  const budget = data.budget;
-+  const budgetText = budget
-+    ? `每日预算：${budget.tokens ? ledgerKilo(budget.tokens) + " token" : "未设 token 上限"}${budget.amount ? "，" + (budget.currency === "CNY" ? "¥" : "$") + ledgerMoney(Number(budget.amount)) : ""}${budget.note ? "（" + e(budget.note) + "）" : ""}。只记录，不拦截。`
-+    : "还没有设每日预算。";
-+  return (
-+    heading +
-+    `<div class="stats-grid">${cards}</div>` +
-+    hourlyPanel +
-+    charts +
-+    `<section class="panel"><div class="panel-header"><h2>用量明细</h2><span class="badge">${rows.length} 行 · ${e(data.timezone || "")}</span></div><div class="panel-body">${table}<p class="hint">${icon("info")}<span>${totals.unpriced ? `其中 ${totals.unpriced} 次不在价目表里，未计价。` : ""}${totals.inexact ? `其中 ${totals.inexact} 行用量不完整（峰谷时段或中转未上报缓存），金额只能给区间。` : ""}输入是输出的 ${totals.output ? Math.round(totals.input / totals.output) : "—"} 倍，长上下文就是这个数撑起来的；缓存命中能省一部分，但 provider 不上报时这一列是空的。</span></p></div></section>` +
-+    `<section class="panel panel-body" style="margin-top:22px"><h2>每日预算</h2><p>${budgetText}</p><p class="hint">${icon("info")}<span>想在聊天里改，直接让助手调 budget_set 工具。</span></p></section>`
-+  );
-+}
-+
-+export function bindUsage(app) {
-+  const select = document.querySelector("#usage-days");
-+  if (select)
-+    select.onchange = () => {
-+      app.state.usageDays = Number(select.value) || 7;
-+      app.loadUsage();
-+    };
-+  const button = document.querySelector("#usage-refresh");
-+  if (button) button.onclick = () => app.loadUsage();
-+  if (!app.state.usage && !app.state.usageError) app.loadUsage();
-+}
 diff --git a/core/usage-ledger.ts b/core/usage-ledger.ts
 new file mode 100644
 index 0000000..df37097
@@ -3551,10 +3573,10 @@ index 0000000..df37097
 +  return () => disposers.forEach(dispose => dispose());
 +}
 diff --git a/core/web.ts b/core/web.ts
-index 1d8286d..9ea8ba9 100644
+index 1d8286d..69d9559 100644
 --- a/core/web.ts
 +++ b/core/web.ts
-@@ -3,22 +3,68 @@
+@@ -3,22 +3,66 @@
   * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
   */
  import { createServer } from "node:http";
@@ -3562,7 +3584,7 @@ index 1d8286d..9ea8ba9 100644
 -import { readFile } from "node:fs/promises";
 +import { clock, timezone } from "./time.ts";
 +import { mkdir, readFile, writeFile } from "node:fs/promises";
-+import { resolve as resolvePath, sep as pathSep, dirname } from "node:path";
++import { resolve as resolvePath, sep as pathSep } from "node:path";
 +import { fileURLToPath } from "node:url";
 +import { execFile } from "node:child_process";
  import { randomBytes, timingSafeEqual } from "node:crypto";
@@ -3572,11 +3594,9 @@ index 1d8286d..9ea8ba9 100644
 +import { toolContentSnapshot } from "./tool-content.ts";
  import { PluginWebRegistry } from "./plugin-web.ts";
 +import { TurnInput } from "./turn-input.ts";
-+import { collectHourly, collectUsage, readBudget } from "./usage-ledger.ts";
  export async function startWeb(config: any, services: any, runtime: any) {
    const { logger, memory, sessions } = services;
 +  // 账本只读 memory/sessions 里的 request_usage，不改任何东西。
-+  const ledgerRoot = resolvePath(dirname(fileURLToPath(import.meta.url)), "..");
    const channels = services.channels ?? new Channels(memory, sessions, config);
    const { host = "127.0.0.1", port = 9270 } = config.web;
    if (host !== "127.0.0.1" && (!config.web.lan_enabled || !config.web.password))
@@ -3625,7 +3645,7 @@ index 1d8286d..9ea8ba9 100644
    const register = (method: string, path: string, handler: any) => routes.register("", lifetime.signal, method, path, handler);
    let origin = `http://${host}:${port}`;
    const assets = new Set([
-@@ -100,7 +146,7 @@ export async function startWeb(config: any, services: any, runtime: any) {
+@@ -100,7 +144,7 @@ export async function startWeb(config: any, services: any, runtime: any) {
            "Cache-Control": "no-store",
            "X-Frame-Options": "DENY",
            "Content-Security-Policy":
@@ -3634,7 +3654,7 @@ index 1d8286d..9ea8ba9 100644
          });
          res.end(await readFile(new URL("./ui/index.html", import.meta.url)));
          return;
-@@ -345,7 +391,24 @@ export async function startWeb(config: any, services: any, runtime: any) {
+@@ -345,7 +389,24 @@ export async function startWeb(config: any, services: any, runtime: any) {
        if (req.method === "GET" && req.url?.startsWith("/api/session?")) {
          const id = new URL(req.url, origin).searchParams.get("id");
          if (!id) return send(400, { error: "请提供会话 ID" });
@@ -3660,7 +3680,7 @@ index 1d8286d..9ea8ba9 100644
        }
        if (req.method === "GET" && req.url === "/api/status")
          return send(200, {
-@@ -365,8 +428,103 @@ export async function startWeb(config: any, services: any, runtime: any) {
+@@ -365,6 +426,90 @@ export async function startWeb(config: any, services: any, runtime: any) {
            pluginPages: routes.pages(),
            diagnostics: services.diagnostics?.status(),
          });
@@ -3750,21 +3770,8 @@ index 1d8286d..9ea8ba9 100644
 +      }
        if (req.method === "GET" && req.url === "/api/logs")
          return send(200, logger.lines);
-+      if (req.method === "GET" && memoryUrl.pathname === "/api/usage") {
-+        const raw = memoryUrl.searchParams.get("days");
-+        const days = Math.min(Math.max(Number(raw || 7) || 7, 1), 31);
-+        return send(200, {
-+          days,
-+          timezone: config.timezone || "Australia/Brisbane",
-+          rows: await collectUsage(ledgerRoot, config, days),
-+          hourly: await collectHourly(ledgerRoot, config),
-+          budget: await readBudget(ledgerRoot),
-+        });
-+      }
        if (req.method === "POST" && req.url === "/api/plugin") {
-         const data = await body(req);
-         await runtime.action(data.id, data.action);
-@@ -388,7 +546,7 @@ export async function startWeb(config: any, services: any, runtime: any) {
+@@ -388,7 +533,7 @@ export async function startWeb(config: any, services: any, runtime: any) {
        else res.end();
      }
    });
@@ -3773,7 +3780,7 @@ index 1d8286d..9ea8ba9 100644
    server.on("upgrade", (req, socket, head) => {
      if (
        !allowedOrigin(req) ||
-@@ -421,23 +579,62 @@ export async function startWeb(config: any, services: any, runtime: any) {
+@@ -421,23 +566,62 @@ export async function startWeb(config: any, services: any, runtime: any) {
      }
      let busy = false;
      ws.on("message", async (raw) => {
@@ -3844,6 +3851,30 @@ index 1d8286d..9ea8ba9 100644
          send({ type: "done" });
        } catch (error: any) {
          logger.error("聊天失败", { error });
+diff --git a/tests/bridge.live.ts b/tests/bridge.live.ts
+new file mode 100644
+index 0000000..24019f3
+--- /dev/null
++++ b/tests/bridge.live.ts
+@@ -0,0 +1,18 @@
++import { apply } from "../plugins/bridge/index.ts";
++import { readFile } from "node:fs/promises";
++
++const cfg = JSON.parse(await readFile(new URL("../plugins/bridge/data/config.json", import.meta.url), "utf8"));
++const reg = new Map<string, any>();
++const ctx: any = {
++  logger: { info() {}, warn() {}, error() {}, debug() {} },
++  tools: { register(t: any) { reg.set(t.name, t); return () => {}; } },
++  config: { async read() { return cfg; }, async save() {} },
++  signal: new AbortController().signal,
++  effect(fn: any) { return fn(); },
++  provide() {}, get() {}, plugin: async () => ({}),
++};
++await apply(ctx);
++const t0 = Date.now();
++const out = await reg.get("ask_astrbot").run({ question: "你是哪一个？用一句话回答，说明你现在在哪个框架里。" }, { permission: "full" });
++console.log("耗时", ((Date.now() - t0) / 1000).toFixed(1), "秒");
++console.log(String(out).slice(0, 600));
 diff --git a/tests/console.test.ts b/tests/console.test.ts
 index 82097ed..2f875e6 100644
 --- a/tests/console.test.ts
@@ -3964,15 +3995,15 @@ index 03a97c7..a602ef4 100644
    close(details({ prompt_cache_hit_tokens: 1, prompt_tokens: 1, completion_tokens: 0 }).cost!.amount!, 0.00000002);
 diff --git a/tests/receipts.test.ts b/tests/receipts.test.ts
 new file mode 100644
-index 0000000..d3832c4
+index 0000000..202b4f7
 --- /dev/null
 +++ b/tests/receipts.test.ts
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,99 @@
 +/*! Copyright (c) 2026 iinukami and contributors.
 + * SPDX-License-Identifier: AGPL-3.0-only
 + * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
 + */
-+import { test } from "node:test";
++import { test, after } from "node:test";
 +import assert from "node:assert/strict";
 +import { createHash } from "node:crypto";
 +import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -3980,7 +4011,9 @@ index 0000000..d3832c4
 +import { join, resolve } from "node:path";
 +import { receiptPath, verifiedFiles, type WriteReceipt } from "../core/receipts.ts";
 +
-+const root = () => mkdtempSync(join(tmpdir(), "whalelife-receipts-"));
++const made: string[] = [];
++const root = () => { const d = mkdtempSync(join(tmpdir(), "whalelife-receipts-")); made.push(d); return d; };
++after(() => { for (const dir of made) { try { rmSync(dir, { recursive: true, force: true }); } catch {} } });
 +const sha = (body: string) => createHash("sha256").update(Buffer.from(body, "utf8")).digest("hex");
 +const receipt = (path: string, body: string, over: Partial<WriteReceipt> = {}): WriteReceipt => ({
 +  kind: "file_write", tool: "hands_write", plugin: "hands", call_id: "call-1", round: 1,
