@@ -1,42 +1,3 @@
-diff --git a/core/plugin-process.ts b/core/plugin-process.ts
-index bb49f28..4f4fd95 100644
---- a/core/plugin-process.ts
-+++ b/core/plugin-process.ts
-@@ -8,7 +8,7 @@ import { PluginRPC } from "./plugin-rpc.ts";
- import { forwardPluginHttp, type PluginHttpEndpoint } from "./plugin-http-bridge.ts";
- 
- export type PluginRuntimeOptions = { startupTimeoutMs?: number; callTimeoutMs?: number; heartbeatTimeoutMs?: number; stopTimeoutMs?: number; maxOldGenerationSizeMb?: number };
--const defaults = { startupTimeoutMs: 15000, callTimeoutMs: 600000, heartbeatTimeoutMs: 5000, stopTimeoutMs: 1000, maxOldGenerationSizeMb: 256 };
-+const defaults = { startupTimeoutMs: 15000, callTimeoutMs: 600000, heartbeatTimeoutMs: 20000, stopTimeoutMs: 1000, maxOldGenerationSizeMb: 256 };
- export function pluginRuntimeOptions(input: PluginRuntimeOptions = {}) {
-   const result = { ...defaults };
-   for (const key of Object.keys(defaults) as Array<keyof typeof defaults>) if (input[key] !== undefined) {
-@@ -23,6 +23,7 @@ export class PluginProcess {
-   private child: ChildProcess;
-   private peer: PluginRPC;
-   private lastPulse = Date.now();
-+  private started = false;
-   private closing?: Promise<void>;
-   private dead = false;
-   private faulted = false;
-@@ -43,7 +44,7 @@ export class PluginProcess {
-     let prepared!: () => void, failed!: (error: Error) => void;
-     this.ready = new Promise((resolve, reject) => { prepared = resolve; failed = reject; }); void this.ready.catch(() => {});
-     this.child.on("message", (message: any) => {
--      if (message.type === "ready") { this.lastPulse = Date.now(); prepared(); }
-+      if (message.type === "ready") { this.lastPulse = Date.now(); this.started = true; prepared(); }
-       else if (message.type === "pulse") this.lastPulse = Date.now();
-       else if (message.type === "fatal") this.fault(Error(message.error));
-       else { try { this.peer.receive(message); } catch (error: any) { this.fault(error); } }
-@@ -52,7 +53,7 @@ export class PluginProcess {
-     this.child.on("exit", (code, signal) => { this.dead = true; const error = Error(`插件 ${id} 进程退出（${signal ?? code}）`); failed(error); this.peer.close(error); if (!this.closing) this.fault(error); });
-     const log = (level: "info" | "warn", chunk: Buffer) => { for (const line of chunk.toString().split(/\r?\n/)) if (line) ctx.logger[level]("插件输出", { plugin: id, text: line.slice(0, 4000) }); };
-     this.child.stdout?.on("data", (chunk) => log("info", chunk)); this.child.stderr?.on("data", (chunk) => log("warn", chunk));
--    this.watchdog = setInterval(() => { if (!this.closing && Date.now() - this.lastPulse > this.options.heartbeatTimeoutMs) this.fault(Error("插件执行无响应，已切割")); }, Math.min(250, this.options.heartbeatTimeoutMs / 2));
-+    this.watchdog = setInterval(() => { if (!this.closing && this.started && Date.now() - this.lastPulse > this.options.heartbeatTimeoutMs) this.fault(Error("插件执行无响应，已切割")); }, Math.min(250, this.options.heartbeatTimeoutMs / 2));
-     this.watchdog.unref();
-     const kernel = Object.freeze({
-       ctx,
 diff --git a/.gitignore b/.gitignore
 index 07b8678..40694e8 100644
 --- a/.gitignore
@@ -284,54 +245,6 @@ index 0000000..f3298f1
 +    }
 +  }
 +})();
-diff --git a/config.example.json b/config.example.json
-index c206df8..49f84f6 100644
---- a/config.example.json
-+++ b/config.example.json
-@@ -6,6 +6,7 @@
-   "models": [],
-   "model_bindings": {
-     "chat": null,
-+    "diary": null,
-     "embedding": null,
-     "rerank": null,
-     "image": null,
-@@ -16,7 +17,6 @@
-     "whale": {
-       "name": "鲸鲸",
-       "file": "memory/personas/whale.md",
--      "model": null,
-       "permission": "ask"
-     }
-   },
-@@ -24,9 +24,26 @@
-   "memory": {
-     "root": "memory",
-     "history_enabled": true,
--    "diary_enabled": false,
-+    "history_scope": "persona",
-+    "context_mode": "diary",
-+    "diary_enabled": true,
-     "compression_trigger_percent": 80,
-     "compression_target_percent": 50,
-     "facts_max_lines": 100
-+  },
-+  "model_router": {
-+    "enabled": false,
-+    "judge_model": null,
-+    "pools": { "fast": null, "mid": null, "high": null },
-+    "high_ratio": 20,
-+    "fallback_decision": "MID",
-+    "simple_max_chars": 20,
-+    "rule_prejudge": true,
-+    "skip_judge_after_fast": true,
-+    "carry_seconds": 600,
-+    "carry_max_chars": 24,
-+    "cache_ttl_seconds": 600,
-+    "cache_max_entries": 500,
-+    "judge_timeout_ms": 4000
-   }
- }
 diff --git a/core/channels.ts b/core/channels.ts
 index 1abf4ef..e980a85 100644
 --- a/core/channels.ts
@@ -436,7 +349,7 @@ index 8308121..89a93bf 100644
      sessions.memoryMaintenance || !!(id && sessions.blockedSessions.has(id));
    memoryEngine.inputEditGuard = (id) => {
 diff --git a/core/llm.ts b/core/llm.ts
-index 547be49..9fce5b8 100644
+index 547be49..d5ac3d9 100644
 --- a/core/llm.ts
 +++ b/core/llm.ts
 @@ -17,8 +17,9 @@ export function thinkingToolHistory(provider: any, tools: unknown[]) {
@@ -451,6 +364,14 @@ index 547be49..9fce5b8 100644
  }
  export class LLM {
    logger: Logger;
+@@ -72,6 +73,7 @@ export class LLM {
+         "/chat/completions",
+         {
+           ...parameters,
++          ...(opts.parameters && typeof opts.parameters === "object" ? opts.parameters : {}),
+           ...(Number.isSafeInteger(opts.max_tokens) && opts.max_tokens > 0
+             ? { max_tokens: opts.max_tokens }
+             : {}),
 diff --git a/core/memory-diary.ts b/core/memory-diary.ts
 index 0170a78..de3e74b 100644
 --- a/core/memory-diary.ts
@@ -674,6 +595,45 @@ index 295a3a7..dfe9bc9 100644
  }
  
  /** Normalize only supported usage fields; do not retain arbitrary provider response metadata. */
+diff --git a/core/plugin-process.ts b/core/plugin-process.ts
+index bb49f28..4f4fd95 100644
+--- a/core/plugin-process.ts
++++ b/core/plugin-process.ts
+@@ -8,7 +8,7 @@ import { PluginRPC } from "./plugin-rpc.ts";
+ import { forwardPluginHttp, type PluginHttpEndpoint } from "./plugin-http-bridge.ts";
+ 
+ export type PluginRuntimeOptions = { startupTimeoutMs?: number; callTimeoutMs?: number; heartbeatTimeoutMs?: number; stopTimeoutMs?: number; maxOldGenerationSizeMb?: number };
+-const defaults = { startupTimeoutMs: 15000, callTimeoutMs: 600000, heartbeatTimeoutMs: 5000, stopTimeoutMs: 1000, maxOldGenerationSizeMb: 256 };
++const defaults = { startupTimeoutMs: 15000, callTimeoutMs: 600000, heartbeatTimeoutMs: 20000, stopTimeoutMs: 1000, maxOldGenerationSizeMb: 256 };
+ export function pluginRuntimeOptions(input: PluginRuntimeOptions = {}) {
+   const result = { ...defaults };
+   for (const key of Object.keys(defaults) as Array<keyof typeof defaults>) if (input[key] !== undefined) {
+@@ -23,6 +23,7 @@ export class PluginProcess {
+   private child: ChildProcess;
+   private peer: PluginRPC;
+   private lastPulse = Date.now();
++  private started = false;
+   private closing?: Promise<void>;
+   private dead = false;
+   private faulted = false;
+@@ -43,7 +44,7 @@ export class PluginProcess {
+     let prepared!: () => void, failed!: (error: Error) => void;
+     this.ready = new Promise((resolve, reject) => { prepared = resolve; failed = reject; }); void this.ready.catch(() => {});
+     this.child.on("message", (message: any) => {
+-      if (message.type === "ready") { this.lastPulse = Date.now(); prepared(); }
++      if (message.type === "ready") { this.lastPulse = Date.now(); this.started = true; prepared(); }
+       else if (message.type === "pulse") this.lastPulse = Date.now();
+       else if (message.type === "fatal") this.fault(Error(message.error));
+       else { try { this.peer.receive(message); } catch (error: any) { this.fault(error); } }
+@@ -52,7 +53,7 @@ export class PluginProcess {
+     this.child.on("exit", (code, signal) => { this.dead = true; const error = Error(`插件 ${id} 进程退出（${signal ?? code}）`); failed(error); this.peer.close(error); if (!this.closing) this.fault(error); });
+     const log = (level: "info" | "warn", chunk: Buffer) => { for (const line of chunk.toString().split(/\r?\n/)) if (line) ctx.logger[level]("插件输出", { plugin: id, text: line.slice(0, 4000) }); };
+     this.child.stdout?.on("data", (chunk) => log("info", chunk)); this.child.stderr?.on("data", (chunk) => log("warn", chunk));
+-    this.watchdog = setInterval(() => { if (!this.closing && Date.now() - this.lastPulse > this.options.heartbeatTimeoutMs) this.fault(Error("插件执行无响应，已切割")); }, Math.min(250, this.options.heartbeatTimeoutMs / 2));
++    this.watchdog = setInterval(() => { if (!this.closing && this.started && Date.now() - this.lastPulse > this.options.heartbeatTimeoutMs) this.fault(Error("插件执行无响应，已切割")); }, Math.min(250, this.options.heartbeatTimeoutMs / 2));
+     this.watchdog.unref();
+     const kernel = Object.freeze({
+       ctx,
 diff --git a/core/receipts.ts b/core/receipts.ts
 new file mode 100644
 index 0000000..141d4ed
