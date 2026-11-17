@@ -6,11 +6,27 @@
  * 默认闭嘴：auto_start 是 false，要用 ear_start 才开。
  */
 import type { Context } from "../../core/context.ts";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { mkdir, writeFile } from "node:fs/promises";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readBody, renderPage, sanitize } from "./ui.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+
+/** 「嘴巴」插件是否装着并且启用着。没装时这页的嘴巴设置只留白、不给填。 */
+function mouthInstalled(): boolean {
+  try {
+    if (!existsSync(join(HERE, "..", "mouth", "plugin.yaml"))) return false;
+    const raw = readFileSync(join(HERE, "..", "..", "config", "plugins.json"), "utf8");
+    const list = JSON.parse(raw)?.disabled;
+    return !(Array.isArray(list) && list.includes("mouth"));
+  } catch {
+    return true;
+  }
+}
 
 const DEFAULTS = {
   python: "",
@@ -25,13 +41,18 @@ const DEFAULTS = {
   max_len: 30,
   /** 空 = 用当前会话。 */
   target_session: "",
-  /** 把回复念出来（走 GSV 9880），默认不念。 */
+  /** 回复完交给「嘴巴」插件念出来，默认不念。 */
   speak_reply: false,
-  gsv_url: "http://127.0.0.1:9880",
-  gsv_ref_audio: "",
-  gsv_prompt_text: "或许我也曾向往过这种力量，但那更像是一种讽刺。",
   /** WhaleLife 启动时自动开始监听。 */
   auto_start: false,
+  /** F9 扩展用哪个解释器；留空 = 用 python 同目录下的 pythonw.exe（不起黑窗口）。 */
+  f9_python: "",
+  /** WhaleLife 启动时把 F9 扩展一起拉起来。 */
+  auto_start_f9: false,
+  /** F9 扩展占用的全局热键：F9、F10、Ctrl+F9 这种写法。 */
+  f9_hotkey: "F9",
+  /** WhaleLife 退出时把 F9 扩展一起关掉。 */
+  stop_f9_on_exit: true,
 };
 
 type Config = typeof DEFAULTS;
@@ -43,7 +64,17 @@ export async function apply(ctx: Context) {
   } catch {
     saved = null;
   }
-  const cfg: Config = { ...DEFAULTS, ...(saved ?? {}) };
+  let cfg: Config = { ...DEFAULTS, ...(saved ?? {}) };
+
+  /** 每次开麦前重读一遍；正在听的边车不受影响，要停了重开才用新参数。 */
+  const reload = async () => {
+    try {
+      const again = (await ctx.config.read("config.json")) as Partial<Config> | null;
+      cfg = { ...DEFAULTS, ...(again ?? {}) };
+    } catch {
+      // 读不到就沿用旧值
+    }
+  };
 
   let child: ChildProcessWithoutNullStreams | null = null;
   let listening = false;
@@ -51,28 +82,8 @@ export async function apply(ctx: Context) {
   let turns = 0;
   let last = "";
   let lastError = "";
+  let lastF9Error = "";
   let buf = "";
-
-  const speak = async (text: string) => {
-    if (!cfg.speak_reply) return;
-    try {
-      const q = new URLSearchParams({
-        text: text.slice(0, 160),
-        text_lang: "zh",
-        ref_audio_path: cfg.gsv_ref_audio,
-        prompt_lang: "zh",
-        prompt_text: cfg.gsv_prompt_text,
-        text_split_method: "cut5",
-        media_type: "wav",
-        streaming_mode: "false",
-      });
-      const res = await fetch(`${cfg.gsv_url}/tts?${q.toString()}`);
-      if (!res.ok) return;
-      await res.arrayBuffer(); // 合成出来就够；播放由本机另走，不在这里卡住
-    } catch {
-      // 没开 GSV 就当没这回事
-    }
-  };
 
   /** 把一句话当用户消息投进会话。 */
   const deliver = async (text: string) => {
@@ -84,10 +95,30 @@ export async function apply(ctx: Context) {
       const reply = await ctx.sessions.run({
         sessionId,
         text,
-        origin: { kind: "channel", name: "ear" } as any,
+        origin: { platform: "ear", action: "hold_to_talk" },
       });
-      ctx.logger.info(`耳朵回复 ${String(reply ?? "").length} 字`);
-      if (reply) await speak(String(reply));
+      const replyText = String(reply ?? "").trim();
+      ctx.logger.info(`耳朵回复 ${replyText.length} 字`);
+      // 回话交给「嘴巴」插件念。没装、被停用、或者开关关着，都只是不出声，不影响打字。
+      if (cfg.speak_reply && replyText) {
+        try {
+          const said: any = await ctx.tools.call(
+            "mouth_say",
+            { text: replyText },
+            { permission: "full", origin: { platform: "ear", action: "hold_to_talk" } } as any,
+          );
+          const note =
+            said && typeof said === "object"
+              ? said.ok === false
+                ? `失败：${said.error ?? ""}`
+                : String(said.result ?? "ok")
+              : String(said);
+          ctx.logger.info(`耳朵叫嘴巴念：${note}`);
+        } catch (error: any) {
+          ctx.logger.warn(`耳朵叫嘴巴念失败（嘴巴装了没？）：${error?.message ?? error}`);
+        }
+      }
+
     } catch (error: any) {
       lastError = error?.message ?? String(error);
       ctx.logger.warn(`耳朵投递失败：${lastError}`);
@@ -125,6 +156,7 @@ export async function apply(ctx: Context) {
 
   const start = async () => {
     if (child) return { ok: false, reason: "已经在听了" };
+    await reload();
     const args = [
       cfg.script,
       "--start",
@@ -229,14 +261,304 @@ export async function apply(ctx: Context) {
     },
   });
 
-  if (cfg.auto_start) {
-    ctx.on("whalelife/ready", async () => {
+  // —— F9 全局热键扩展：由插件拉起/收掉，跟 WhaleLife 同生共死 ——
+  const f9Script = join(HERE, "f9", "hold_to_talk.py");
+  let f9Child: ReturnType<typeof spawn> | null = null;
+  let f9StartedAt = 0;
+
+  /** python.exe → 同目录 pythonw.exe；找不到就退回原样。 */
+  const f9Interpreter = () => {
+    if (cfg.f9_python) return cfg.f9_python;
+    const p = String(cfg.python || "");
+    if (!p) return "pythonw";
+    const w = p.replace(/python\.exe$/i, "pythonw.exe");
+    return w !== p && existsSync(w) ? w : p;
+  };
+
+  const f9Start = async () => {
+    if (f9Child) return { ok: false, reason: "已经在跑了" };
+    await reload();
+    if (!existsSync(f9Script)) return { ok: false, reason: "脚本不在：" + f9Script };
+    const exe = f9Interpreter();
+    try {
+      const c = spawn(exe, [f9Script, "--hotkey", cfg.f9_hotkey || "F9"], {
+        cwd: join(HERE, "f9"),
+        windowsHide: true,
+        stdio: "ignore",
+        env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+      });
+      f9Child = c;
+      f9StartedAt = Date.now();
+      lastF9Error = "";
+      c.on("exit", (code) => {
+        ctx.logger.info("F9 扩展退出，code=" + code);
+        f9Child = null;
+      });
+      c.on("error", (e: Error) => {
+        lastF9Error = e.message;
+        f9Child = null;
+      });
+      ctx.logger.info("F9 扩展拉起，pid=" + (c.pid ?? "?") + "，解释器 " + exe);
+      return { ok: true, pid: c.pid ?? null, python: exe };
+    } catch (error: any) {
+      return { ok: false, reason: error?.message ?? String(error) };
+    }
+  };
+
+  const f9Stop = async () => {
+    const c = f9Child;
+    if (!c) return { ok: false, reason: "没在跑" };
+    try {
+      c.kill();
+    } catch {}
+    await new Promise((r) => setTimeout(r, 400));
+    if (f9Child) {
+      try {
+        f9Child.kill("SIGKILL");
+      } catch {}
+      f9Child = null;
+    }
+    ctx.logger.info("F9 扩展已收");
+    return { ok: true };
+  };
+
+  const f9State = () => ({
+    running: !!f9Child,
+    pid: f9Child?.pid ?? null,
+    uptime: f9Child ? Math.round((Date.now() - f9StartedAt) / 1000) : 0,
+    python: f9Interpreter(),
+    script: f9Script,
+    error: lastF9Error,
+  });
+
+  /** 边车公共参数。 */
+  const sidecarArgs = (extra: string[]) => [
+    cfg.script,
+    ...extra,
+    "--device", String(cfg.device),
+    "--engine", String(cfg.engine),
+    "--model", String(cfg.model),
+    "--sensevoice_dir", String(cfg.sensevoice_dir),
+    "--language", String(cfg.language),
+    "--initial_prompt", String(cfg.initial_prompt),
+  ];
+
+  /** 异步跑边车。不能用 spawnSync：它会卡住整个插件进程，心跳断掉就被看门狗切。 */
+  const runSidecar = (extra: string[], timeout = 240_000) =>
+    new Promise<{ stdout: string; stderr: string; status: number | null }>((resolve) => {
+      const child = spawn(cfg.python, sidecarArgs(extra), {
+        cwd: HERE,
+        windowsHide: true,
+        env: { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONUNBUFFERED: "1" },
+      });
+      let stdout = "";
+      let stderr = "";
+      const timer = setTimeout(() => {
+        try {
+          child.kill();
+        } catch {
+          /* 收不掉就算了，after below 会返回 */
+        }
+      }, timeout);
+      child.stdout?.on("data", (d: Buffer) => (stdout += d.toString("utf8")));
+      child.stderr?.on("data", (d: Buffer) => (stderr += d.toString("utf8")));
+      child.on("error", (e: Error) => {
+        clearTimeout(timer);
+        resolve({ stdout, stderr: stderr + "\n" + e.message, status: null });
+      });
+      child.on("close", (code: number | null) => {
+        clearTimeout(timer);
+        resolve({ stdout, stderr, status: code });
+      });
+    });
+
+  const sidecarOut = (out: any) => {
+    const text = String(out?.stdout ?? "").trim();
+    const line = text.split(/\r?\n/).filter((l) => l.trim().startsWith("{")).pop();
+    return line ?? "";
+  };
+
+  /** 跑一次 --selftest：加载引擎、量底噪。慢，一分钟上下。 */
+  const selftest = async (): Promise<{ ok: boolean; lines: string[] }> => {
+    await reload();
+    const lines: string[] = [];
+    if (!cfg.python) {
+      lines.push("[×] 没填 python 解释器。填上之后再测。");
+      return { ok: false, lines };
+    }
+    if (!existsSync(cfg.python)) {
+      lines.push(`[×] python 不在：${cfg.python}`);
+      return { ok: false, lines };
+    }
+    if (!existsSync(cfg.script)) {
+      lines.push(`[×] 边车脚本不在：${cfg.script}`);
+      return { ok: false, lines };
+    }
+    lines.push(`[·] python：${cfg.python}`);
+    lines.push(`[·] 引擎：${cfg.engine}，设备号 ${cfg.device}`);
+    const t0 = Date.now();
+    const out = await runSidecar(["--selftest"]);
+    const ms = Date.now() - t0;
+    const line = sidecarOut(out);
+    if (!line) {
+      const tail = String(out?.stderr ?? "").trim().split(/\r?\n/).slice(-4).join(" / ");
+      lines.push(`[×] 自检没吐出结果（${(ms / 1000).toFixed(1)} 秒）${tail ? "：" + tail : ""}`);
+      return { ok: false, lines };
+    }
+    let data: any;
+    try {
+      data = JSON.parse(line);
+    } catch {
+      lines.push(`[×] 自检输出解不开：${line.slice(0, 200)}`);
+      return { ok: false, lines };
+    }
+    if (data.ok) {
+      lines.push(`[✓] 引擎 ${data.engine} 加载成功，底噪阈值 ${data.threshold}`);
+      lines.push(`[✓] 全流程用时 ${(ms / 1000).toFixed(1)} 秒`);
+      return { ok: true, lines };
+    }
+    lines.push(`[×] 自检失败：${data.error ?? "没给原因"}`);
+    return { ok: false, lines };
+  };
+
+  /** 识别一个 wav 文件（16bit PCM）。 */
+  const recognize = async (wavPath: string): Promise<{ ok: boolean; text?: string; error?: string; note?: string }> => {
+    await reload();
+    const out = await runSidecar(["--recognize", wavPath]);
+    const line = sidecarOut(out);
+    if (!line) {
+      const tail = String(out?.stderr ?? "").trim().split(/\r?\n/).slice(-3).join(" / ");
+      return { ok: false, error: `边车没给结果${tail ? "：" + tail : ""}` };
+    }
+    try {
+      const data = JSON.parse(line);
+      if (!data.ok) return { ok: false, error: data.error ?? "识别失败" };
+      return { ok: true, text: String(data.text ?? ""), note: data.note };
+    } catch {
+      return { ok: false, error: `输出解不开：${line.slice(0, 160)}` };
+    }
+  };
+
+  /** 读客户端上传的原始字节，限 8MB。 */
+  const readAudio = async (req: any): Promise<Buffer> => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > 8 * 1024 * 1024) throw new Error("音频太大（超过 8MB）");
+      chunks.push(Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks);
+  };
+
+  const replyJson = (res: any, code: number, body: any) => {
+    res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(JSON.stringify(body));
+  };
+
+  ctx.web.api("/plugins/ear/f9/start", async (_req: any, res: any) => {
+    try {
+      const r = await f9Start();
+      return replyJson(res, r.ok ? 200 : 400, { ...r, state: f9State() });
+    } catch (error: any) {
+      return replyJson(res, 500, { ok: false, reason: error?.message ?? String(error), state: f9State() });
+    }
+  });
+
+  ctx.web.api("/plugins/ear/f9/stop", async (_req: any, res: any) => {
+    try {
+      const r = await f9Stop();
+      return replyJson(res, r.ok ? 200 : 400, { ...r, state: f9State() });
+    } catch (error: any) {
+      return replyJson(res, 500, { ok: false, reason: error?.message ?? String(error), state: f9State() });
+    }
+  });
+
+  ctx.web.api("/plugins/ear/f9/status", async (_req: any, res: any) => {
+    return replyJson(res, 200, { ok: true, state: f9State() });
+  });
+
+  ctx.web.api("/plugins/ear/test", async (_req: any, res: any) => {
+    try {
+      const r = await selftest();
+      return replyJson(res, 200, r);
+    } catch (error: any) {
+      return replyJson(res, 500, { ok: false, lines: [`测试本身出错：${error?.message ?? error}`] });
+    }
+  });
+
+  ctx.web.api("/plugins/ear/utter", async (req: any, res: any) => {
+    let dir = "";
+    try {
+      const buf = await readAudio(req);
+      if (!buf.length) return replyJson(res, 400, { ok: false, error: "没收到音频" });
+      await reload();
+      dir = mkdtempSync(join(tmpdir(), "whalelife-ear-"));
+      const file = join(dir, "hold.wav");
+      writeFileSync(file, buf);
+      const r = await recognize(file);
+      if (!r.ok) return replyJson(res, 500, { ok: false, error: r.error });
+      const text = String(r.text ?? "").trim();
+      if (!text) return replyJson(res, 200, { ok: true, text: "", detail: r.note ?? "没听清说什么" });
+      void deliver(text);
+      return replyJson(res, 200, { ok: true, text });
+    } catch (error: any) {
+      return replyJson(res, 500, { ok: false, error: error?.message ?? String(error) });
+    } finally {
+      if (dir) {
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch {
+          /* 临时目录清不掉不算错 */
+        }
+      }
+    }
+  });
+
+  ctx.web.page(
+    "/plugins/ear/",
+    async (_req: any, res: any) => {
+      await reload();
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(renderPage(cfg, mouthInstalled()));
+    },
+    { title: "耳朵", navigation: true },
+  );
+
+  ctx.web.api("/plugins/ear/save", async (req: any, res: any) => {
+    try {
+      const patchIn = sanitize(await readBody(req));
+      const keys = Object.keys(patchIn);
+      if (!keys.length) throw new Error("没有可保存的字段");
+      const merged = { ...(await ctx.config.read<any>("config.json").catch(() => null)), ...patchIn };
+      await ctx.config.save("config.json", merged);
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ ok: true, saved: keys }));
+    } catch (error: any) {
+      res.writeHead(400, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ ok: false, error: error?.message ?? String(error) }));
+    }
+  });
+
+  ctx.on("whalelife/ready", async () => {
+    await reload();
+    if (cfg.auto_start) {
       const r = await start();
       ctx.logger.info(r.ok ? "耳朵已随主程序开始监听" : `耳朵未开：${r.reason}`);
-    });
-  }
+    }
+    if (cfg.auto_start_f9) {
+      const r = await f9Start();
+      ctx.logger.info(r.ok ? `F9 扩展已随主程序启动，pid=${r.pid}` : `F9 扩展未开：${r.reason}`);
+    }
+  });
 
   ctx.effect(() => () => {
+    if (cfg.stop_f9_on_exit && f9Child) {
+      try {
+        f9Child.kill();
+      } catch {}
+      f9Child = null;
+    }
     if (child) {
       try {
         child.stdin.write("quit\n");

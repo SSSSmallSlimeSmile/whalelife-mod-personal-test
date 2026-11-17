@@ -7,6 +7,7 @@
     python ear_sidecar.py --list            列输入设备
     python ear_sidecar.py --selftest        加载引擎、量一次底噪，然后退出
     python ear_sidecar.py --start           正式监听，每句输出一行 JSON
+    python ear_sidecar.py --recognize a.wav 只识别这一个文件，出结果就退出
 
 stdout 只有 JSON 行（或 --list/--selftest 的文本），日志全走 stderr。
 """
@@ -15,9 +16,9 @@ from __future__ import annotations
 import argparse
 import gc
 import json
-import os
 import queue
 import re
+import os
 import sys
 import threading
 import time
@@ -58,6 +59,26 @@ def is_hallucination(text: str) -> bool:
     if len(t) >= 6 and len(set(t)) / len(t) < 0.3:
         return True
     return False
+
+
+def read_wav(path: str):
+    """读一个 wav 成 16k 单声道 float32。只支持 16bit PCM，别的直接报错。"""
+    import wave
+    import numpy as np
+    with wave.open(path, "rb") as w:
+        sw = w.getsampwidth()
+        ch = w.getnchannels()
+        sr = w.getframerate()
+        raw = w.readframes(w.getnframes())
+    if sw != 2:
+        raise ValueError("只支持 16bit PCM 的 wav，这个文件是 %d bit" % (sw * 8))
+    x = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    if ch > 1:
+        x = x.reshape(-1, ch)[:, 0]
+    if sr != SR:
+        n = max(1, int(len(x) * SR / sr))
+        x = np.interp(np.linspace(0, len(x) - 1, n), np.arange(len(x)), x).astype(np.float32)
+    return x
 
 
 def list_devices() -> None:
@@ -184,6 +205,7 @@ def main() -> int:
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--start", action="store_true")
+    ap.add_argument("--recognize", default="")
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--engine", default="sensevoice")
     ap.add_argument("--model", default="base")
@@ -199,6 +221,29 @@ def main() -> int:
         return 0
 
     ear = Ear(args)
+    if args.recognize:
+        try:
+            audio = read_wav(args.recognize)
+            if len(audio) / SR < 0.2:
+                emit({"event": "recognized", "ok": False, "error": "录音太短"})
+                return 1
+            ear.model = ear.load_engine()
+            t0 = time.time()
+            text = ear.transcribe(audio)
+            cost = time.time() - t0
+            if is_hallucination(text):
+                emit({"event": "recognized", "ok": True, "text": "",
+                      "note": "识别结果像幻觉，丢掉", "seconds": round(len(audio) / SR, 2)})
+                return 0
+            emit({"event": "recognized", "ok": True, "text": text,
+                  "seconds": round(len(audio) / SR, 2), "cost": round(cost, 2)})
+            return 0
+        except Exception as exc:
+            emit({"event": "recognized", "ok": False, "error": str(exc)})
+            return 1
+        finally:
+            ear.close()
+
     if args.selftest:
         try:
             ear.measure_noise()

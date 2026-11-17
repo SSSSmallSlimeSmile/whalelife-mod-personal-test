@@ -1,0 +1,21 @@
+{
+  "python": "",
+  "sensevoice_dir": "",
+  "gsv_ref_audio": "",
+  "speak_reply": false,
+  "device": 0,
+  "engine": "sensevoice",
+  "model": "base",
+  "language": "zh",
+  "initial_prompt": "",
+  "silence": 0.7,
+  "max_len": 30,
+  "target_session": "",
+  "gsv_url": "http://127.0.0.1:9880",
+  "gsv_prompt_text": "",
+  "f9_hotkey": "F9",
+  "f9_python": "",
+  "auto_start_f9": false,
+  "stop_f9_on_exit": true,
+  "auto_start": false
+}

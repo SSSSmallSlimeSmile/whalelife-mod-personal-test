@@ -14,10 +14,11 @@
  */
 import type { Context } from "../../core/context.ts";
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readBody, renderPage, sanitize } from "./ui.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -66,24 +67,66 @@ function trace(file: string, line: string): void {
   }
 }
 
-/** 读 wav 头算这一声多长；读不出来按一秒半算。 */
-function wavSeconds(path: string, fallback = 1.5): number {
+/** 读音频时长：wav 看头，mp3 按比特率估算。读不出来按一秒半算。 */
+function audioSeconds(path: string, fallback = 1.5): number {
   try {
     const buf = readFileSync(path);
-    if (buf.length < 44 || buf.toString("ascii", 0, 4) !== "RIFF") return fallback;
-    let at = 12;
-    let byteRate = 0;
-    while (at + 8 <= buf.length) {
-      const id = buf.toString("ascii", at, at + 4);
-      const size = buf.readUInt32LE(at + 4);
-      if (id === "fmt " && at + 16 <= buf.length) byteRate = buf.readUInt32LE(at + 16);
-      if (id === "data" && byteRate > 0) return size / byteRate;
-      at += 8 + size + (size % 2);
+    if (buf.length >= 44 && buf.toString("ascii", 0, 4) === "RIFF") {
+      let at = 12;
+      let byteRate = 0;
+      while (at + 8 <= buf.length) {
+        const id = buf.toString("ascii", at, at + 4);
+        const size = buf.readUInt32LE(at + 4);
+        if (id === "fmt " && at + 16 <= buf.length) byteRate = buf.readUInt32LE(at + 16);
+        if (id === "data" && byteRate > 0) return size / byteRate;
+        at += 8 + size + (size % 2);
+      }
+    }
+    // mp3：跳过 ID3v2，找到第一个帧头，按比特率估总时长。VBR 会有偏差，够用。
+    let at = 0;
+    if (buf.length > 10 && buf.toString("ascii", 0, 3) === "ID3") {
+      const size =
+        ((buf[6] & 0x7f) << 21) | ((buf[7] & 0x7f) << 14) | ((buf[8] & 0x7f) << 7) | (buf[9] & 0x7f);
+      at = 10 + size;
+    }
+    // MPEG1 与 MPEG2/2.5 的比特率表不同，别只认前者。
+    const RATES_V1 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+    const RATES_V2 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+    let guard = 0;
+    while (at + 4 <= buf.length && guard++ < 200000) {
+      if (buf[at] === 0xff && (buf[at + 1] & 0xe0) === 0xe0) {
+        const ver = (buf[at + 1] >> 3) & 3;
+        const brIdx = (buf[at + 2] >> 4) & 0x0f;
+        if (ver !== 1 && brIdx > 0 && brIdx < 15) {
+          const table = ver === 3 ? RATES_V1 : RATES_V2;
+          return (buf.length - at) / ((table[brIdx] * 1000) / 8);
+        }
+        break;
+      }
+      at++;
     }
     return fallback;
   } catch {
     return fallback;
   }
+}
+
+/** 挑这一声用哪个文件。sound_path 是目录时随机抽一个，是文件时就用它。 */
+function pickSound(cfg: Config): { path: string; seconds: number } {
+  const raw = String(cfg.sound_path || cfg.wav_path || "");
+  if (!raw || !existsSync(raw)) return { path: raw, seconds: 1.5 };
+  try {
+    if (statSync(raw).isDirectory()) {
+      const files = readdirSync(raw).filter((f) => /\.(wav|mp3)$/i.test(f));
+      if (files.length) {
+        const one = join(raw, files[Math.floor(Math.random() * files.length)]);
+        return { path: one, seconds: audioSeconds(one) };
+      }
+    }
+  } catch {
+    /* 目录读不动就当文件处理，不该因此不响 */
+  }
+  return { path: raw, seconds: audioSeconds(raw) };
 }
 
 /** 另起一个进程去放。返回是否确实发出去了。 */
@@ -93,14 +136,14 @@ function play(path: string): boolean {
   const script = !ok
     ? "[System.Media.SystemSounds]::Asterisk.Play(); Start-Sleep -Milliseconds 800"
     : /\.mp3$/i.test(path)
-      // mp3: SoundPlayer 只认 wav，得用 WPF 的 MediaPlayer。起播是异步的，等两秒再收。
-      ? `Add-Type -AssemblyName PresentationCore; $p = New-Object System.Windows.Media.MediaPlayer; $p.Open([uri]'${q}'); $p.Play(); Start-Sleep -Milliseconds 2200; $p.Close()`
+      // mp3: SoundPlayer 只认 wav，得用 WPF 的 MediaPlayer。等它真正播完再收，别硬切。
+      ? `Add-Type -AssemblyName PresentationCore; $p = New-Object System.Windows.Media.MediaPlayer; $p.Open([uri]'${q}'); $p.Play(); Start-Sleep -Milliseconds ${Math.ceil((audioSeconds(path) + 0.4) * 1000)}; $p.Close()`
       : `(New-Object System.Media.SoundPlayer '${q}').PlaySync()`;
   try {
     const child = spawn(
       "powershell.exe",
       ["-NoProfile", "-WindowStyle", "Hidden", "-Command", script],
-      { windowsHide: true, detached: true, stdio: "ignore" },
+      { windowsHide: true, stdio: "ignore" },
     );
     child.unref();
     return true;
@@ -116,9 +159,19 @@ export async function apply(ctx: Context) {
   } catch {
     saved = null;
   }
-  const cfg: Config = { ...DEFAULTS, ...(saved ?? {}) };
-  const wav = String(cfg.sound_path || cfg.wav_path || "");
-  const duration = wav && existsSync(wav) ? wavSeconds(wav) : 1.5;
+  let cfg: Config = { ...DEFAULTS, ...(saved ?? {}) };
+  let { path: wav, seconds: duration } = pickSound(cfg);
+
+  /** 每次要判断前重读一遍，页面里改完立刻生效。 */
+  const reload = async () => {
+    try {
+      const again = await ctx.config.read<Partial<Config>>("config.json");
+      cfg = { ...DEFAULTS, ...(again ?? {}) };
+    } catch {
+      // 读不到就沿用旧值，不该因此不响
+    }
+    ({ path: wav, seconds: duration } = pickSound(cfg));
+  };
   if (wav && !existsSync(wav)) ctx.logger.warn(`音效文件不存在，回退系统提示音：${wav}`);
 
   const starts = new Map<string, number>();
@@ -137,7 +190,8 @@ export async function apply(ctx: Context) {
   });
 
   // 回复落地 = 这一轮真的发出去了
-  ctx.on("channel/reply", (event) => {
+  ctx.on("channel/reply", async (event) => {
+    await reload();
     if (!cfg.enabled || !event || event.transient === true || !allowed(event)) return;
     const key = sessionOf(event);
     const began = starts.get(key);
@@ -173,9 +227,51 @@ export async function apply(ctx: Context) {
     schema: { type: "object", properties: {}, required: [] },
     danger: "safe",
     run: async () => {
+      await reload();
       const ok = play(wav);
       trace(cfg.log, `test ok=${ok}`);
       return ok ? "已发出提示音" : "播放失败：起不了 powershell";
     },
+  });
+
+  ctx.web.api("/plugins/chime/test", async (_req: any, res: any) => {
+    const reply = (code: number, body: any) => {
+      res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(JSON.stringify(body));
+    };
+    try {
+      await reload();
+      const ok = play(wav);
+      trace(cfg.log, `test ok=${ok}`);
+      if (!ok) return reply(500, { ok: false, error: "起不了 powershell，声音没发出去" });
+      return reply(200, { ok: true, detail: `已发出：${wav || "系统提示音"}` });
+    } catch (error: any) {
+      return reply(500, { ok: false, error: error?.message ?? String(error) });
+    }
+  });
+
+  ctx.web.page(
+    "/plugins/chime/",
+    async (_req: any, res: any) => {
+      await reload();
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(renderPage(cfg));
+    },
+    { title: "提示音", navigation: true },
+  );
+
+  ctx.web.api("/plugins/chime/save", async (req: any, res: any) => {
+    try {
+      const patchIn = sanitize(await readBody(req));
+      const keys = Object.keys(patchIn);
+      if (!keys.length) throw new Error("没有可保存的字段");
+      const merged = { ...(await ctx.config.read<any>("config.json").catch(() => null)), ...patchIn };
+      await ctx.config.save("config.json", merged);
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ ok: true, saved: keys }));
+    } catch (error: any) {
+      res.writeHead(400, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ ok: false, error: error?.message ?? String(error) }));
+    }
   });
 }

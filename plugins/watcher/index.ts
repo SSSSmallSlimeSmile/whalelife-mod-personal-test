@@ -12,11 +12,12 @@ import type { Context } from "../../core/context.ts";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readBody, renderPage, sanitize } from "./ui.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 const DEFAULTS = {
-  enabled: false,
+  enabled: true,
   /** 信匣。一封信一个 md，看完不删。 */
   letters_dir: "",
   /** 叫醒妹妹的口子。写进去两秒内该被取走。 */
@@ -122,9 +123,19 @@ export async function apply(ctx: Context) {
   } catch {
     saved = null;
   }
-  const cfg: Config = { ...DEFAULTS, ...(saved ?? {}) };
+  let cfg: Config = { ...DEFAULTS, ...(saved ?? {}) };
   const state = loadState(cfg.state);
   mkdirSync(dirname(cfg.log), { recursive: true });
+
+  /** 页面里改完立刻生效。state 和 log 跟着启动时的路径走，不跟着变。 */
+  const reload = async () => {
+    try {
+      const again = await ctx.config.read<Partial<Config>>("config.json");
+      cfg = { ...DEFAULTS, ...(again ?? {}) };
+    } catch {
+      // 读不到就沿用旧值
+    }
+  };
 
   const log = (line: string) => trace(cfg.log, line);
 
@@ -180,7 +191,9 @@ export async function apply(ctx: Context) {
 
   ctx.effect(() => {
     const timer = setInterval(() => {
-      if (cfg.enabled && !ctx.signal.aborted) poll("tick");
+      void reload().then(() => {
+        if (cfg.enabled && !ctx.signal.aborted) poll("tick");
+      });
     }, Math.max(5, Number(cfg.poll_seconds)) * 1000);
     // 卸载时掐掉，别留第二条监听——AstrBot 那边为这个栽过。
     return { dispose: () => clearInterval(timer) };
@@ -194,6 +207,7 @@ export async function apply(ctx: Context) {
     schema: { type: "object", properties: {}, required: [] },
     danger: "safe",
     run: async () => {
+      await reload();
       const pending = state.outbox;
       const waited = pending ? ((Date.now() - pending.at) / 1000).toFixed(1) : null;
       return {
@@ -212,6 +226,7 @@ export async function apply(ctx: Context) {
     schema: { type: "object", properties: {}, required: [] },
     danger: "safe",
     run: async () => {
+      await reload();
       const fresh = poll("manual");
       const items = fresh.map((name) => {
         state.letters[name] = { ...(state.letters[name] ?? { mtime: 0, seen: false }), seen: true };
@@ -236,6 +251,7 @@ export async function apply(ctx: Context) {
     run: async (args: { text?: string }) => {
       const text = String(args?.text ?? "").trim();
       if (!text) return "没话可写";
+      await reload();
       const waved = state.outbox
         ? ((Date.now() - state.outbox.at) / 1000).toFixed(0)
         : null;
@@ -255,5 +271,30 @@ export async function apply(ctx: Context) {
         return `写不进去：${String(error)}`;
       }
     },
+  });
+
+  ctx.web.page(
+    "/plugins/watcher/",
+    async (_req: any, res: any) => {
+      await reload();
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(renderPage(cfg));
+    },
+    { title: "递话监听", navigation: true },
+  );
+
+  ctx.web.api("/plugins/watcher/save", async (req: any, res: any) => {
+    try {
+      const patchIn = sanitize(await readBody(req));
+      const keys = Object.keys(patchIn);
+      if (!keys.length) throw new Error("没有可保存的字段");
+      const merged = { ...(await ctx.config.read<any>("config.json").catch(() => null)), ...patchIn };
+      await ctx.config.save("config.json", merged);
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ ok: true, saved: keys }));
+    } catch (error: any) {
+      res.writeHead(400, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ ok: false, error: error?.message ?? String(error) }));
+    }
   });
 }

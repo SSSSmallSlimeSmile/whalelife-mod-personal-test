@@ -1,0 +1,10 @@
+{
+  "hotkey": "F9",
+  "url": "http://127.0.0.1:9270",
+  "min_seconds": 0.35,
+  "max_seconds": 60,
+  "sample_rate": 16000,
+  "device": 0,
+  "log": "",
+  "beep": true
+}
