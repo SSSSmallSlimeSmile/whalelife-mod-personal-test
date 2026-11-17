@@ -29,19 +29,14 @@
 | 每日图 | 同款双轴，每天一格；无记录的日子留底边，悬停写「无记录」 |
 | 模型排名 | 按输入 token 排前八 |
 | 悬停卡 | 白底细边框（原来深色已改掉） |
-| 使用配置 | 新增「日记整理模型」一栏，留空则跟随对话模型 |
 
 ## 三、主干逻辑
 
 | 功能 | 最终形态 |
 |---|---|
-| 模型分级路由 | 规则预判 → 判官 → 高级池 20% 放行；连续闲聊沿用上一档、不叫判官 |
-| 规则修正四条 | 执行动词命中即 MID；`HARD_SIGNALS` 不再自我升级；单字词只认整句；空白区交判官 |
-| 判官记账 | 每次判官调用写进 `memory/usage-judge.jsonl`，账本合并统计 |
 | 价目表 | 八个 provider 实际报价；DeepSeek 分峰谷；MiraRouter 按折扣价；本地记 0；免费档按 provider id 判 0 |
 | reasoning_content 兼容 | 不再按模型名判断；缺失记一条 warn 继续跑，不中断回合 |
 | 图片体积守卫 | 本轮合计超 8MiB 降 detail，超 16MiB 直接拒 |
-| 日记整理 | 可单独指定模型，绕开 `deepseek-v4.1-flash` 两档 `context_window` 100 万 / 20 万的差 |
 | 用量工具 | `usage_today` 查当天；`budget_set` 只记账不拦 |
 | 会话改名接口 | `POST /api/memory/session/rename`（上游本来就有，只是对话页没入口） |
 
@@ -57,7 +52,4 @@
 
 ## 五、明确的遗留
 
-- **没有 commit**：本地最新提交是 `5960abd`，但工作区仍有 `model-config.ts`、`model-router.ts`、`session.ts`、`ui/api.js`、`ui/views.js` 五处未提交改动
-- **`context_window` 五倍差**：配置里 `deepseek-v4.1-flash` 两条，一个 100 万一个 20 万；日记那条线已经绕开，对话那条还在受影响
-- **`/删/` 是单字**：所以「解释一下删除权限」这种问句也会判 MID，没再收紧
 - **chime 无处可放音**：播放器试过 `SoundPlayer`、WPF `MediaPlayer`，探测显示四个 Realtek 端点都 OK，但「默认端点」为空
