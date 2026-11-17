@@ -13,13 +13,12 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 const DEFAULTS = {
-  python: "D:\\AstrBot\\backend\\python\\python.exe",
+  python: "",
   script: join(HERE, "ear_sidecar.py"),
   device: 1,
   engine: "sensevoice",
   model: "base",
-  sensevoice_dir:
-    "K:\\AstrBotData\\projects\\project_eea8e91a\\models\\sensevoice\\models\\iic--SenseVoiceSmall\\snapshots\\master",
+  sensevoice_dir: "",
   language: "zh",
   initial_prompt: "勘，誊，astrbot，whalelife，Minecraft，ComfyUI，Lora，表情包，插件，麦克风",
   silence: 0.8,
@@ -29,7 +28,7 @@ const DEFAULTS = {
   /** 把回复念出来（走 GSV 9880），默认不念。 */
   speak_reply: false,
   gsv_url: "http://127.0.0.1:9880",
-  gsv_ref_audio: "K:\\GPT-SoVITS\\refs\\furina_ref23.wav",
+  gsv_ref_audio: "",
   gsv_prompt_text: "或许我也曾向往过这种力量，但那更像是一种讽刺。",
   /** WhaleLife 启动时自动开始监听。 */
   auto_start: false,

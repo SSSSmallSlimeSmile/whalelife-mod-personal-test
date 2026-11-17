@@ -16,11 +16,11 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 const DEFAULTS = {
-  enabled: true,
+  enabled: false,
   /** 信匣。一封信一个 md，看完不删。 */
-  letters_dir: "K:\\AstrBotData\\projects\\project_eea8e91a\\handoff\\letters",
+  letters_dir: "",
   /** 叫醒妹妹的口子。写进去两秒内该被取走。 */
-  outbox_path: "C:\\Users\\SmallSlimeSmile\\.astrbot\\data\\temp\\sister\\outbox.json",
+  outbox_path: "",
   /** 多久看一次。只读目录，不调模型。 */
   poll_seconds: 20,
   /** 写进去多久还没被取走，就当桥断。 */

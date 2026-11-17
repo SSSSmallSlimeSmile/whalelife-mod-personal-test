@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import queue
 import re
 import sys
@@ -26,8 +27,7 @@ SR = 16000
 DEV_SR = 44100          # 采集用设备原生采样率；16000 下去 MME 常给一片零
 BLOCK = 0.1
 
-SENSE_DIR = (r"K:\AstrBotData\projects\project_eea8e91a\models\sensevoice\models"
-             r"\iic--SenseVoiceSmall\snapshots\master")
+SENSE_DIR = os.environ.get("WHALELIFE_SENSE_DIR", "")
 
 # whisper 对噪声有瘾，静音时爱吐这些
 HALLUCINATIONS = (

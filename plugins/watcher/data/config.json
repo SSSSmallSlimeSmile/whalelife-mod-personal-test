@@ -1,9 +1,0 @@
-{
-  "enabled": true,
-  "letters_dir": "K:\\AstrBotData\\projects\\project_eea8e91a\\handoff\\letters",
-  "outbox_path": "C:\\Users\\SmallSlimeSmile\\.astrbot\\data\\temp\\sister\\outbox.json",
-  "poll_seconds": 20,
-  "bridge_timeout_seconds": 25,
-  "log": "K:\\WhaleLife\\whalelife\\plugins\\watcher\\data\\watcher.log",
-  "state": "K:\\WhaleLife\\whalelife\\plugins\\watcher\\data\\state.json"
-}

@@ -19,7 +19,13 @@
 | `watcher` | 信匣监视 + 递话。默认关闭，脚本本身在跑，需要人确认后再启用 |
 | `ear` | 麦克风听写。代码在，没开麦试过 |
 
-这三个只放代码和配置，运行产物（音频缓存、截图、日志、`__pycache__`）没有入库。
+这三个只放代码和示例配置，运行产物（音频缓存、截图、日志、`__pycache__`）没有入库。
+
+**`watcher` 的配置一样只放示例**：仓库里是 `plugins/watcher/data/config.example.json`，里面的路径都是空的，`enabled` 是 `false`。用之前复制成 `config.json` 再填自己机器上的路径：
+
+```
+copy plugins\watcher\data\config.example.json plugins\watcher\data\config.json
+```
 
 ---
 

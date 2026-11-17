@@ -1,0 +1,9 @@
+{
+  "enabled": false,
+  "letters_dir": "",
+  "outbox_path": "",
+  "poll_seconds": 20,
+  "bridge_timeout_seconds": 25,
+  "log": "",
+  "state": ""
+}
