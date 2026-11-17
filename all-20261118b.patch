@@ -387,15 +387,14 @@ index 0000000..86753bf
 +$stream.Dispose()
 +$img.Dispose()
 diff --git a/core/index.ts b/core/index.ts
-index 8308121..4312106 100644
+index 8308121..89a93bf 100644
 --- a/core/index.ts
 +++ b/core/index.ts
-@@ -17,14 +17,18 @@ import { Sessions } from "./session.ts";
+@@ -17,14 +17,17 @@ import { Sessions } from "./session.ts";
  import { Channels } from "./channels.ts";
  import { startWeb } from "./web.ts";
  import { ModelConfig, resolveModel } from "./model-config.ts";
 +import { loadEnvFile, expandSecret } from "./secrets.ts";
-+import { ModelRouter } from "./model-router.ts";
  import { PersonaFiles } from "./persona-config.ts";
  import { MemoryEngine } from "./memory-engine.ts";
  import { registerMemoryTools } from "./memory-tools.ts";
@@ -409,7 +408,7 @@ index 8308121..4312106 100644
    const config = JSON.parse(
      (await readFile(resolve(root, "config/config.json"), "utf8")).replace(
        /^\uFEFF/,
-@@ -34,15 +38,16 @@ export async function boot(
+@@ -34,15 +37,16 @@ export async function boot(
    const logger = new Logger(
      resolve(root, "logs"),
      config.log,
@@ -428,27 +427,7 @@ index 8308121..4312106 100644
    await diagnostics.initialize();
    diagnostics.event("coverage", {
      supported: ["core_session_chat", "core_tools", "memory_diary", "legacy_memory_maintenance", "plugin_llm_chat", "model_config_http"],
-@@ -74,6 +79,11 @@ export async function boot(
-       resolveModel(config, id),
-     ),
-     tools = new Tools(logger, config.permissions?.tools);
-+  const modelRouter = new ModelRouter(config, logger, llm);
-+  modelRouter.onUsage = (usage) => {
-+    void appendUsageRecord(root, usage);
-+  };
-+  modelRouter.selfCheck();
-   const executionArchive = new ExecutionArchive(resolve(root, "logs/executions"), logger);
-   tools.executionArchive = executionArchive;
-   llm.diagnostics = diagnostics;
-@@ -89,6 +99,7 @@ export async function boot(
-     executionArchive,
-     approval,
-     modelConfig,
-+    modelRouter,
-     personaFiles: new PersonaFiles(root, config, logger),
-   };
-   const sessions = new Sessions(root, config, services);
-@@ -104,6 +115,7 @@ export async function boot(
+@@ -104,6 +108,7 @@ export async function boot(
      registerMemoryTools(ctx.tools, memoryEngine),
    );
    await runtime.builtin("execution_archive", {}, (ctx) => registerExecutionTools(ctx.tools, executionArchive));
@@ -489,7 +468,7 @@ index 0170a78..de3e74b 100644
    delete parameters.reasoning_effort;
    return { ...provider, parameters };
 diff --git a/core/memory-engine.ts b/core/memory-engine.ts
-index 03614a2..bfee965 100644
+index 03614a2..86bfc29 100644
 --- a/core/memory-engine.ts
 +++ b/core/memory-engine.ts
 @@ -253,7 +253,7 @@ export class MemoryEngine {
@@ -501,23 +480,8 @@ index 03614a2..bfee965 100644
      } catch (e: any) {
        if (e.code === "ENOENT") return fallback;
        throw e;
-@@ -899,6 +899,14 @@ export class MemoryEngine {
-     this.memoryReservations.set(ticket.id, { sessionId: id, ticket });
-     return ticket;
-   }
-+  /** 每日记忆请求预算的剩余量；日记归档必须按它来挑段落，否则永远挑不到能过账的一批。 */
-+  async memoryRequestBudget(id: string): Promise<{ budget: number; reserved: number; remaining: number }> {
-+    const s = await this.state(id);
-+    const day = new Date().toISOString().slice(0, 10);
-+    const budget = s.settings.daily_memory_tokens ?? 20000;
-+    const reserved = s.daily?.day === day ? Math.max(0, s.daily.reserved ?? 0) : 0;
-+    return { budget, reserved, remaining: Math.max(0, budget - reserved) };
-+  }
-   async settleMemoryRequest(id: string, ticket: MemoryReservation, usage?: any, options: { notSent?: boolean } = {}): Promise<void> {
-     const entry = this.memoryReservations.get(ticket.id);
-     if (!entry) return; // Settled, foreign, or from a prior process: never refund again.
 diff --git a/core/model-config.ts b/core/model-config.ts
-index 1047ebf..5680807 100644
+index 1047ebf..347aa1c 100644
 --- a/core/model-config.ts
 +++ b/core/model-config.ts
 @@ -5,6 +5,7 @@
@@ -528,22 +492,12 @@ index 1047ebf..5680807 100644
  import { readFileSync } from "node:fs";
  import { readFile, writeFile, rename, unlink, mkdir } from "node:fs/promises";
  import { join, resolve, dirname } from "node:path";
-@@ -27,6 +28,7 @@ export const MODEL_TYPES = [
- export type ModelType = (typeof MODEL_TYPES)[number];
- export const MODEL_ROLES = [
-   "chat",
-+  "diary",
-   "embedding",
-   "rerank",
-   "image",
-@@ -34,6 +36,16 @@ export const MODEL_ROLES = [
+@@ -34,6 +35,14 @@ export const MODEL_ROLES = [
    "tts",
  ] as const;
  type ModelRole = (typeof MODEL_ROLES)[number];
-+/** 用途到模型类型：日记整理借用对话模型，但可单独绑定。 */
 +export const MODEL_ROLE_TYPES: Record<ModelRole, ModelType> = {
 +  chat: "chat",
-+  diary: "chat",
 +  embedding: "embedding",
 +  rerank: "rerank",
 +  image: "image",
@@ -553,25 +507,7 @@ index 1047ebf..5680807 100644
  export interface ProviderConfig {
    id: string;
    name: string;
-@@ -387,6 +399,17 @@ function normalize(config: any) {
-   };
- }
- 
-+/** 日记整理专用模型；未绑定则返回 null，由调用方回落到对话模型。 */
-+export function resolveDiaryModel(config: any) {
-+  const selected = config?.model_bindings?.diary;
-+  if (!selected) return null;
-+  try {
-+    return resolveModel(config, selected);
-+  } catch {
-+    return null;
-+  }
-+}
-+
- export function resolveChatModel(
-   config: any,
-   personaId?: string,
-@@ -496,7 +519,7 @@ export class ModelConfig {
+@@ -496,7 +505,7 @@ export class ModelConfig {
        providers: this.source.providers.map(
          ({ api_key, ...p }: ProviderConfig) => ({
            ...p,
@@ -580,7 +516,7 @@ index 1047ebf..5680807 100644
          }),
        ),
        models: this.source.models.map((m: ModelDefinition) => ({
-@@ -544,7 +567,7 @@ export class ModelConfig {
+@@ -544,7 +553,7 @@ export class ModelConfig {
      return structuredClone({
        id: model.id, name: model.name, model: model.model, type: model.type,
        provider_id: provider.id, provider_name: provider.name, protocol: provider.protocol,
@@ -589,7 +525,7 @@ index 1047ebf..5680807 100644
        timeout_seconds: provider.timeout_seconds, proxy_url: provider.proxy_url,
        parameters: model.parameters, dimensions: model.dimensions,
        context_window: model.context_window ?? null,
-@@ -739,7 +762,7 @@ export class ModelConfig {
+@@ -739,7 +748,7 @@ export class ModelConfig {
        selected: unknown,
        type: ModelType,
      ): string | null => {
@@ -598,7 +534,7 @@ index 1047ebf..5680807 100644
        if (typeof selected !== "string")
          throw new ModelConfigError("每项模型用途需明确选择模型或留空");
        const model = models.find((m) => m.id === selected);
-@@ -760,7 +783,7 @@ export class ModelConfig {
+@@ -760,7 +769,7 @@ export class ModelConfig {
      const bindings = Object.fromEntries(
        MODEL_ROLES.map((role) => [
          role,
@@ -607,624 +543,6 @@ index 1047ebf..5680807 100644
        ]),
      );
      const personas = disk.personas ?? {};
-diff --git a/core/model-router.ts b/core/model-router.ts
-new file mode 100644
-index 0000000..caa9353
---- /dev/null
-+++ b/core/model-router.ts
-@@ -0,0 +1,612 @@
-+/*! Copyright (c) 2026 iinukami and contributors.
-+ * SPDX-License-Identifier: AGPL-3.0-only
-+ * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
-+ */
-+/**
-+ * 回合级模型分级路由。
-+ *
-+ * 移植自 AstrBot 的 astrbot_plugin_judge 魔改版（三档 HIGH/MID/FAST）。
-+ * WhaleLife 的事件系统只通知不拦截，插件没有"回合开始前"的钩子，
-+ * 所以分段选模型只能落在主干：persona() 之后、发请求之前换掉 provider。
-+ */
-+import { readFileSync } from "node:fs";
-+import { resolveModel } from "./model-config.ts";
-+import { expandSecret } from "./secrets.ts";
-+import { requestUsage } from "./session-context.ts";
-+
-+export const DEFAULT_JUDGE_SYSTEM_PROMPT =
-+  "你是消息分流助手，只输出一个 JSON 对象：{\"tier\":\"HIGH\"|\"MID\"|\"FAST\",\"confidence\":0 到 1 的小数}。\\n" +
-+  "HIGH —— 需要多步推理、代码或数学推导、长链条分析、要求严格准确的活；\\n" +
-+  "MID —— 一般任务，需要理解或动手，但步骤不多、容错较高；\\n" +
-+  "FAST —— 寒暄、闲聊、情绪回应、一句话能答完的问题。\\n" +
-+  "极短的祈使句（例如「来，做」「搜」「改」「继续」「打开那个」）通常是让助手接着做上一步说好的事，不是闲聊，判 MID。\\n" +
-+  "confidence 表示你对这个判断的把握，1 为完全确定。不要输出 JSON 以外的任何文字。";
-+
-+export const DEFAULT_JUDGE_PROMPT_TEMPLATE = `你是一个“消息复杂度/成本-收益”分流器。目标是在满足用户需求的前提下尽量节省成本与时延：除非确实需要更强推理/更长上下文/更高准确性，否则优先选择 FAST。
-+
-+你只输出一个 JSON 对象，格式固定：{"tier":"HIGH|MID|FAST","confidence":0 到 1 的小数}。不要输出解释、代码块或其他任何文字。
-+
-+## 判定目标
-+- HIGH：任务对推理深度、正确性、稳定性、长上下文、复杂结构化输出有明显要求，用 MID 高概率给出错误/不完整/不可靠结果。
-+- MID：需要一点推理或整理才答得好，但不是难题——解释概念、两三步推演、比较几个选项、写一段有结构的话、看一段稍长的材料。
-+- FAST：可以用简短直接回答解决；或即使略有不精确也不影响体验；或可用简单规则/常识完成。
-+
-+## 关键判断维度（满足任意一条通常选 HIGH）
-+1) 多步推理：需要严谨推导、证明、复杂逻辑链、反例讨论、细致方案权衡。
-+2) 数学/算法/代码：编程实现、调试、复杂算法、SQL/正则、性能分析、边界条件多。
-+3) 长文本/多要点：需要总结/对比/归纳长内容，或输出结构化清单且要覆盖全面。
-+4) 专业/高风险：医疗/法律/金融/安全等对准确性要求高，或需要谨慎措辞与推断。
-+5) 明确要求“详细/深入/步骤/举例/证明/推导/完整代码/测试用例/鲁棒性”等。
-+
-+## 典型 MID 场景（满足任意一条通常选 MID）
-+- 要我解释某个概念或原理，但不要求严谨证明。
-+- 要一段有结构的回答：列几点、比较两三个选项、给个大致方案。
-+- 要结合上下文推断意图，需要一点逻辑但不复杂。
-+- 消息本身不短（两三行以上），但内容并不难。
-+- 极短的祈使句：「来，做」「搜」「改」「继续」「再来」「试试」「接着做」「打开那个」——这是让助手继续执行上一步已经说好的事，不是寒暄。
-+
-+## 典型 FAST 场景（满足任意一条通常选 FAST）
-+- 问候/闲聊/情绪安抚/短句翻译/简短定义解释。
-+- 单一事实或简单是非判断（不要求严谨推导）。
-+- 简单改写、润色、生成短回复、轻量总结（文本不长）。
-+- 用户问题很短且没有“深入/详细/步骤/代码/推导”等要求。
-+- 已经做完、只要一句回应或确认的收尾话。
-+
-+## 边界处理
-+- 不确定时默认 MID：宁可多想一点，也别在真想思考的时候把它省掉。
-+- 只有明显是寒暄、单句问答、只要个短结论时才选 FAST。
-+- 只有明确要求严谨推理、完整代码、证明、长文综合时才选 HIGH。
-+- 判不准的，把 confidence 报低一些（低于 0.55 会被当成没把握）也不要硬猜。
-+
-+用户消息如下：
-+$message
-+
-+最终输出（仅一个 JSON 对象）：{"tier":"HIGH|MID|FAST","confidence":0.0-1.0}`;
-+
-+/** 解析判官输出：优先 JSON，退回旧的单词语法。解析不了返回 null。 */
-+export function parseJudgeOutput(raw: string): { tier: Decision; confidence: number } | null {
-+  const text = String(raw ?? "").trim();
-+  if (!text) return null;
-+  const cleaned = text.replace(/```[a-zA-Z]*\n?/g, "").replace(/```/g, "").trim();
-+  const start = cleaned.indexOf("{");
-+  const end = cleaned.lastIndexOf("}");
-+  if (start >= 0 && end > start) {
-+    try {
-+      const obj: any = JSON.parse(cleaned.slice(start, end + 1));
-+      const tierRaw = String(obj?.tier ?? obj?.level ?? obj?.decision ?? "").toUpperCase();
-+      const tier = tierRaw.includes("HIGH") ? "HIGH"
-+        : tierRaw.includes("MID") || tierRaw.includes("MEDIUM") ? "MID"
-+          : tierRaw.includes("FAST") ? "FAST" : "";
-+      if (tier) {
-+        const conf = Number(obj?.confidence);
-+        return {
-+          tier: tier as Decision,
-+          confidence: Number.isFinite(conf) ? Math.min(1, Math.max(0, conf)) : 1,
-+        };
-+      }
-+    } catch {
-+      // 不是合法 JSON，退回按词解析
-+    }
-+  }
-+  const out = cleaned.toUpperCase();
-+  if (out.includes("HIGH")) return { tier: "HIGH", confidence: 1 };
-+  if (out.includes("MID") || out.includes("MEDIUM")) return { tier: "MID", confidence: 1 };
-+  if (out.includes("FAST")) return { tier: "FAST", confidence: 1 };
-+  return null;
-+}
-+
-+
-+/** 意图样本库：本地 embedding 只做单向放行（exec → MID），不降档。 */
-+type IntentRoute = { name: string; utterances: string[] };
-+
-+const embedCache = new Map<string, number[]>();
-+
-+const INTENT_FILE = new URL("../config/router-intents.json", import.meta.url);
-+
-+function cosine(a: number[], b: number[]) {
-+  const n = Math.min(a.length, b.length);
-+  let dot = 0;
-+  let na = 0;
-+  let nb = 0;
-+  for (let i = 0; i < n; i++) {
-+    dot += a[i] * b[i];
-+    na += a[i] * a[i];
-+    nb += b[i] * b[i];
-+  }
-+  if (!na || !nb) return 0;
-+  return dot / Math.sqrt(na * nb);
-+}
-+
-+const META_FAST_PATTERNS = [
-+  /把.*(需求|代码).*(贴|发|给|丢|贴我|发我)/,
-+  /(把|将).*(代码|报错).*(发|贴|给).*(看看|我看看|我看下|我看一眼)/,
-+  /(你要|想要|准备).*(写|搞).*(哪块|什么|哪个).*(编程|代码)/,
-+  /(python|node|javascript|java).*(还是|或|或者).*(别的|其它|其他)/i,
-+];
-+
-+/** 动手意图。关键词列不全，所以补一组“动词 + 语气词”的正则。 */
-+const EXEC_KEYWORDS = [
-+  "删掉", "删除", "删了", "移走", "移动", "移一下", "安装", "装上", "装一下",
-+  "重启", "拉起来", "杀掉", "执行", "跑一下", "跑个", "复制", "拷贝",
-+  "改名", "改个名", "改成", "换成", "提交", "回滚", "撤销", "部署", "编译",
-+  "打开", "点开", "搜一下", "搜一搜", "搜索", "查一下", "查查", "读一下",
-+  "看一下", "看一眼", "列出", "翻一下", "调一下",
-+];
-+
-+const EXEC_PATTERNS: RegExp[] = [
-+  /删/,
-+  /移除|移走|移动|挪/,
-+  /安装|装上|装一下|装吧/,
-+  /重启|拉起|启动一下|杀掉/,
-+  /执行|运行|跑一下|跑个/,
-+  /复制|拷贝/,
-+  /改名|改个名/,
-+  /提交|回滚|撤销|部署|编译/,
-+  /(改|换|加|去掉)(一下|个|掉|吧|了|成)/,
-+  /打开|点开|切到|跳到|翻到/,
-+  /搜|搜索|查一下|查查|查下/,
-+  /看一下|看一眼|看看|读一下|念一下|列一下|列出/,
-+];
-+
-+const STRONG_COMPLEX_KEYWORDS = [
-+  "算法", "函数", "类", "接口", "计算", "数学", "公式", "方程", "证明", "推导",
-+  "原理", "机制", "为什么", "比较", "区别", "优缺点", "总结", "归纳", "写一篇",
-+  "写一个", "帮我写", "实现", "改一下", "优化一下", "格式化", "sql", "正则",
-+  "bug", "error", "debug", "调试", "报错", "修复", "优化", "设计", "架构",
-+  "方案", "策略", "规划",
-+];
-+
-+const WEAK_COMPLEX_KEYWORDS = [
-+  "编程", "程序", "代码", "python", "java", "javascript", "node", "c++", "html", "css",
-+];
-+
-+const WEAK_NEED_STRONG_TRIGGERS = [
-+  "怎么", "如何", "为什么", "写", "实现", "改", "生成", "修复", "优化", "调试",
-+  "报错", "bug", "error", "debug", "算法", "函数", "类", "接口", "sql", "正则",
-+];
-+
-+const SIMPLE_KEYWORDS = [
-+  "你好", "嗨", "hi", "hello", "早上好", "晚上好", "谢谢", "感谢", "好的",
-+  "可以", "行", "嗯", "是", "否", "对", "不对", "是的", "不是", "几点",
-+  "天气", "今天", "明天", "在吗", "在不在", "有空吗",
-+];
-+
-+const HARD_SIGNALS = [
-+  "证明", "推导", "完整", "详细", "步骤", "实现", "算法", "复杂度", "测试",
-+  "边界", "架构", "优化", "方案", "对比",
-+];
-+
-+type Decision = "HIGH" | "MID" | "FAST";
-+
-+const SINGLE_CHAR_SIMPLE = new Set(["嗯", "是", "否", "对", "行"]);
-+
-+function hit(text: string, keywords: string[]) {
-+  for (const keyword of keywords) {
-+    const kw = String(keyword).toLowerCase();
-+    if (kw.length < 2) {
-+      // 单字词只认整句：否则“行”会命中“执行”“运行”，“对”会命中“对比”。
-+      if (!SINGLE_CHAR_SIMPLE.has(kw)) continue;
-+      if (text.replace(/[\s，。！？、,.!?~…]+/g, "") === kw) return keyword;
-+      continue;
-+    }
-+    if (text.includes(kw)) return keyword;
-+  }
-+  return "";
-+}
-+
-+let intentSamplesPromise: Promise<Map<string, { text: string; vector: number[] }[]>> | null = null;
-+
-+export class ModelRouter {
-+  config: any;
-+  logger: any;
-+  llm: any;
-+  settings: any;
-+  lastDecision: Map<string, any> = new Map();
-+
-+  constructor(config: any, logger: any, llm: any) {
-+    this.config = config;
-+    this.logger = logger;
-+    this.llm = llm;
-+    this.settings = config.model_router ?? {};
-+  }
-+
-+  get enabled() {
-+    return this.settings?.enabled === true;
-+  }
-+
-+  setting(name: string, fallback: any) {
-+    const value = this.settings?.[name];
-+    return value === undefined || value === null ? fallback : value;
-+  }
-+
-+  /** 规则预判：命中就不必叫判官。逻辑与插件 judge_rules 保持一致（含软档处理）。 */
-+  ruleJudgement(text: string, lower: string): { decision: Decision | ""; reason: string } {
-+    if (text.length > 200) return { decision: "HIGH", reason: "len>200" };
-+    if (text.includes("```") || lower.includes("def ") || lower.includes("function "))
-+      return { decision: "HIGH", reason: "codeblock" };
-+    if (text.length > 80) return { decision: "MID", reason: "len>80" };
-+    for (const pattern of META_FAST_PATTERNS)
-+      if (pattern.test(text)) return { decision: "FAST", reason: "meta:clarify" };
-+
-+    // 日常词（今天、天气、几点、你好……）只在短句里算数：
-+    // 长句里的“今天”多是时间状语，排在强关键词前面命中，会把
-+    // “今天帮我把桌面上那个 bat 改一下”误判成闲聊。
-+    // 动手意图优先于寒暄词：“谢谢，把那个删了”不该因为“谢谢”落进 FAST。
-+    const exec = hit(lower, EXEC_KEYWORDS);
-+    if (exec) return { decision: "MID", reason: `exec:${exec}` };
-+    const execPattern = EXEC_PATTERNS.find((pattern) => pattern.test(text));
-+    if (execPattern) return { decision: "MID", reason: `exec:/${execPattern.source}/` };
-+
-+    const simpleMaxRaw = Number(this.setting("simple_max_chars", 20));
-+    const simpleMax = Number.isFinite(simpleMaxRaw) && simpleMaxRaw > 0 ? simpleMaxRaw : 20;
-+    if (text.length <= simpleMax) {
-+      const simple = hit(lower, SIMPLE_KEYWORDS);
-+      if (simple && !hit(lower, STRONG_COMPLEX_KEYWORDS) && !hit(lower, WEAK_COMPLEX_KEYWORDS))
-+        return { decision: "FAST", reason: `kw:${simple}` };
-+    }
-+
-+    // HARD_SIGNALS 与 STRONG_COMPLEX_KEYWORDS 有重叠（方案、优化、架构、实现……），
-+    // 不排掉关键词自己，“这个方案好不好”会被自己顶成 HIGH。
-+    const soft = (keyword: string) =>
-+      text.length < 60 &&
-+      !HARD_SIGNALS.some((signal) => signal !== keyword && lower.includes(signal));
-+
-+    const strong = hit(lower, STRONG_COMPLEX_KEYWORDS);
-+    if (strong)
-+      return soft(strong)
-+        ? { decision: "MID", reason: `kw:${strong}:soft` }
-+        : { decision: "HIGH", reason: `kw:${strong}` };
-+
-+    const weak = hit(lower, WEAK_COMPLEX_KEYWORDS);
-+    if (weak) {
-+      if (WEAK_NEED_STRONG_TRIGGERS.some((trigger) => lower.includes(trigger)))
-+        return soft(weak)
-+          ? { decision: "MID", reason: `kw:${weak}:soft` }
-+          : { decision: "HIGH", reason: `kw:${weak}` };
-+      return { decision: "MID", reason: `kw:${weak}:weak` };
-+    }
-+
-+    if (text.length <= 20 && (text.includes("?") || text.includes("？")))
-+      return { decision: "FAST", reason: "short_question" };
-+    return { decision: "", reason: "" };
-+  }
-+
-+  /** 判官自己的调用同样计费；不记这一笔，账本会少算、图上也会少一个颜色。 */
-+  onUsage?: (usage: any) => void;
-+
-+  /** 判官：输出一个 JSON 对象，给 40 token 够用；超时或解析不了就交给保底。 */
-+  async ask(text: string): Promise<{ decision: Decision | ""; source: string; reason: string }> {
-+    const modelId = String(this.setting("judge_model", "") || "");
-+    if (!modelId) return { decision: "", source: "fallback", reason: "no_judge_model" };
-+    let provider: any;
-+    try {
-+      provider = resolveModel(this.config, modelId);
-+    } catch (error: any) {
-+      this.logger.warn("判官模型不可用", { model: modelId, error: error?.message });
-+      return { decision: "", source: "fallback", reason: "judge_model_unavailable" };
-+    }
-+    const system = String(this.setting("judge_system_prompt", DEFAULT_JUDGE_SYSTEM_PROMPT) || "").trim() || DEFAULT_JUDGE_SYSTEM_PROMPT;
-+    const template = String(this.setting("judge_prompt_template", DEFAULT_JUDGE_PROMPT_TEMPLATE));
-+    const prompt = template.split("$message").join(text);
-+    const timeout = Number(this.setting("judge_timeout_ms", 4000));
-+    try {
-+      const reply = await this.llm.chat({
-+        provider,
-+        messages: [
-+          { role: "system", content: system },
-+          { role: "user", content: prompt },
-+        ],
-+        max_tokens: 40,
-+        signal: AbortSignal.timeout(Number.isFinite(timeout) && timeout > 0 ? timeout : 4000),
-+      });
-+      if (reply?.usage) {
-+        try {
-+          const measured = requestUsage(reply.usage, provider, null);
-+          if (measured) this.onUsage?.(measured);
-+        } catch {
-+          // 记账失败不影响判档：这一笔宁可少算，也不能让回合走保底。
-+        }
-+      }
-+      const raw = String(reply?.text ?? "");
-+      const parsed = parseJudgeOutput(raw);
-+      if (parsed) {
-+        const floorRaw = Number(this.setting("judge_min_confidence", 0.55));
-+        const floor = Number.isFinite(floorRaw) ? floorRaw : 0.55;
-+        if (parsed.confidence < floor) {
-+          this.logger.warn("判官没把握，走保底", { tier: parsed.tier, confidence: parsed.confidence, floor });
-+          return { decision: "", source: "fallback", reason: `low_confidence:${parsed.confidence.toFixed(2)}` };
-+        }
-+        return {
-+          decision: parsed.tier,
-+          source: "judge",
-+          reason: parsed.confidence < 1 ? `conf:${parsed.confidence.toFixed(2)}` : "",
-+        };
-+      }
-+      this.logger.warn("判官输出无法解析", { preview: raw.slice(0, 120), chars: raw.length, finish: (reply as any)?.finishReason ?? (reply as any)?.finish_reason ?? null });
-+      return { decision: "", source: "fallback", reason: "judge_unparseable" };
-+    } catch (error: any) {
-+      this.logger.warn("判官调用失败，走保底", { error: error?.message, name: error?.name, code: error?.code });
-+      return { decision: "", source: "fallback", reason: "judge_error" };
-+    }
-+  }
-+
-+
-+  /** 向量模型：取 model_bindings.embedding 指向的那条。取不到返回 null。 */
-+  private embedProvider() {
-+    try {
-+      const id = this.config?.model_bindings?.embedding;
-+      if (!id) return null;
-+      const model = (this.config?.models ?? []).find((m: any) => m.id === id);
-+      if (!model || model.enabled === false) return null;
-+      const provider = (this.config?.providers ?? []).find((p: any) => p.id === model.provider);
-+      if (!provider || provider.enabled === false) return null;
-+      return { model: String(model.model), provider };
-+    } catch {
-+      return null;
-+    }
-+  }
-+
-+  private async embed(text: string): Promise<number[] | null> {
-+    const target = this.embedProvider();
-+    if (!target) return null;
-+    const key = text.trim();
-+    if (!key) return null;
-+    const cached = embedCache.get(key);
-+    if (cached) return cached;
-+    const base = String(target.provider.base_url || "").replace(/\/+$/, "");
-+    const controller = new AbortController();
-+    const timer = setTimeout(() => controller.abort(), Number(this.setting("embed_timeout_ms", 8000)));
-+    try {
-+      const res = await fetch(`${base}/embeddings`, {
-+        method: "POST",
-+        headers: {
-+          "Content-Type": "application/json",
-+          ...(expandSecret(target.provider.api_key) ? { Authorization: `Bearer ${expandSecret(target.provider.api_key)}` } : {}),
-+        },
-+        body: JSON.stringify({ model: target.model, input: key }),
-+        signal: controller.signal,
-+      });
-+      if (!res.ok) return null;
-+      const data: any = await res.json();
-+      const vector = data?.data?.[0]?.embedding;
-+      if (!Array.isArray(vector) || !vector.length) return null;
-+      if (embedCache.size > 2000) embedCache.clear();
-+      embedCache.set(key, vector);
-+      return vector;
-+    } catch {
-+      return null;
-+    } finally {
-+      clearTimeout(timer);
-+    }
-+  }
-+
-+  /** 每个意图配上它所有例句的向量。只算一次，读不到就当没有样本库。 */
-+  private intentSamples(): Promise<Map<string, { text: string; vector: number[] }[]>> {
-+    if (!intentSamplesPromise) {
-+      intentSamplesPromise = (async () => {
-+        const map = new Map<string, { text: string; vector: number[] }[]>();
-+        let routes: IntentRoute[] = [];
-+        try {
-+          const raw = JSON.parse(readFileSync(INTENT_FILE, "utf8"));
-+          routes = Array.isArray(raw?.routes) ? raw.routes : [];
-+        } catch (error: any) {
-+          this.logger.warn("意图样本库读不到，跳过向量放行", { error: error?.message });
-+          return map;
-+        }
-+        for (const route of routes) {
-+          const bucket: { text: string; vector: number[] }[] = [];
-+          for (const sentence of route.utterances ?? []) {
-+            const text = String(sentence ?? "").trim();
-+            if (!text) continue;
-+            const vector = await this.embed(text);
-+            if (vector) bucket.push({ text, vector });
-+          }
-+          if (bucket.length) map.set(route.name, bucket);
-+        }
-+        return map;
-+      })();
-+    }
-+    return intentSamplesPromise;
-+  }
-+
-+  /**
-+   * 单向放行：只有 exec 拿最高分、分数够高、且明显领先第二名时才抬到 MID。
-+   * 用最近邻而不是中心向量——中心向量会把 chat 和 exec 糊在一起，
-+   * “来，做”“继续”这种短祈使句的优势会被抹平。
-+   * 返回 null 表示不管，交给判官。
-+   */
-+  private async embedEscalate(text: string) {
-+    if (this.setting("embed_route", true) === false) return null;
-+    const vector = await this.embed(text);
-+    if (!vector) return null;
-+    const samples = await this.intentSamples();
-+    if (!samples.size) return null;
-+    const scored: { name: string; score: number; hit: string }[] = [];
-+    for (const [name, bucket] of samples) {
-+      let best = { score: -1, hit: "" };
-+      for (const sample of bucket) {
-+        const score = cosine(vector, sample.vector);
-+        if (score > best.score) best = { score, hit: sample.text };
-+      }
-+      scored.push({ name, score: best.score, hit: best.hit });
-+    }
-+    scored.sort((a, b) => b.score - a.score);
-+    const top = scored[0];
-+    const second = scored[1] ?? { name: top.name, score: 0, hit: "" };
-+    const gateRaw = Number(this.setting("embed_route_gate", 0.7));
-+    const gate = Number.isFinite(gateRaw) ? gateRaw : 0.7;
-+    const marginRaw = Number(this.setting("embed_route_margin", 0.05));
-+    const margin = Number.isFinite(marginRaw) ? marginRaw : 0.05;
-+    if (top.name !== "exec") return null;
-+    if (top.score < gate) return null;
-+    if (top.score - second.score < margin) return null;
-+    return { score: top.score, margin: top.score - second.score, next: second.name };
-+  }
-+
-+  /**
-+   * 启动自检：把 pools / judge_model 里解析不了的模型名一次列出来。
-+   * 这套补丁给别人用时，最常见的问题就是照抄了本地配置里的模型别名（mr-xxx），
-+   * 而他那边根本没这些模型；不早点说，只会表现为"路由不生效"。
-+   */
-+  selfCheck() {
-+    if (!this.enabled) {
-+      this.logger.info("模型分级", { status: "disabled" });
-+      return;
-+    }
-+    const pools: any = this.settings?.pools ?? {};
-+    const roles: Array<[string, string]> = [
-+      ["judge", String(this.setting("judge_model", "") || "")],
-+      ["fast", String(pools.fast || "")],
-+      ["mid", String(pools.mid || "")],
-+      ["high", String(pools.high || "")],
-+    ];
-+    const missing: string[] = [];
-+    for (const [role, id] of roles) {
-+      if (!id) {
-+        missing.push(role + "：未配置");
-+        continue;
-+      }
-+      try {
-+        resolveModel(this.config, id);
-+      } catch (error: any) {
-+        missing.push(role + "：" + id + "（" + (error?.message ?? "解析不到") + "）");
-+      }
-+    }
-+    if (missing.length) {
-+      this.logger.warn("模型分级配置不完整，缺的档会逐级回退，最差回退到人格默认模型", { missing });
-+    } else {
-+      this.logger.info("模型分级就绪", {
-+        pools: { fast: pools.fast, mid: pools.mid, high: pools.high },
-+        judge: this.setting("judge_model", ""),
-+      });
-+    }
-+  }
-+
-+  private resolvePool(pool: string) {
-+    const pools = this.settings?.pools ?? {};
-+    const chain =
-+      pool === "high" ? ["high", "mid", "fast"]
-+        : pool === "mid" ? ["mid", "fast", "high"]
-+          : ["fast", "mid", "high"];
-+    for (const name of chain) {
-+      const id = String(pools[name] || "");
-+      if (!id) continue;
-+      try {
-+        return { pool: name, model: id, provider: resolveModel(this.config, id) };
-+      } catch {
-+        continue;
-+      }
-+    }
-+    return null;
-+  }
-+
-+  /**
-+   * 返回该回合该用的 provider。null 表示不干预，沿用人格默认。
-+   */
-+  async route(input: { text: string; sessionId?: string; fallbackProvider?: any }) {
-+    if (!this.enabled) return null;
-+    const text = String(input.text || "");
-+    if (!text.trim()) return null;
-+    const lower = text.toLowerCase();
-+    const now = Date.now();
-+
-+    let decision: Decision | "" = "";
-+    let source = "";
-+    let reason = "";
-+
-+    const rule = this.ruleJudgement(text, lower);
-+    if (rule.decision) {
-+      decision = rule.decision;
-+      source = "rule";
-+      reason = rule.reason;
-+    }
-+
-+    // 连续闲聊不叫判官：上一轮判成 FAST、间隔不久、这句又短，就沿用。
-+    if (!decision && this.setting("skip_judge_after_fast", true) && input.sessionId) {
-+      const last = this.lastDecision.get(input.sessionId);
-+      const window = Number(this.setting("carry_seconds", 600)) * 1000;
-+      const maxChars = Number(this.setting("carry_max_chars", 24));
-+      if (
-+        last &&
-+        last.decision === "FAST" &&
-+        now - last.at < window &&
-+        text.trim().length <= maxChars
-+      ) {
-+        decision = "FAST";
-+        source = "carry";
-+        reason = "after_fast";
-+      }
-+    }
-+
-+    // 向量放行：只往高了抬（exec → MID），不降档。
-+    if (!decision) {
-+      const escalated = await this.embedEscalate(text);
-+      if (escalated) {
-+        decision = "MID";
-+        source = "embed";
-+        reason = `exec:${escalated.score.toFixed(3)}/+${escalated.margin.toFixed(3)}`;
-+      }
-+    }
-+
-+    if (!decision) {
-+      const judged = await this.ask(text);
-+      decision = judged.decision as Decision | "";
-+      source = judged.source;
-+      reason = judged.reason;
-+    }
-+
-+    // 拿不准就落在一档：按配置的保底档（默认 mid，即 low think）。
-+    if (!decision) {
-+      decision = String(this.setting("fallback_decision", "MID")).toUpperCase() as Decision;
-+      if (decision !== "HIGH" && decision !== "MID" && decision !== "FAST") decision = "MID";
-+      source = source || "fallback";
-+      reason = reason || "unknown";
-+    }
-+
-+    // 预算：判成 HIGH 也只有 high_ratio% 的机会真的用高级池，其余降到 mid。
-+    let pool = decision.toLowerCase();
-+    if (decision === "HIGH") {
-+      const ratioRaw = Number(this.setting("high_ratio", 20));
-+      const ratio = Number.isFinite(ratioRaw) ? Math.min(100, Math.max(0, ratioRaw)) : 20;
-+      if (ratio <= 0) {
-+        pool = "mid";
-+        reason = reason || "budget";
-+      } else if (ratio < 100 && Math.floor(Math.random() * 100) + 1 > ratio) {
-+        pool = "mid";
-+        reason = reason || "budget";
-+      }
-+    }
-+
-+    const resolved = this.resolvePool(pool);
-+    if (!resolved) {
-+      this.logger.warn("路由目标模型不可用，回退人格默认", { decision, pool });
-+      return {
-+        provider: input.fallbackProvider,
-+        decision,
-+        source: `${source}:unavailable`,
-+        reason,
-+        pool: "base",
-+        model: "",
-+      };
-+    }
-+
-+    if (input.sessionId) this.lastDecision.set(input.sessionId, { decision, at: now });
-+
-+    this.logger.info("模型分级", {
-+      decision,
-+      pool: resolved.pool,
-+      model: resolved.model,
-+      source,
-+      ...(reason ? { reason } : {}),
-+    });
-+
-+    return {
-+      provider: resolved.provider,
-+      decision,
-+      source,
-+      reason,
-+      pool: resolved.pool,
-+      model: resolved.model,
-+    };
-+  }
-+}
 diff --git a/core/model-usage.ts b/core/model-usage.ts
 index 295a3a7..dfe9bc9 100644
 --- a/core/model-usage.ts
@@ -1517,10 +835,10 @@ index 0000000..0aad606
 +  return loaded;
 +}
 diff --git a/core/session.ts b/core/session.ts
-index 754b582..884d39f 100644
+index 754b582..40746e4 100644
 --- a/core/session.ts
 +++ b/core/session.ts
-@@ -15,8 +15,14 @@ import { shortSummaryKey, shortContext, compressShort, consolidateLong, shouldDe
+@@ -15,7 +15,12 @@ import { shortSummaryKey, shortContext, compressShort, consolidateLong, shouldDe
  import { attribution, historyTail, originNote, originOf, renderHistory } from "./provenance.ts";
  import { SessionQueue, type QueuePolicy } from "./session-queue.ts";
  import { TRANSIENT_REPLY, type ToolTurn } from "./tool-retention.ts";
@@ -1531,23 +849,17 @@ index 754b582..884d39f 100644
 +/** 本轮图片总量上下限：超过 soft 降 detail，超过 total 直接拒（勘 2026-11-16）。 */
 +const IMAGE_LIMITS = Object.freeze({ softBytes: 8 * 1024 * 1024, totalBytes: 16 * 1024 * 1024 });
  import { resolveModelContext } from "./model-context.ts";
-+import { resolveDiaryModel } from "./model-config.ts";
  import { diaryContext, diaryRequestPlan, writeDiary } from "./memory-diary.ts";
  import { contextFrame, diaryPrefix, fittingDiaryPrefix, historyEntry, recalledMaterial, supportsContextPrefix } from "./context-material.ts";
- import {
-@@ -26,6 +32,11 @@ import {
+@@ -26,6 +31,7 @@ import {
    requestUsage,
    memoryWindow,
  } from "./session-context.ts";
-+// 日记整理时，原文 token 相对输出上限的最大倍数；超过它压缩比就不现实。
-+const DIARY_SOURCE_RATIO = 3;
-+// 预算扣掉固定开销后装不下这个规模的原文时，压缩比不现实：不请求模型，等预算归零。
-+const MIN_DIARY_SOURCE_TOKENS = 4000;
 +
  export class Sessions {
    memoryMaintenance = false;
    blockedSessions = new Set<string>();
-@@ -114,12 +125,25 @@ export class Sessions {
+@@ -114,12 +120,25 @@ export class Sessions {
      const history = matchingHistory(rows, p.revision, policy.history_scope);
      const last = rows.findLast((row: any) => row.role === "assistant" && !row.delivery_id);
      const usage = last?.request_usage;
@@ -1575,7 +887,7 @@ index 754b582..884d39f 100644
      const legacy = policy.memory_mode === "legacy";
      const window = legacy ? memoryWindow(history, policy)
        : { short: history.filter((row: any) => row.type === "message"), long: [] };
-@@ -191,9 +215,9 @@ export class Sessions {
+@@ -191,9 +210,9 @@ export class Sessions {
        usage: matches
          ? {
              ...usage,
@@ -1588,7 +900,7 @@ index 754b582..884d39f 100644
                : null,
              settings_changed:
                JSON.stringify(last.context_policy) !== JSON.stringify(policy) ||
-@@ -248,9 +272,11 @@ export class Sessions {
+@@ -248,9 +267,11 @@ export class Sessions {
      route?: ChannelRoute,
      transient = false,
      queue?: QueuePolicy,
@@ -1601,7 +913,7 @@ index 754b582..884d39f 100644
    }
    /** Capture arrival metadata before any asynchronous routing or queue wait. */
    async outgoingIdentity(id: string, route: ChannelRoute) {
-@@ -291,6 +317,7 @@ export class Sessions {
+@@ -291,6 +312,7 @@ export class Sessions {
      transient = false,
      turn: ToolTurn = { transient: false },
      input?: TurnInput,
@@ -1609,7 +921,7 @@ index 754b582..884d39f 100644
    ) {
      signal.throwIfAborted();
      if (this.memoryMaintenance) throw Error("记忆恢复中，请稍后重试");
-@@ -302,6 +329,10 @@ export class Sessions {
+@@ -302,6 +324,10 @@ export class Sessions {
      if (this.memoryMaintenance || this.blockedSessions.has(id))
        throw Error("会话维护中，请稍后重试");
      if (!text.trim() || text.length > 16000) throw Error("请输入 1–16000 字");
@@ -1620,27 +932,7 @@ index 754b582..884d39f 100644
      const receivedAt = route?.receivedAt ?? new Date().toISOString(), zone = route?.timezone ?? timezone(this.config.timezone);
      const { memory, memoryEngine: engine, llm, tools, logger } = this.services;
      const execution = await this.services.executionArchive?.start(id, {
-@@ -328,6 +359,19 @@ export class Sessions {
-       signal.throwIfAborted();
-       const p = await persona(this.root, this.config, channel.persona);
-       this.identities.set(id, { persona_id: p.id, persona_name: p.name, persona_revision: p.revision, timezone: zone });
-+      const routed = transient
-+        ? null
-+        : await this.services.modelRouter?.route({ text, sessionId: id, fallbackProvider: p.provider });
-+      if (routed?.provider) {
-+        p.provider = routed.provider;
-+        await execution?.write("route", {
-+          decision: routed.decision,
-+          source: routed.source,
-+          pool: routed.pool,
-+          model: routed.model,
-+          ...(routed.reason ? { reason: routed.reason } : {}),
-+        });
-+      }
-       await execution?.write("context", { persona: p.id, provider: p.provider.id, model: p.provider.model });
-       if (expectedPersona && expectedPersona !== p.id)
-         throw Error("当前人格已在其他窗口切换，请刷新后重试");
-@@ -356,6 +400,24 @@ export class Sessions {
+@@ -356,6 +382,24 @@ export class Sessions {
          personaId: p.id,
          permission: channel.permission ?? p.permission,
          signal,
@@ -1665,7 +957,7 @@ index 754b582..884d39f 100644
        };
        const storedHistory = (engine ? await engine.contextRows(id) : conversationRows(await memory.readSession(id))).filter(
          (row: any) => row.type !== "channel_receipt",
-@@ -463,18 +525,27 @@ export class Sessions {
+@@ -463,18 +507,27 @@ export class Sessions {
        const reserve = this.outputReserve(p.provider, legacy);
        const requestBudget = limit.tokens ? Math.max(1, limit.tokens - reserve) : Infinity;
        const stablePrefix = !legacy && supportsContextPrefix(p.provider);
@@ -1695,80 +987,7 @@ index 754b582..884d39f 100644
        );
        let recentTokens = tail(recent, Infinity).tokens;
        const overBudget = () => recentTokens > capacity();
-@@ -500,24 +571,62 @@ export class Sessions {
-           const inputTokens = estimateTokens(promptText(assembled()) + JSON.stringify(toolList));
-           const target = limit.tokens * policy.compression_target_percent! / 100 - reserve;
-           // Output is a request ceiling, not a forced diary length or a source truncation limit.
--          const outputTokens = Math.max(256, Math.min(8192, Math.floor(requestBudget * 0.1)));
-+          // 输出上限可配：写日记比对话更需要长输出，8192 在长会话里必然被 finish_reason=length 截断。
-+          const outputCeiling = Math.max(256, Math.min(65536, Number(this.config.memory?.diary_max_output_tokens) || 8192));
-+          const outputTokens = Math.max(256, Math.min(outputCeiling, Math.floor(requestBudget * 0.1)));
-+          // 日记整理可单独绑定模型；触发阈值仍按对话模型容量算。
-+          const diaryModel = resolveDiaryModel(this.config);
-+          const diaryProvider = diaryModel?.provider ?? p.provider;
-+          const diaryLimit = (diaryModel ? (await this.modelLimit(diaryProvider, signal)).tokens : null) ?? limit.tokens;
-           const cost = (rows: any[]) => estimateTokens(JSON.stringify(renderHistory(rows.map(historyEntry), zone, historyReference)));
--          const desired = diaryPrefix(diary.remaining, inputTokens - target + outputTokens, cost);
--          const selected = fittingDiaryPrefix(desired, rows => diaryRequestPlan({ rows, scope, timezone: zone,
--            outputTokens }).reserved <= limit.tokens!);
-+          // 原文上限：一次整理的原文规模不得超过输出上限的若干倍，否则必然被 finish_reason=length 截断。
-+          const sourceCeiling = outputTokens * DIARY_SOURCE_RATIO;
-+          const desired = diaryPrefix(diary.remaining, Math.min(inputTokens - target + outputTokens, sourceCeiling), cost);
-+          // 预订额度由记忆引擎按「每日记忆预算」卡住；只看模型上下文会挑出一批永远过不了账的段落。
-+          const memoryBudget = await engine.memoryRequestBudget(id);
-+          const fits = (rows: any[]) => {
-+            const reserved = diaryRequestPlan({ rows, scope, timezone: zone, outputTokens }).reserved;
-+            return reserved <= diaryLimit! && reserved <= memoryBudget.remaining;
-+          };
-+          const selected = memoryBudget.remaining > 0 ? fittingDiaryPrefix(desired, fits) : [];
-+          const selectedCost = selected.length ? cost(selected) : 0;
-           if (diary.paused) memoryNotice = "日记整理已暂停：" + diary.paused.reason;
-+          else if (memoryBudget.remaining <= 0) {
-+            memoryNotice = "今日记忆整理预算已用完（" + memoryBudget.reserved + "/" + memoryBudget.budget + "）；明天继续，或提高每日记忆预算。";
-+            logger.info("日记整理", { status: "skipped", reason: "memory_budget_exhausted", remaining: diary.remaining.length, budget: diaryLimit, memory_remaining: memoryBudget.remaining });
-+          }
-           else if (estimateTokens(promptText(assembled([])) + JSON.stringify(toolList)) >= target)
-             memoryNotice = "已有日记和固定内容已接近压后目标；不会再次压缩旧日记，请提高目标比例或封存后新建会话。";
--          else if (!selected.length) memoryNotice = "没有可在模型容量内归档的完整旧对话；请更换更大容量模型或封存后新建会话。";
-+          else if (!selected.length) {
-+            memoryNotice = "没有可归档的完整旧对话：模型容量或今日记忆预算不足（剩余 " + memoryBudget.remaining + " token）；请提高每日记忆预算、更换更大容量模型，或封存后新建会话。";
-+            logger.info("日记整理", { status: "skipped", reason: "no_fitting_prefix", remaining: diary.remaining.length, budget: diaryLimit, memory_remaining: memoryBudget.remaining });
-+          }
-+          else if (selectedCost < MIN_DIARY_SOURCE_TOKENS && selected.length < desired.length) {
-+            memoryNotice = "今日记忆整理预算不足以整理出有效压缩比（可归档 " + selected.length + " 条）；等预算归零后再整理。";
-+            logger.info("日记整理", { status: "skipped", reason: "budget_too_small", sources: selected.length, cost: selectedCost, memory_remaining: memoryBudget.remaining, remaining: diary.remaining.length, budget: diaryLimit });
-+          }
-           else {
--            const result = await writeDiary({ services: this.services, id, scope, rows: selected,
--              provider: p.provider, limit: limit.tokens, outputTokens, signal, timezone: zone });
--            memoryNotice = result.reason;
-+            // 输出撞上 max_completion_tokens 只说明这一批原文超出了模型一次能写完的量：
-+            // 把原文减半再试，比把整个会话的日记停到人工解封更合适。最多三轮，避免反复花钱。
-+            let attempt = selected;
-+            let result: any = null;
-+            for (let round = 0; ; round += 1) {
-+              result = await writeDiary({ services: this.services, id, scope, rows: attempt,
-+                provider: diaryProvider, limit: diaryLimit, outputTokens, signal, timezone: zone });
-+              if (result.status === "written" || round >= 2) break;
-+              if (!String(result.reason ?? "").includes("截断")) break;
-+              const half = attempt.slice(0, Math.floor(attempt.length / 2));
-+              if (!half.length || cost(half) < MIN_DIARY_SOURCE_TOKENS) break;
-+              await engine.retryDiary(id, scope); // 上一轮失败写了暂停标记；不清掉，下一次调用会直接返回 paused
-+              attempt = half;
-+            }
-+            memoryNotice = result?.reason;
-             diary = await diaryContext(engine, id, scope, shortRows);
-             recent = diary.remaining.map(historyEntry);
--            if (result.status === "written" && estimateTokens(promptText(assembled()) + JSON.stringify(toolList)) > target)
-+            if (result?.status === "written" && estimateTokens(promptText(assembled()) + JSON.stringify(toolList)) > target)
-               memoryNotice = "日记已保存；为保留信息，本次尚未降到目标占用，不会立即追加压缩请求。";
--            await execution?.write("memory_diary", { status: result.status, sources: selected.length, reason: result.reason });
-+            await execution?.write("memory_diary", { status: result?.status, sources: attempt.length, reason: result?.reason });
-+            logger.info("日记整理", { status: result?.status, sources: attempt.length, reason: result?.reason, remaining: diary.remaining.length, budget: diaryLimit });
-           }
-         }
-       }
-@@ -540,6 +649,7 @@ export class Sessions {
+@@ -540,6 +593,7 @@ export class Sessions {
          after: { materials: materials(), history: recent, input: text, transient,
            history_scope: policy.history_scope, context_limit: limit.tokens, request_budget: Number.isFinite(requestBudget) ? requestBudget : null } });
        let final = "";
@@ -1776,7 +995,7 @@ index 754b582..884d39f 100644
        let measured: any = null;
        let memoryWriteRejected = false;
        const mediaSignals: AbortSignal[] = [];
-@@ -613,8 +723,11 @@ export class Sessions {
+@@ -613,8 +667,11 @@ export class Sessions {
            // Seal synchronously after the last await. Unsent candidates never enter history.
            if (input && !input.tryFinish()) continue;
            final = reply.text;
@@ -1788,7 +1007,7 @@ index 754b582..884d39f 100644
          if (historyReference && typeof reply.reasoning_content !== "string")
            throw Error("思考模式工具响应缺少 reasoning_content，未执行本次工具调用");
          messages.push({
-@@ -638,6 +751,8 @@ export class Sessions {
+@@ -638,6 +695,8 @@ export class Sessions {
            const toolOrigin = tools.entries?.get(call.name)?.origin;
            let result;
            superseded ||= input?.hasPending() ?? false;
@@ -1797,7 +1016,7 @@ index 754b582..884d39f 100644
            if (superseded) {
              result = { ok: false, executed: false, reason: "user_input_appended",
                result: "未执行：用户补充了消息，请结合补充内容重新判断是否仍需调用此工具。" };
-@@ -661,6 +776,8 @@ export class Sessions {
+@@ -661,6 +720,8 @@ export class Sessions {
                tool: turn.transient && !toolOrigin ? "[未注册工具]" : call.name, error: result.result,
                ...(turn.transient ? {} : { arguments: call.arguments }) });
            }
@@ -1806,7 +1025,7 @@ index 754b582..884d39f 100644
            if (!superseded && !result.ok && ["remember_fact", "edit_facts"].includes(call.name))
              memoryWriteRejected = true;
            await memory.appendEvent({
-@@ -695,6 +812,10 @@ export class Sessions {
+@@ -695,6 +756,10 @@ export class Sessions {
          messages.push(...attachments);
          if (attachments.length) diagnostics?.event("context.change", { operation: "append", source: "tool_attachments", after: attachments });
        }
@@ -1817,7 +1036,7 @@ index 754b582..884d39f 100644
        if (!final) throw Error("模型未返回最终回复，请重试");
        await memory.appendEvent({
          type: "message",
-@@ -704,6 +825,7 @@ export class Sessions {
+@@ -704,6 +769,7 @@ export class Sessions {
          role: "assistant",
          // User-facing conversation is primary history. Technical plugin runs retain their opt-in privacy.
          text: transient && turn.transient ? TRANSIENT_REPLY : final,
@@ -1825,7 +1044,7 @@ index 754b582..884d39f 100644
          ...(transient && turn.transient ? { transient: true } : {}),
          ...context,
          request_usage: measured,
-@@ -716,6 +838,8 @@ export class Sessions {
+@@ -716,6 +782,8 @@ export class Sessions {
            provider: p.provider, limit: limit.tokens, signal, timezone: zone,
            rows: matchingHistory(currentRows, p.revision, policy.history_scope), policy, revision: p.revision });
        }
@@ -1858,18 +1077,6 @@ index a434c0b..866aeb3 100644
        // Cancellation cannot undo a completed external operation or replace its true result.
        if (tool.transientResult) {
          if (!result || typeof result !== "object" || !Object.hasOwn(result, "content") || !Object.hasOwn(result, "receipt"))
-diff --git a/core/ui/api.js b/core/ui/api.js
-index 7d430e0..42d04f3 100644
---- a/core/ui/api.js
-+++ b/core/ui/api.js
-@@ -31,6 +31,7 @@ export const escapeHTML = (value) =>
-   );
- export const typeNames = {
-   chat: "对话",
-+  diary: "日记整理",
-   embedding: "向量 / Embedding",
-   rerank: "重排序",
-   image: "图像生成",
 diff --git a/core/ui/app.js b/core/ui/app.js
 index 55ade77..db1888d 100644
 --- a/core/ui/app.js
@@ -3212,18 +2419,16 @@ index 5251c75..0d0d3ab 100644
 +  cursor: default;
 +}
 diff --git a/core/ui/views.js b/core/ui/views.js
-index 7884c7e..cc5944b 100644
+index 7884c7e..63a0554 100644
 --- a/core/ui/views.js
 +++ b/core/ui/views.js
-@@ -120,13 +120,15 @@ export function renderBindings(app) {
+@@ -120,13 +120,13 @@ export function renderBindings(app) {
    const sessionSettings = `<section class="panel panel-body" style="margin-bottom:22px"><h2>当前会话</h2><p>正在使用：<strong>${e(sessionName(app.state))}</strong> <small>${e(app.state.session)}</small></p><div class="row context-session-select"><label for="active-session">切换到</label><select id="active-session" ${app.state.chatBusy ? "disabled" : ""}>${sessions.map(item => `<option value="${e(item.id)}" ${item.id === app.state.session ? "selected" : ""}>${e(item.name || item.id)}${item.id === app.state.session ? "（正在使用）" : ""}</option>`).join("")}</select><button id="apply-session" class="btn primary small" type="button" disabled>切换会话</button><button id="new-session" class="btn small" type="button" ${app.state.chatBusy ? "disabled" : ""}>${icon("plus")}新建并使用</button></div><p class="hint">选好后点击“切换会话”才生效。网页和跟随当前会话的插件共用此选择，正在处理的请求仍留在原会话。浏览记忆档案不会切换这里。</p><p id="session-switch-error" class="form-error" role="alert"></p></section>`;
    const activePersona = c.activePersona || app.state.status?.persona || "";
    const personaSettings = `<label class="form-field"><span>当前聊天人格</span><select id="active-persona" name="activePersona" required ${app.state.chatBusy || !c.personas.length ? "disabled" : ""}>${!activePersona ? '<option value="">请选择人格</option>' : ""}${c.personas.map((p) => `<option value="${e(p.id)}" ${p.id === activePersona ? "selected" : ""}>${e(p.name)}</option>`).join("")}</select></label><p id="active-persona-routing" class="hint" style="margin-top:16px">${e(personaRoutingText(c, activePersona))}</p><p class="hint" style="margin-top:12px">与模型选择一起保存后生效。切换人格保持当前会话和聊天记录；请等待当前回复结束后切换。</p><a href="#personas" class="btn tonal" style="margin-top:18px">编辑人格 ${icon("arrow")}</a>`;
 -  const options = (type, selected, inherit = false) =>
 -    `<option value="">${inherit ? "使用工作空间的对话模型" : "未配置"}</option>` +
 +  const options = (type, selected, inherit = false) => {
-+    // 日记整理借用对话模型那一类；模型本身没有 type=diary。
-+    const kind = type === "diary" ? "chat" : type;
 +    return `<option value="">${inherit ? "使用工作空间的对话模型" : "未配置"}</option>` +
      c.models
        .filter(
@@ -3235,28 +2440,15 @@ index 7884c7e..cc5944b 100644
            m.enabled &&
            !m.configuration_error &&
            c.providers.find((p) => p.id === m.provider)?.enabled,
-@@ -136,9 +138,10 @@ export function renderBindings(app) {
+@@ -136,6 +136,7 @@ export function renderBindings(app) {
            `<option value="${e(m.id)}" ${m.id === selected ? "selected" : ""}>${e(m.name)} · ${e(c.providers.find((p) => p.id === m.provider)?.name || m.provider)}</option>`,
        )
        .join("");
 +  };
    const field = (type, description) =>
      `<div class="binding-row"><div class="row">${icon(typeIcon(type))}<h3>${typeNames[type]}模型</h3></div><select name="binding_${type}" aria-label="${typeNames[type]}模型">${options(type, c.bindings[type])}</select><p>${description}</p></div>`;
--  return `<div class="page-heading"><div><div class="eyebrow">MODEL ROUTING</div><h1>使用配置</h1><p>明确选择每种能力使用的模型。未配置的用途保持关闭。</p></div><div class="heading-actions"><button type="submit" form="bindings-form" class="btn primary" id="save-bindings">${icon("check")}保存配置</button></div></div><div class="info-banner">${icon("info")}选择已启用的模型，保存后从下一次请求开始生效。</div>${sessionSettings}<form id="bindings-form"><div class="bindings-grid"><section class="panel"><div class="panel-header"><h2>工作空间模型</h2><a href="#models" class="btn small link">管理模型 ${icon("arrow")}</a></div><div class="panel-body">${field("chat", "用于鲸鲸的日常对话和会话摘要。")}${field("embedding", "供插件使用的向量模型。当前支持配置与接口测试；检索由插件实现。")}${field("rerank", "供重排序插件使用的模型选择，可留空。")}<details style="margin-top:20px"><summary class="muted">更多模型用途</summary><div style="margin-top:20px">${field("image", "图像生成服务的模型选择。")}${field("stt", "语音识别服务的模型选择。")}${field("tts", "语音合成服务的模型选择。")}<p class="hint" style="margin-top:16px">这里保存模型选择，图像、语音与重排序的具体调用由对应插件实现。</p></div></details></div></section><section class="panel"><div class="panel-header"><h2>人格配置</h2></div><div class="panel-body">${personaSettings}${timeSettings}</div></section></div><p id="bindings-error" class="form-error" role="alert"></p></form>`;
-+  return `<div class="page-heading"><div><div class="eyebrow">MODEL ROUTING</div><h1>使用配置</h1><p>明确选择每种能力使用的模型。未配置的用途保持关闭。</p></div><div class="heading-actions"><button type="submit" form="bindings-form" class="btn primary" id="save-bindings">${icon("check")}保存配置</button></div></div><div class="info-banner">${icon("info")}选择已启用的模型，保存后从下一次请求开始生效。</div>${sessionSettings}<form id="bindings-form"><div class="bindings-grid"><section class="panel"><div class="panel-header"><h2>工作空间模型</h2><a href="#models" class="btn small link">管理模型 ${icon("arrow")}</a></div><div class="panel-body">${field("chat", "用于鲸鲸的日常对话和会话摘要。")}${field("diary", "日记整理单独使用的模型。留空则沿用对话模型。")}${field("embedding", "供插件使用的向量模型。当前支持配置与接口测试；检索由插件实现。")}${field("rerank", "供重排序插件使用的模型选择，可留空。")}<details style="margin-top:20px"><summary class="muted">更多模型用途</summary><div style="margin-top:20px">${field("image", "图像生成服务的模型选择。")}${field("stt", "语音识别服务的模型选择。")}${field("tts", "语音合成服务的模型选择。")}<p class="hint" style="margin-top:16px">这里保存模型选择，图像、语音与重排序的具体调用由对应插件实现。</p></div></details></div></section><section class="panel"><div class="panel-header"><h2>人格配置</h2></div><div class="panel-body">${personaSettings}${timeSettings}</div></section></div><p id="bindings-error" class="form-error" role="alert"></p></form>`;
- }
- export function bindBindings(app) {
-   app.bindingsDirty = false;
-@@ -184,7 +187,7 @@ export function bindBindings(app) {
-     button.disabled = true;
-     const next = app.configDraft();
-     if (selectedPersona) next.activePersona = selectedPersona;
--    for (const key of ["chat", "embedding", "rerank", "image", "stt", "tts"])
-+    for (const key of ["chat", "diary", "embedding", "rerank", "image", "stt", "tts"])
-       next.bindings[key] = data.get("binding_" + key) || null;
-     try {
-       await app.saveConfig(next);
-@@ -208,7 +211,8 @@ export function bindPlugins(app) {
+   return `<div class="page-heading"><div><div class="eyebrow">MODEL ROUTING</div><h1>使用配置</h1><p>明确选择每种能力使用的模型。未配置的用途保持关闭。</p></div><div class="heading-actions"><button type="submit" form="bindings-form" class="btn primary" id="save-bindings">${icon("check")}保存配置</button></div></div><div class="info-banner">${icon("info")}选择已启用的模型，保存后从下一次请求开始生效。</div>${sessionSettings}<form id="bindings-form"><div class="bindings-grid"><section class="panel"><div class="panel-header"><h2>工作空间模型</h2><a href="#models" class="btn small link">管理模型 ${icon("arrow")}</a></div><div class="panel-body">${field("chat", "用于鲸鲸的日常对话和会话摘要。")}${field("embedding", "供插件使用的向量模型。当前支持配置与接口测试；检索由插件实现。")}${field("rerank", "供重排序插件使用的模型选择，可留空。")}<details style="margin-top:20px"><summary class="muted">更多模型用途</summary><div style="margin-top:20px">${field("image", "图像生成服务的模型选择。")}${field("stt", "语音识别服务的模型选择。")}${field("tts", "语音合成服务的模型选择。")}<p class="hint" style="margin-top:16px">这里保存模型选择，图像、语音与重排序的具体调用由对应插件实现。</p></div></details></div></section><section class="panel"><div class="panel-header"><h2>人格配置</h2></div><div class="panel-body">${personaSettings}${timeSettings}</div></section></div><p id="bindings-error" class="form-error" role="alert"></p></form>`;
+@@ -208,7 +209,8 @@ export function bindPlugins(app) {
  export function renderChat(app) {
    const model = activeChat(app);
    const personaName = app.state.status.personaName || "助手";
@@ -3266,7 +2458,7 @@ index 7884c7e..cc5944b 100644
  }
  export function bindChat(app) {
    app.refreshSessionContext();
-@@ -216,6 +220,9 @@ export function bindChat(app) {
+@@ -216,6 +218,9 @@ export function bindChat(app) {
    const input = document.querySelector("#chat-input");
    input.value = app.state.chatDraft || "";
    input.oninput = () => (app.state.chatDraft = input.value);
@@ -3851,30 +3043,6 @@ index 1d8286d..69d9559 100644
          send({ type: "done" });
        } catch (error: any) {
          logger.error("聊天失败", { error });
-diff --git a/tests/bridge.live.ts b/tests/bridge.live.ts
-new file mode 100644
-index 0000000..24019f3
---- /dev/null
-+++ b/tests/bridge.live.ts
-@@ -0,0 +1,18 @@
-+import { apply } from "../plugins/bridge/index.ts";
-+import { readFile } from "node:fs/promises";
-+
-+const cfg = JSON.parse(await readFile(new URL("../plugins/bridge/data/config.json", import.meta.url), "utf8"));
-+const reg = new Map<string, any>();
-+const ctx: any = {
-+  logger: { info() {}, warn() {}, error() {}, debug() {} },
-+  tools: { register(t: any) { reg.set(t.name, t); return () => {}; } },
-+  config: { async read() { return cfg; }, async save() {} },
-+  signal: new AbortController().signal,
-+  effect(fn: any) { return fn(); },
-+  provide() {}, get() {}, plugin: async () => ({}),
-+};
-+await apply(ctx);
-+const t0 = Date.now();
-+const out = await reg.get("ask_astrbot").run({ question: "你是哪一个？用一句话回答，说明你现在在哪个框架里。" }, { permission: "full" });
-+console.log("耗时", ((Date.now() - t0) / 1000).toFixed(1), "秒");
-+console.log(String(out).slice(0, 600));
 diff --git a/tests/console.test.ts b/tests/console.test.ts
 index 82097ed..2f875e6 100644
 --- a/tests/console.test.ts
@@ -4111,3 +3279,53 @@ index 6b09d51..a36826a 100644
    assert.doesNotMatch(renderContextPanel(app), /400 \/ 200|仅供查看/);
    const compact = renderContextMeter(app.state.memoryContext, true);
    assert.match(compact, /chat-context-compact/);
+diff --git a/tools/kan-edit-rail.ps1 b/tools/kan-edit-rail.ps1
+new file mode 100644
+index 0000000..74b7025
+--- /dev/null
++++ b/tools/kan-edit-rail.ps1
+@@ -0,0 +1,44 @@
++$ErrorActionPreference = "Stop"
++$path = "K:\WhaleLife\whalelife\core\ui\app.js"
++$enc = New-Object System.Text.UTF8Encoding($false)
++$text = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
++
++Copy-Item $path "$path.bak-kan-20261116-rail5" -Force
++
++$old = @'
++    // 当前那一节仍按消息真实位置判定，任何时刻只留一条紫线
++    const head = box.scrollTop + Math.min(120, box.clientHeight * 0.3);
++    let active = 0;
++    (this.railTurns || []).forEach((turn, i) => {
++      const node = nodes[turn.from];
++      const from = node ? node.getBoundingClientRect().top - boxRect.top + box.scrollTop : 0;
++      if (from <= head) active = i;
++    });
++    ticks.forEach((tick, i) => tick.classList.toggle("active", i === active));
++'@
++
++$new = @'
++    // 当前那一节：直接拿消息相对视口的位置比，不再掺 scrollTop。
++    // 旧写法假设滚动一定发生在这个容器上；实际一旦滚动落在祖先元素，
++    // scrollTop 恒为 0、每条消息的 rect 却已经在动，于是"全都不超过阈值"，
++    // 高亮永远停在最后一格（勘 2026-11-16 修）。
++    const liveBox = box.getBoundingClientRect();
++    const head = liveBox.top + Math.min(120, box.clientHeight * 0.3);
++    let active = 0;
++    (this.railTurns || []).forEach((turn, i) => {
++      const node = nodes[turn.from];
++      if (!node) return;
++      if (node.getBoundingClientRect().top <= head) active = i;
++    });
++    ticks.forEach((tick, i) => tick.classList.toggle("active", i === active));
++'@
++
++if (-not $text.Contains($old.Replace("`r`n", "`n")) -and -not $text.Contains($old)) { throw "锚点没找到（active 块）" }
++$text = $text.Replace($old, $new)
++
++$text = $text.Replace("  }  async refreshSessionContext() {", "  }`r`n  async refreshSessionContext() {")
++
++[System.IO.File]::WriteAllText($path, $text, $enc)
++node --check $path
++if ($LASTEXITCODE -ne 0) { throw "node --check 失败" }
++"OK"
