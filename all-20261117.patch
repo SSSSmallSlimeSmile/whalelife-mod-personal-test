@@ -1,0 +1,4080 @@
+diff --git a/core/plugin-process.ts b/core/plugin-process.ts
+index bb49f28..d02c6e2 100644
+--- a/core/plugin-process.ts
++++ b/core/plugin-process.ts
+@@ -23,6 +23,7 @@ export class PluginProcess {
+   private child: ChildProcess;
+   private peer: PluginRPC;
+   private lastPulse = Date.now();
++  private started = false;
+   private closing?: Promise<void>;
+   private dead = false;
+   private faulted = false;
+@@ -43,7 +44,7 @@ export class PluginProcess {
+     let prepared!: () => void, failed!: (error: Error) => void;
+     this.ready = new Promise((resolve, reject) => { prepared = resolve; failed = reject; }); void this.ready.catch(() => {});
+     this.child.on("message", (message: any) => {
+-      if (message.type === "ready") { this.lastPulse = Date.now(); prepared(); }
++      if (message.type === "ready") { this.lastPulse = Date.now(); this.started = true; prepared(); }
+       else if (message.type === "pulse") this.lastPulse = Date.now();
+       else if (message.type === "fatal") this.fault(Error(message.error));
+       else { try { this.peer.receive(message); } catch (error: any) { this.fault(error); } }
+@@ -52,7 +53,7 @@ export class PluginProcess {
+     this.child.on("exit", (code, signal) => { this.dead = true; const error = Error(`插件 ${id} 进程退出（${signal ?? code}）`); failed(error); this.peer.close(error); if (!this.closing) this.fault(error); });
+     const log = (level: "info" | "warn", chunk: Buffer) => { for (const line of chunk.toString().split(/\r?\n/)) if (line) ctx.logger[level]("插件输出", { plugin: id, text: line.slice(0, 4000) }); };
+     this.child.stdout?.on("data", (chunk) => log("info", chunk)); this.child.stderr?.on("data", (chunk) => log("warn", chunk));
+-    this.watchdog = setInterval(() => { if (!this.closing && Date.now() - this.lastPulse > this.options.heartbeatTimeoutMs) this.fault(Error("插件执行无响应，已切割")); }, Math.min(250, this.options.heartbeatTimeoutMs / 2));
++    this.watchdog = setInterval(() => { if (!this.closing && this.started && Date.now() - this.lastPulse > this.options.heartbeatTimeoutMs) this.fault(Error("插件执行无响应，已切割")); }, Math.min(250, this.options.heartbeatTimeoutMs / 2));
+     this.watchdog.unref();
+     const kernel = Object.freeze({
+       ctx,
+diff --git a/.gitignore b/.gitignore
+index 07b8678..40694e8 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -33,3 +33,19 @@ plugins/**/data/
+ *.key
+ *.p12
+ *.pfx
++
++# ===== 本地调试产物（勘） =====
++*.bak-kan-*
++*.bak-prethink-*
++cdp_prof_*/
++chrome_prof*/
++tmp/
++bili_dump.html
++bing_dumpdom.html
++r2.html
++render_test.html
++rn_index.html
++test_bili2.html
++chrome_err.txt
++tests/*.live.out.txt
++cdp_dump*.ps1
+diff --git a/config.example.json b/config.example.json
+index c206df8..49f84f6 100644
+--- a/config.example.json
++++ b/config.example.json
+@@ -6,6 +6,7 @@
+   "models": [],
+   "model_bindings": {
+     "chat": null,
++    "diary": null,
+     "embedding": null,
+     "rerank": null,
+     "image": null,
+@@ -16,7 +17,6 @@
+     "whale": {
+       "name": "鲸鲸",
+       "file": "memory/personas/whale.md",
+-      "model": null,
+       "permission": "ask"
+     }
+   },
+@@ -24,9 +24,26 @@
+   "memory": {
+     "root": "memory",
+     "history_enabled": true,
+-    "diary_enabled": false,
++    "history_scope": "persona",
++    "context_mode": "diary",
++    "diary_enabled": true,
+     "compression_trigger_percent": 80,
+     "compression_target_percent": 50,
+     "facts_max_lines": 100
++  },
++  "model_router": {
++    "enabled": false,
++    "judge_model": null,
++    "pools": { "fast": null, "mid": null, "high": null },
++    "high_ratio": 20,
++    "fallback_decision": "MID",
++    "simple_max_chars": 20,
++    "rule_prejudge": true,
++    "skip_judge_after_fast": true,
++    "carry_seconds": 600,
++    "carry_max_chars": 24,
++    "cache_ttl_seconds": 600,
++    "cache_max_entries": 500,
++    "judge_timeout_ms": 4000
+   }
+ }
+diff --git a/core/channels.ts b/core/channels.ts
+index 1abf4ef..e980a85 100644
+--- a/core/channels.ts
++++ b/core/channels.ts
+@@ -611,18 +611,18 @@ export class Channels {
+     groups.set(groupKey, { fingerprint, promise });
+     return promise;
+   }
+-  private generate(id: string, text: string, route: ChannelRoute, onChunk: (text: string) => void = () => {}, onContext?: (value: any) => void, expectedPersona?: string) {
++  private generate(id: string, text: string, route: ChannelRoute, onChunk: (text: string) => void = () => {}, onContext?: (value: any) => void, expectedPersona?: string, images?: { mimeType: string; data: Uint8Array }[], input?: TurnInput) {
+     route.signal?.throwIfAborted();
+     return this.sessions.chat(id, text, onChunk, onContext, expectedPersona, route, false, { wait: true,
+-      onWaiting: () => onContext?.({ queued: true }) });
++      onWaiting: () => onContext?.({ queued: true }) }, images, input);
+   }
+   /** Web keeps its explicit session and streaming protocol, sharing the trusted dispatch path. */
+-  web(id: string, text: string, onChunk: (text: string) => void, onContext?: (value: any) => void, expectedPersona?: string) {
++  web(id: string, text: string, onChunk: (text: string) => void, onContext?: (value: any) => void, expectedPersona?: string, images?: { mimeType: string; data: Uint8Array }[], input?: TurnInput) {
+     if (this.closing) throw Error("渠道服务已关闭");
+     safeId(id);
+     return this.watch(this.generate(id, text, { channel: "web", account: "local", peer: id, signal: this.controller.signal,
+       origin: { plugin: "core", channel: "web", platform: "控制台" },
+-      ...this.policy({ id: "web", account: "local" }) }, onChunk, onContext, expectedPersona));
++      ...this.policy({ id: "web", account: "local" }) }, onChunk, onContext, expectedPersona, images, input));
+   }
+   register(adapter: ChannelAdapter, owner = "core"): ChannelHandle {
+     if (this.closing) throw Error("渠道服务已关闭");
+diff --git a/core/clipboard-image.ps1 b/core/clipboard-image.ps1
+new file mode 100644
+index 0000000..86753bf
+--- /dev/null
++++ b/core/clipboard-image.ps1
+@@ -0,0 +1,21 @@
++# Reads the Windows clipboard bitmap and prints it as base64 PNG.
++# Used by /api/clipboard-image when the browser cannot decode a pasted image
++# (WeChat screenshots often reach Chromium as a bare DIB that fails to decode).
++# Must run in an STA apartment: -STA is required for Clipboard::GetImage().
++Add-Type -AssemblyName System.Windows.Forms
++Add-Type -AssemblyName System.Drawing
++try {
++  $img = [System.Windows.Forms.Clipboard]::GetImage()
++} catch {
++  [Console]::Out.Write("ERROR:" + $_.Exception.Message)
++  exit 4
++}
++if ($null -eq $img) {
++  [Console]::Out.Write("NOIMAGE")
++  exit 3
++}
++$stream = New-Object System.IO.MemoryStream
++$img.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
++[Console]::Out.Write([Convert]::ToBase64String($stream.ToArray()))
++$stream.Dispose()
++$img.Dispose()
+diff --git a/core/index.ts b/core/index.ts
+index 8308121..4050106 100644
+--- a/core/index.ts
++++ b/core/index.ts
+@@ -17,11 +17,13 @@ import { Sessions } from "./session.ts";
+ import { Channels } from "./channels.ts";
+ import { startWeb } from "./web.ts";
+ import { ModelConfig, resolveModel } from "./model-config.ts";
++import { ModelRouter } from "./model-router.ts";
+ import { PersonaFiles } from "./persona-config.ts";
+ import { MemoryEngine } from "./memory-engine.ts";
+ import { registerMemoryTools } from "./memory-tools.ts";
+ import { pluginServices } from "./plugin-services.ts";
+ import { ExecutionArchive, registerExecutionTools } from "./execution-archive.ts";
++import { appendUsageRecord, registerUsageTools } from "./usage-ledger.ts";
+ export async function boot(
+   root = resolve(dirname(fileURLToPath(import.meta.url)), ".."),
+ ) {
+@@ -74,6 +76,11 @@ export async function boot(
+       resolveModel(config, id),
+     ),
+     tools = new Tools(logger, config.permissions?.tools);
++  const modelRouter = new ModelRouter(config, logger, llm);
++  modelRouter.onUsage = (usage) => {
++    void appendUsageRecord(root, usage);
++  };
++  modelRouter.selfCheck();
+   const executionArchive = new ExecutionArchive(resolve(root, "logs/executions"), logger);
+   tools.executionArchive = executionArchive;
+   llm.diagnostics = diagnostics;
+@@ -89,6 +96,7 @@ export async function boot(
+     executionArchive,
+     approval,
+     modelConfig,
++    modelRouter,
+     personaFiles: new PersonaFiles(root, config, logger),
+   };
+   const sessions = new Sessions(root, config, services);
+@@ -104,6 +112,7 @@ export async function boot(
+     registerMemoryTools(ctx.tools, memoryEngine),
+   );
+   await runtime.builtin("execution_archive", {}, (ctx) => registerExecutionTools(ctx.tools, executionArchive));
++  await runtime.builtin("usage", {}, (ctx) => registerUsageTools(ctx.tools, root, config));
+   memoryEngine.maintenance = (id) =>
+     sessions.memoryMaintenance || !!(id && sessions.blockedSessions.has(id));
+   memoryEngine.inputEditGuard = (id) => {
+diff --git a/core/llm.ts b/core/llm.ts
+index 547be49..9fce5b8 100644
+--- a/core/llm.ts
++++ b/core/llm.ts
+@@ -17,8 +17,9 @@ export function thinkingToolHistory(provider: any, tools: unknown[]) {
+   if (!tools.length || provider.parameters?.thinking?.type === "disabled") return false;
+   let host = "";
+   try { host = new URL(provider.base_url).hostname.toLowerCase(); } catch { /* validated before transport */ }
+-  return provider.parameters?.thinking?.type === "enabled" ||
+-    host === "api.deepseek.com" || /^deepseek[-/]/i.test(provider.model ?? "");
++  // 只有官方端点或显式开启 thinking 时才强制要求 reasoning_content；
++  // 第三方网关（如 MiraRouter）常把思考段吞掉或不返回，按模型名猜会误判。
++  return provider.parameters?.thinking?.type === "enabled" || host === "api.deepseek.com";
+ }
+ export class LLM {
+   logger: Logger;
+diff --git a/core/memory-diary.ts b/core/memory-diary.ts
+index 0170a78..de3e74b 100644
+--- a/core/memory-diary.ts
++++ b/core/memory-diary.ts
+@@ -70,7 +70,10 @@ function diaryProvider(provider: any, outputTokens: number) {
+   }
+   let host = "";
+   try { host = new URL(provider.base_url).hostname.toLowerCase(); } catch { /* Transport validates addresses. */ }
+-  if (host !== "api.deepseek.com" && !/^deepseek[-/]/i.test(provider.model ?? "")) return { ...provider, parameters };
++  // Only the official endpoint is documented to accept `thinking` / `response_format` here.
++  // Relays such as MiraRouter carry their own `reasoning_effort` (e.g. "none") and may not
++  // understand `thinking` at all, so their parameters are forwarded untouched.
++  if (host !== "api.deepseek.com") return { ...provider, parameters };
+   Object.assign(parameters, { response_format: { type: "json_object" }, thinking: { type: "disabled" } });
+   delete parameters.reasoning_effort;
+   return { ...provider, parameters };
+diff --git a/core/memory-engine.ts b/core/memory-engine.ts
+index 03614a2..bfee965 100644
+--- a/core/memory-engine.ts
++++ b/core/memory-engine.ts
+@@ -253,7 +253,7 @@ export class MemoryEngine {
+   }
+   private async json(file: string, fallback: any) {
+     try {
+-      return JSON.parse(await readFile(file, "utf8"));
++      return JSON.parse((await readFile(file, "utf8")).replace(/^\uFEFF/, ""));
+     } catch (e: any) {
+       if (e.code === "ENOENT") return fallback;
+       throw e;
+@@ -899,6 +899,14 @@ export class MemoryEngine {
+     this.memoryReservations.set(ticket.id, { sessionId: id, ticket });
+     return ticket;
+   }
++  /** 每日记忆请求预算的剩余量；日记归档必须按它来挑段落，否则永远挑不到能过账的一批。 */
++  async memoryRequestBudget(id: string): Promise<{ budget: number; reserved: number; remaining: number }> {
++    const s = await this.state(id);
++    const day = new Date().toISOString().slice(0, 10);
++    const budget = s.settings.daily_memory_tokens ?? 20000;
++    const reserved = s.daily?.day === day ? Math.max(0, s.daily.reserved ?? 0) : 0;
++    return { budget, reserved, remaining: Math.max(0, budget - reserved) };
++  }
+   async settleMemoryRequest(id: string, ticket: MemoryReservation, usage?: any, options: { notSent?: boolean } = {}): Promise<void> {
+     const entry = this.memoryReservations.get(ticket.id);
+     if (!entry) return; // Settled, foreign, or from a prior process: never refund again.
+diff --git a/core/model-config.ts b/core/model-config.ts
+index 1047ebf..b762a0e 100644
+--- a/core/model-config.ts
++++ b/core/model-config.ts
+@@ -27,6 +27,7 @@ export const MODEL_TYPES = [
+ export type ModelType = (typeof MODEL_TYPES)[number];
+ export const MODEL_ROLES = [
+   "chat",
++  "diary",
+   "embedding",
+   "rerank",
+   "image",
+@@ -34,6 +35,16 @@ export const MODEL_ROLES = [
+   "tts",
+ ] as const;
+ type ModelRole = (typeof MODEL_ROLES)[number];
++/** 用途到模型类型：日记整理借用对话模型，但可单独绑定。 */
++export const MODEL_ROLE_TYPES: Record<ModelRole, ModelType> = {
++  chat: "chat",
++  diary: "chat",
++  embedding: "embedding",
++  rerank: "rerank",
++  image: "image",
++  stt: "stt",
++  tts: "tts",
++};
+ export interface ProviderConfig {
+   id: string;
+   name: string;
+@@ -387,6 +398,17 @@ function normalize(config: any) {
+   };
+ }
+ 
++/** 日记整理专用模型；未绑定则返回 null，由调用方回落到对话模型。 */
++export function resolveDiaryModel(config: any) {
++  const selected = config?.model_bindings?.diary;
++  if (!selected) return null;
++  try {
++    return resolveModel(config, selected);
++  } catch {
++    return null;
++  }
++}
++
+ export function resolveChatModel(
+   config: any,
+   personaId?: string,
+@@ -739,7 +761,7 @@ export class ModelConfig {
+       selected: unknown,
+       type: ModelType,
+     ): string | null => {
+-      if (selected === null) return null;
++      if (selected === null || selected === undefined) return null;
+       if (typeof selected !== "string")
+         throw new ModelConfigError("每项模型用途需明确选择模型或留空");
+       const model = models.find((m) => m.id === selected);
+@@ -760,7 +782,7 @@ export class ModelConfig {
+     const bindings = Object.fromEntries(
+       MODEL_ROLES.map((role) => [
+         role,
+-        validateBinding(input.bindings[role], role),
++        validateBinding(input.bindings[role], MODEL_ROLE_TYPES[role]),
+       ]),
+     );
+     const personas = disk.personas ?? {};
+diff --git a/core/model-router.ts b/core/model-router.ts
+new file mode 100644
+index 0000000..917e3ee
+--- /dev/null
++++ b/core/model-router.ts
+@@ -0,0 +1,611 @@
++/*! Copyright (c) 2026 iinukami and contributors.
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
++ */
++/**
++ * 回合级模型分级路由。
++ *
++ * 移植自 AstrBot 的 astrbot_plugin_judge 魔改版（三档 HIGH/MID/FAST）。
++ * WhaleLife 的事件系统只通知不拦截，插件没有"回合开始前"的钩子，
++ * 所以分段选模型只能落在主干：persona() 之后、发请求之前换掉 provider。
++ */
++import { readFileSync } from "node:fs";
++import { resolveModel } from "./model-config.ts";
++import { requestUsage } from "./session-context.ts";
++
++export const DEFAULT_JUDGE_SYSTEM_PROMPT =
++  "你是消息分流助手，只输出一个 JSON 对象：{\"tier\":\"HIGH\"|\"MID\"|\"FAST\",\"confidence\":0 到 1 的小数}。\\n" +
++  "HIGH —— 需要多步推理、代码或数学推导、长链条分析、要求严格准确的活；\\n" +
++  "MID —— 一般任务，需要理解或动手，但步骤不多、容错较高；\\n" +
++  "FAST —— 寒暄、闲聊、情绪回应、一句话能答完的问题。\\n" +
++  "极短的祈使句（例如「来，做」「搜」「改」「继续」「打开那个」）通常是让助手接着做上一步说好的事，不是闲聊，判 MID。\\n" +
++  "confidence 表示你对这个判断的把握，1 为完全确定。不要输出 JSON 以外的任何文字。";
++
++export const DEFAULT_JUDGE_PROMPT_TEMPLATE = `你是一个“消息复杂度/成本-收益”分流器。目标是在满足用户需求的前提下尽量节省成本与时延：除非确实需要更强推理/更长上下文/更高准确性，否则优先选择 FAST。
++
++你只输出一个 JSON 对象，格式固定：{"tier":"HIGH|MID|FAST","confidence":0 到 1 的小数}。不要输出解释、代码块或其他任何文字。
++
++## 判定目标
++- HIGH：任务对推理深度、正确性、稳定性、长上下文、复杂结构化输出有明显要求，用 MID 高概率给出错误/不完整/不可靠结果。
++- MID：需要一点推理或整理才答得好，但不是难题——解释概念、两三步推演、比较几个选项、写一段有结构的话、看一段稍长的材料。
++- FAST：可以用简短直接回答解决；或即使略有不精确也不影响体验；或可用简单规则/常识完成。
++
++## 关键判断维度（满足任意一条通常选 HIGH）
++1) 多步推理：需要严谨推导、证明、复杂逻辑链、反例讨论、细致方案权衡。
++2) 数学/算法/代码：编程实现、调试、复杂算法、SQL/正则、性能分析、边界条件多。
++3) 长文本/多要点：需要总结/对比/归纳长内容，或输出结构化清单且要覆盖全面。
++4) 专业/高风险：医疗/法律/金融/安全等对准确性要求高，或需要谨慎措辞与推断。
++5) 明确要求“详细/深入/步骤/举例/证明/推导/完整代码/测试用例/鲁棒性”等。
++
++## 典型 MID 场景（满足任意一条通常选 MID）
++- 要我解释某个概念或原理，但不要求严谨证明。
++- 要一段有结构的回答：列几点、比较两三个选项、给个大致方案。
++- 要结合上下文推断意图，需要一点逻辑但不复杂。
++- 消息本身不短（两三行以上），但内容并不难。
++- 极短的祈使句：「来，做」「搜」「改」「继续」「再来」「试试」「接着做」「打开那个」——这是让助手继续执行上一步已经说好的事，不是寒暄。
++
++## 典型 FAST 场景（满足任意一条通常选 FAST）
++- 问候/闲聊/情绪安抚/短句翻译/简短定义解释。
++- 单一事实或简单是非判断（不要求严谨推导）。
++- 简单改写、润色、生成短回复、轻量总结（文本不长）。
++- 用户问题很短且没有“深入/详细/步骤/代码/推导”等要求。
++- 已经做完、只要一句回应或确认的收尾话。
++
++## 边界处理
++- 不确定时默认 MID：宁可多想一点，也别在真想思考的时候把它省掉。
++- 只有明显是寒暄、单句问答、只要个短结论时才选 FAST。
++- 只有明确要求严谨推理、完整代码、证明、长文综合时才选 HIGH。
++- 判不准的，把 confidence 报低一些（低于 0.55 会被当成没把握）也不要硬猜。
++
++用户消息如下：
++$message
++
++最终输出（仅一个 JSON 对象）：{"tier":"HIGH|MID|FAST","confidence":0.0-1.0}`;
++
++/** 解析判官输出：优先 JSON，退回旧的单词语法。解析不了返回 null。 */
++export function parseJudgeOutput(raw: string): { tier: Decision; confidence: number } | null {
++  const text = String(raw ?? "").trim();
++  if (!text) return null;
++  const cleaned = text.replace(/```[a-zA-Z]*\n?/g, "").replace(/```/g, "").trim();
++  const start = cleaned.indexOf("{");
++  const end = cleaned.lastIndexOf("}");
++  if (start >= 0 && end > start) {
++    try {
++      const obj: any = JSON.parse(cleaned.slice(start, end + 1));
++      const tierRaw = String(obj?.tier ?? obj?.level ?? obj?.decision ?? "").toUpperCase();
++      const tier = tierRaw.includes("HIGH") ? "HIGH"
++        : tierRaw.includes("MID") || tierRaw.includes("MEDIUM") ? "MID"
++          : tierRaw.includes("FAST") ? "FAST" : "";
++      if (tier) {
++        const conf = Number(obj?.confidence);
++        return {
++          tier: tier as Decision,
++          confidence: Number.isFinite(conf) ? Math.min(1, Math.max(0, conf)) : 1,
++        };
++      }
++    } catch {
++      // 不是合法 JSON，退回按词解析
++    }
++  }
++  const out = cleaned.toUpperCase();
++  if (out.includes("HIGH")) return { tier: "HIGH", confidence: 1 };
++  if (out.includes("MID") || out.includes("MEDIUM")) return { tier: "MID", confidence: 1 };
++  if (out.includes("FAST")) return { tier: "FAST", confidence: 1 };
++  return null;
++}
++
++
++/** 意图样本库：本地 embedding 只做单向放行（exec → MID），不降档。 */
++type IntentRoute = { name: string; utterances: string[] };
++
++const embedCache = new Map<string, number[]>();
++
++const INTENT_FILE = new URL("../config/router-intents.json", import.meta.url);
++
++function cosine(a: number[], b: number[]) {
++  const n = Math.min(a.length, b.length);
++  let dot = 0;
++  let na = 0;
++  let nb = 0;
++  for (let i = 0; i < n; i++) {
++    dot += a[i] * b[i];
++    na += a[i] * a[i];
++    nb += b[i] * b[i];
++  }
++  if (!na || !nb) return 0;
++  return dot / Math.sqrt(na * nb);
++}
++
++const META_FAST_PATTERNS = [
++  /把.*(需求|代码).*(贴|发|给|丢|贴我|发我)/,
++  /(把|将).*(代码|报错).*(发|贴|给).*(看看|我看看|我看下|我看一眼)/,
++  /(你要|想要|准备).*(写|搞).*(哪块|什么|哪个).*(编程|代码)/,
++  /(python|node|javascript|java).*(还是|或|或者).*(别的|其它|其他)/i,
++];
++
++/** 动手意图。关键词列不全，所以补一组“动词 + 语气词”的正则。 */
++const EXEC_KEYWORDS = [
++  "删掉", "删除", "删了", "移走", "移动", "移一下", "安装", "装上", "装一下",
++  "重启", "拉起来", "杀掉", "执行", "跑一下", "跑个", "复制", "拷贝",
++  "改名", "改个名", "改成", "换成", "提交", "回滚", "撤销", "部署", "编译",
++  "打开", "点开", "搜一下", "搜一搜", "搜索", "查一下", "查查", "读一下",
++  "看一下", "看一眼", "列出", "翻一下", "调一下",
++];
++
++const EXEC_PATTERNS: RegExp[] = [
++  /删/,
++  /移除|移走|移动|挪/,
++  /安装|装上|装一下|装吧/,
++  /重启|拉起|启动一下|杀掉/,
++  /执行|运行|跑一下|跑个/,
++  /复制|拷贝/,
++  /改名|改个名/,
++  /提交|回滚|撤销|部署|编译/,
++  /(改|换|加|去掉)(一下|个|掉|吧|了|成)/,
++  /打开|点开|切到|跳到|翻到/,
++  /搜|搜索|查一下|查查|查下/,
++  /看一下|看一眼|看看|读一下|念一下|列一下|列出/,
++];
++
++const STRONG_COMPLEX_KEYWORDS = [
++  "算法", "函数", "类", "接口", "计算", "数学", "公式", "方程", "证明", "推导",
++  "原理", "机制", "为什么", "比较", "区别", "优缺点", "总结", "归纳", "写一篇",
++  "写一个", "帮我写", "实现", "改一下", "优化一下", "格式化", "sql", "正则",
++  "bug", "error", "debug", "调试", "报错", "修复", "优化", "设计", "架构",
++  "方案", "策略", "规划",
++];
++
++const WEAK_COMPLEX_KEYWORDS = [
++  "编程", "程序", "代码", "python", "java", "javascript", "node", "c++", "html", "css",
++];
++
++const WEAK_NEED_STRONG_TRIGGERS = [
++  "怎么", "如何", "为什么", "写", "实现", "改", "生成", "修复", "优化", "调试",
++  "报错", "bug", "error", "debug", "算法", "函数", "类", "接口", "sql", "正则",
++];
++
++const SIMPLE_KEYWORDS = [
++  "你好", "嗨", "hi", "hello", "早上好", "晚上好", "谢谢", "感谢", "好的",
++  "可以", "行", "嗯", "是", "否", "对", "不对", "是的", "不是", "几点",
++  "天气", "今天", "明天", "在吗", "在不在", "有空吗",
++];
++
++const HARD_SIGNALS = [
++  "证明", "推导", "完整", "详细", "步骤", "实现", "算法", "复杂度", "测试",
++  "边界", "架构", "优化", "方案", "对比",
++];
++
++type Decision = "HIGH" | "MID" | "FAST";
++
++const SINGLE_CHAR_SIMPLE = new Set(["嗯", "是", "否", "对", "行"]);
++
++function hit(text: string, keywords: string[]) {
++  for (const keyword of keywords) {
++    const kw = String(keyword).toLowerCase();
++    if (kw.length < 2) {
++      // 单字词只认整句：否则“行”会命中“执行”“运行”，“对”会命中“对比”。
++      if (!SINGLE_CHAR_SIMPLE.has(kw)) continue;
++      if (text.replace(/[\s，。！？、,.!?~…]+/g, "") === kw) return keyword;
++      continue;
++    }
++    if (text.includes(kw)) return keyword;
++  }
++  return "";
++}
++
++let intentSamplesPromise: Promise<Map<string, { text: string; vector: number[] }[]>> | null = null;
++
++export class ModelRouter {
++  config: any;
++  logger: any;
++  llm: any;
++  settings: any;
++  lastDecision: Map<string, any> = new Map();
++
++  constructor(config: any, logger: any, llm: any) {
++    this.config = config;
++    this.logger = logger;
++    this.llm = llm;
++    this.settings = config.model_router ?? {};
++  }
++
++  get enabled() {
++    return this.settings?.enabled === true;
++  }
++
++  setting(name: string, fallback: any) {
++    const value = this.settings?.[name];
++    return value === undefined || value === null ? fallback : value;
++  }
++
++  /** 规则预判：命中就不必叫判官。逻辑与插件 judge_rules 保持一致（含软档处理）。 */
++  ruleJudgement(text: string, lower: string): { decision: Decision | ""; reason: string } {
++    if (text.length > 200) return { decision: "HIGH", reason: "len>200" };
++    if (text.includes("```") || lower.includes("def ") || lower.includes("function "))
++      return { decision: "HIGH", reason: "codeblock" };
++    if (text.length > 80) return { decision: "MID", reason: "len>80" };
++    for (const pattern of META_FAST_PATTERNS)
++      if (pattern.test(text)) return { decision: "FAST", reason: "meta:clarify" };
++
++    // 日常词（今天、天气、几点、你好……）只在短句里算数：
++    // 长句里的“今天”多是时间状语，排在强关键词前面命中，会把
++    // “今天帮我把桌面上那个 bat 改一下”误判成闲聊。
++    // 动手意图优先于寒暄词：“谢谢，把那个删了”不该因为“谢谢”落进 FAST。
++    const exec = hit(lower, EXEC_KEYWORDS);
++    if (exec) return { decision: "MID", reason: `exec:${exec}` };
++    const execPattern = EXEC_PATTERNS.find((pattern) => pattern.test(text));
++    if (execPattern) return { decision: "MID", reason: `exec:/${execPattern.source}/` };
++
++    const simpleMaxRaw = Number(this.setting("simple_max_chars", 20));
++    const simpleMax = Number.isFinite(simpleMaxRaw) && simpleMaxRaw > 0 ? simpleMaxRaw : 20;
++    if (text.length <= simpleMax) {
++      const simple = hit(lower, SIMPLE_KEYWORDS);
++      if (simple && !hit(lower, STRONG_COMPLEX_KEYWORDS) && !hit(lower, WEAK_COMPLEX_KEYWORDS))
++        return { decision: "FAST", reason: `kw:${simple}` };
++    }
++
++    // HARD_SIGNALS 与 STRONG_COMPLEX_KEYWORDS 有重叠（方案、优化、架构、实现……），
++    // 不排掉关键词自己，“这个方案好不好”会被自己顶成 HIGH。
++    const soft = (keyword: string) =>
++      text.length < 60 &&
++      !HARD_SIGNALS.some((signal) => signal !== keyword && lower.includes(signal));
++
++    const strong = hit(lower, STRONG_COMPLEX_KEYWORDS);
++    if (strong)
++      return soft(strong)
++        ? { decision: "MID", reason: `kw:${strong}:soft` }
++        : { decision: "HIGH", reason: `kw:${strong}` };
++
++    const weak = hit(lower, WEAK_COMPLEX_KEYWORDS);
++    if (weak) {
++      if (WEAK_NEED_STRONG_TRIGGERS.some((trigger) => lower.includes(trigger)))
++        return soft(weak)
++          ? { decision: "MID", reason: `kw:${weak}:soft` }
++          : { decision: "HIGH", reason: `kw:${weak}` };
++      return { decision: "MID", reason: `kw:${weak}:weak` };
++    }
++
++    if (text.length <= 20 && (text.includes("?") || text.includes("？")))
++      return { decision: "FAST", reason: "short_question" };
++    return { decision: "", reason: "" };
++  }
++
++  /** 判官自己的调用同样计费；不记这一笔，账本会少算、图上也会少一个颜色。 */
++  onUsage?: (usage: any) => void;
++
++  /** 判官：输出一个 JSON 对象，给 40 token 够用；超时或解析不了就交给保底。 */
++  async ask(text: string): Promise<{ decision: Decision | ""; source: string; reason: string }> {
++    const modelId = String(this.setting("judge_model", "") || "");
++    if (!modelId) return { decision: "", source: "fallback", reason: "no_judge_model" };
++    let provider: any;
++    try {
++      provider = resolveModel(this.config, modelId);
++    } catch (error: any) {
++      this.logger.warn("判官模型不可用", { model: modelId, error: error?.message });
++      return { decision: "", source: "fallback", reason: "judge_model_unavailable" };
++    }
++    const system = String(this.setting("judge_system_prompt", DEFAULT_JUDGE_SYSTEM_PROMPT) || "").trim() || DEFAULT_JUDGE_SYSTEM_PROMPT;
++    const template = String(this.setting("judge_prompt_template", DEFAULT_JUDGE_PROMPT_TEMPLATE));
++    const prompt = template.split("$message").join(text);
++    const timeout = Number(this.setting("judge_timeout_ms", 4000));
++    try {
++      const reply = await this.llm.chat({
++        provider,
++        messages: [
++          { role: "system", content: system },
++          { role: "user", content: prompt },
++        ],
++        max_tokens: 40,
++        signal: AbortSignal.timeout(Number.isFinite(timeout) && timeout > 0 ? timeout : 4000),
++      });
++      if (reply?.usage) {
++        try {
++          const measured = requestUsage(reply.usage, provider, null);
++          if (measured) this.onUsage?.(measured);
++        } catch {
++          // 记账失败不影响判档：这一笔宁可少算，也不能让回合走保底。
++        }
++      }
++      const raw = String(reply?.text ?? "");
++      const parsed = parseJudgeOutput(raw);
++      if (parsed) {
++        const floorRaw = Number(this.setting("judge_min_confidence", 0.55));
++        const floor = Number.isFinite(floorRaw) ? floorRaw : 0.55;
++        if (parsed.confidence < floor) {
++          this.logger.warn("判官没把握，走保底", { tier: parsed.tier, confidence: parsed.confidence, floor });
++          return { decision: "", source: "fallback", reason: `low_confidence:${parsed.confidence.toFixed(2)}` };
++        }
++        return {
++          decision: parsed.tier,
++          source: "judge",
++          reason: parsed.confidence < 1 ? `conf:${parsed.confidence.toFixed(2)}` : "",
++        };
++      }
++      this.logger.warn("判官输出无法解析", { preview: raw.slice(0, 120), chars: raw.length, finish: (reply as any)?.finishReason ?? (reply as any)?.finish_reason ?? null });
++      return { decision: "", source: "fallback", reason: "judge_unparseable" };
++    } catch (error: any) {
++      this.logger.warn("判官调用失败，走保底", { error: error?.message, name: error?.name, code: error?.code });
++      return { decision: "", source: "fallback", reason: "judge_error" };
++    }
++  }
++
++
++  /** 向量模型：取 model_bindings.embedding 指向的那条。取不到返回 null。 */
++  private embedProvider() {
++    try {
++      const id = this.config?.model_bindings?.embedding;
++      if (!id) return null;
++      const model = (this.config?.models ?? []).find((m: any) => m.id === id);
++      if (!model || model.enabled === false) return null;
++      const provider = (this.config?.providers ?? []).find((p: any) => p.id === model.provider);
++      if (!provider || provider.enabled === false) return null;
++      return { model: String(model.model), provider };
++    } catch {
++      return null;
++    }
++  }
++
++  private async embed(text: string): Promise<number[] | null> {
++    const target = this.embedProvider();
++    if (!target) return null;
++    const key = text.trim();
++    if (!key) return null;
++    const cached = embedCache.get(key);
++    if (cached) return cached;
++    const base = String(target.provider.base_url || "").replace(/\/+$/, "");
++    const controller = new AbortController();
++    const timer = setTimeout(() => controller.abort(), Number(this.setting("embed_timeout_ms", 8000)));
++    try {
++      const res = await fetch(`${base}/embeddings`, {
++        method: "POST",
++        headers: {
++          "Content-Type": "application/json",
++          ...(target.provider.api_key ? { Authorization: `Bearer ${target.provider.api_key}` } : {}),
++        },
++        body: JSON.stringify({ model: target.model, input: key }),
++        signal: controller.signal,
++      });
++      if (!res.ok) return null;
++      const data: any = await res.json();
++      const vector = data?.data?.[0]?.embedding;
++      if (!Array.isArray(vector) || !vector.length) return null;
++      if (embedCache.size > 2000) embedCache.clear();
++      embedCache.set(key, vector);
++      return vector;
++    } catch {
++      return null;
++    } finally {
++      clearTimeout(timer);
++    }
++  }
++
++  /** 每个意图配上它所有例句的向量。只算一次，读不到就当没有样本库。 */
++  private intentSamples(): Promise<Map<string, { text: string; vector: number[] }[]>> {
++    if (!intentSamplesPromise) {
++      intentSamplesPromise = (async () => {
++        const map = new Map<string, { text: string; vector: number[] }[]>();
++        let routes: IntentRoute[] = [];
++        try {
++          const raw = JSON.parse(readFileSync(INTENT_FILE, "utf8"));
++          routes = Array.isArray(raw?.routes) ? raw.routes : [];
++        } catch (error: any) {
++          this.logger.warn("意图样本库读不到，跳过向量放行", { error: error?.message });
++          return map;
++        }
++        for (const route of routes) {
++          const bucket: { text: string; vector: number[] }[] = [];
++          for (const sentence of route.utterances ?? []) {
++            const text = String(sentence ?? "").trim();
++            if (!text) continue;
++            const vector = await this.embed(text);
++            if (vector) bucket.push({ text, vector });
++          }
++          if (bucket.length) map.set(route.name, bucket);
++        }
++        return map;
++      })();
++    }
++    return intentSamplesPromise;
++  }
++
++  /**
++   * 单向放行：只有 exec 拿最高分、分数够高、且明显领先第二名时才抬到 MID。
++   * 用最近邻而不是中心向量——中心向量会把 chat 和 exec 糊在一起，
++   * “来，做”“继续”这种短祈使句的优势会被抹平。
++   * 返回 null 表示不管，交给判官。
++   */
++  private async embedEscalate(text: string) {
++    if (this.setting("embed_route", true) === false) return null;
++    const vector = await this.embed(text);
++    if (!vector) return null;
++    const samples = await this.intentSamples();
++    if (!samples.size) return null;
++    const scored: { name: string; score: number; hit: string }[] = [];
++    for (const [name, bucket] of samples) {
++      let best = { score: -1, hit: "" };
++      for (const sample of bucket) {
++        const score = cosine(vector, sample.vector);
++        if (score > best.score) best = { score, hit: sample.text };
++      }
++      scored.push({ name, score: best.score, hit: best.hit });
++    }
++    scored.sort((a, b) => b.score - a.score);
++    const top = scored[0];
++    const second = scored[1] ?? { name: top.name, score: 0, hit: "" };
++    const gateRaw = Number(this.setting("embed_route_gate", 0.7));
++    const gate = Number.isFinite(gateRaw) ? gateRaw : 0.7;
++    const marginRaw = Number(this.setting("embed_route_margin", 0.05));
++    const margin = Number.isFinite(marginRaw) ? marginRaw : 0.05;
++    if (top.name !== "exec") return null;
++    if (top.score < gate) return null;
++    if (top.score - second.score < margin) return null;
++    return { score: top.score, margin: top.score - second.score, next: second.name };
++  }
++
++  /**
++   * 启动自检：把 pools / judge_model 里解析不了的模型名一次列出来。
++   * 这套补丁给别人用时，最常见的问题就是照抄了本地配置里的模型别名（mr-xxx），
++   * 而他那边根本没这些模型；不早点说，只会表现为"路由不生效"。
++   */
++  selfCheck() {
++    if (!this.enabled) {
++      this.logger.info("模型分级", { status: "disabled" });
++      return;
++    }
++    const pools: any = this.settings?.pools ?? {};
++    const roles: Array<[string, string]> = [
++      ["judge", String(this.setting("judge_model", "") || "")],
++      ["fast", String(pools.fast || "")],
++      ["mid", String(pools.mid || "")],
++      ["high", String(pools.high || "")],
++    ];
++    const missing: string[] = [];
++    for (const [role, id] of roles) {
++      if (!id) {
++        missing.push(role + "：未配置");
++        continue;
++      }
++      try {
++        resolveModel(this.config, id);
++      } catch (error: any) {
++        missing.push(role + "：" + id + "（" + (error?.message ?? "解析不到") + "）");
++      }
++    }
++    if (missing.length) {
++      this.logger.warn("模型分级配置不完整，缺的档会逐级回退，最差回退到人格默认模型", { missing });
++    } else {
++      this.logger.info("模型分级就绪", {
++        pools: { fast: pools.fast, mid: pools.mid, high: pools.high },
++        judge: this.setting("judge_model", ""),
++      });
++    }
++  }
++
++  private resolvePool(pool: string) {
++    const pools = this.settings?.pools ?? {};
++    const chain =
++      pool === "high" ? ["high", "mid", "fast"]
++        : pool === "mid" ? ["mid", "fast", "high"]
++          : ["fast", "mid", "high"];
++    for (const name of chain) {
++      const id = String(pools[name] || "");
++      if (!id) continue;
++      try {
++        return { pool: name, model: id, provider: resolveModel(this.config, id) };
++      } catch {
++        continue;
++      }
++    }
++    return null;
++  }
++
++  /**
++   * 返回该回合该用的 provider。null 表示不干预，沿用人格默认。
++   */
++  async route(input: { text: string; sessionId?: string; fallbackProvider?: any }) {
++    if (!this.enabled) return null;
++    const text = String(input.text || "");
++    if (!text.trim()) return null;
++    const lower = text.toLowerCase();
++    const now = Date.now();
++
++    let decision: Decision | "" = "";
++    let source = "";
++    let reason = "";
++
++    const rule = this.ruleJudgement(text, lower);
++    if (rule.decision) {
++      decision = rule.decision;
++      source = "rule";
++      reason = rule.reason;
++    }
++
++    // 连续闲聊不叫判官：上一轮判成 FAST、间隔不久、这句又短，就沿用。
++    if (!decision && this.setting("skip_judge_after_fast", true) && input.sessionId) {
++      const last = this.lastDecision.get(input.sessionId);
++      const window = Number(this.setting("carry_seconds", 600)) * 1000;
++      const maxChars = Number(this.setting("carry_max_chars", 24));
++      if (
++        last &&
++        last.decision === "FAST" &&
++        now - last.at < window &&
++        text.trim().length <= maxChars
++      ) {
++        decision = "FAST";
++        source = "carry";
++        reason = "after_fast";
++      }
++    }
++
++    // 向量放行：只往高了抬（exec → MID），不降档。
++    if (!decision) {
++      const escalated = await this.embedEscalate(text);
++      if (escalated) {
++        decision = "MID";
++        source = "embed";
++        reason = `exec:${escalated.score.toFixed(3)}/+${escalated.margin.toFixed(3)}`;
++      }
++    }
++
++    if (!decision) {
++      const judged = await this.ask(text);
++      decision = judged.decision as Decision | "";
++      source = judged.source;
++      reason = judged.reason;
++    }
++
++    // 拿不准就落在一档：按配置的保底档（默认 mid，即 low think）。
++    if (!decision) {
++      decision = String(this.setting("fallback_decision", "MID")).toUpperCase() as Decision;
++      if (decision !== "HIGH" && decision !== "MID" && decision !== "FAST") decision = "MID";
++      source = source || "fallback";
++      reason = reason || "unknown";
++    }
++
++    // 预算：判成 HIGH 也只有 high_ratio% 的机会真的用高级池，其余降到 mid。
++    let pool = decision.toLowerCase();
++    if (decision === "HIGH") {
++      const ratioRaw = Number(this.setting("high_ratio", 20));
++      const ratio = Number.isFinite(ratioRaw) ? Math.min(100, Math.max(0, ratioRaw)) : 20;
++      if (ratio <= 0) {
++        pool = "mid";
++        reason = reason || "budget";
++      } else if (ratio < 100 && Math.floor(Math.random() * 100) + 1 > ratio) {
++        pool = "mid";
++        reason = reason || "budget";
++      }
++    }
++
++    const resolved = this.resolvePool(pool);
++    if (!resolved) {
++      this.logger.warn("路由目标模型不可用，回退人格默认", { decision, pool });
++      return {
++        provider: input.fallbackProvider,
++        decision,
++        source: `${source}:unavailable`,
++        reason,
++        pool: "base",
++        model: "",
++      };
++    }
++
++    if (input.sessionId) this.lastDecision.set(input.sessionId, { decision, at: now });
++
++    this.logger.info("模型分级", {
++      decision,
++      pool: resolved.pool,
++      model: resolved.model,
++      source,
++      ...(reason ? { reason } : {}),
++    });
++
++    return {
++      provider: resolved.provider,
++      decision,
++      source,
++      reason,
++      pool: resolved.pool,
++      model: resolved.model,
++    };
++  }
++}
+diff --git a/core/model-usage.ts b/core/model-usage.ts
+index 295a3a7..dfe9bc9 100644
+--- a/core/model-usage.ts
++++ b/core/model-usage.ts
+@@ -8,11 +8,11 @@ export type CacheUsage = {
+   hit_percent: number | null;
+ };
+ export type ReferenceCost = {
+-  currency: "CNY";
++  currency: "CNY" | "USD";
+   amount: number | null;
+   min: number;
+   max: number;
+-  price_date: "2026-11-09";
++  price_date: string;
+   period: "off_peak" | "peak_or_holiday";
+   basis: "reference";
+ };
+@@ -41,39 +41,98 @@ function cacheUsage(raw: any): CacheUsage {
+   return { hit_tokens: hit, miss_tokens: miss, hit_percent: input ? hit / input * 100 : null };
+ }
+ 
+-// CNY per million tokens, verified 2026-11-09. These are reference rates, not a bill.
++/** Per million tokens: [cache hit, input, output]. Reference rates, not a bill. */
++type Rates = readonly [number, number, number];
++type Book = {
++  currency: "CNY" | "USD";
++  /** DeepSeek doubles input/output inside weekday peak windows; other books bill flat. */
++  peakMultiplier?: number;
++  /** Local runtimes bill nothing and have no per-model schedule. */
++  anyModel?: boolean;
++  rates: Map<string, Rates>;
++};
++
++/** 价目核验日期：价格表改动时同步更新，测试引用它避免写死。 */
++export const VERIFIED = "2026-11-16";
++
++// 人民币/百万 token，DeepSeek 官方平峰价；峰时输入输出翻倍。
+ // https://api-docs.deepseek.com/zh-cn/quick_start/pricing/
+-const flash = [0.02, 1, 4] as const;
+-const prices = new Map<string, readonly [number, number, number]>([
+-  ["deepseek-flash", flash],
+-  ["deepseek-v4-flash", flash],
+-  ["deepseek-v4-flash-vision-exp", flash],
+-  ["deepseek-v4-pro", [0.15, 4.5, 13.5]],
++const deepseek: Book = {
++  currency: "CNY",
++  peakMultiplier: 2,
++  rates: new Map<string, Rates>([
++    ["deepseek-flash", [0.02, 1, 4]],
++    ["deepseek-v4-flash", [0.02, 1, 4]],
++    ["deepseek-v4-flash-vision-exp", [0.02, 1, 4]],
++    ["deepseek-v4-pro", [0.15, 4.5, 13.5]],
++  ]),
++};
++
++// 美元/百万 token，MiraRouter 实际扣费价（下面三个均已含折扣）。
++// https://mirarouter.com/api/models
++const mira = new Map<string, Rates>([
++  ["deepseek-v4.1-flash", [0.0035, 0.135, 0.54]], // 原价 0.15 / 0.6，九折
++  ["claude-haiku-5.5", [0.01, 0.1, 0.5]],
++  ["gpt-6.1-sol", [0.08, 1.6, 8]], // 原价 2 / 10，八折
++]);
++const miraclaude = mira;
++const miragpt = mira;
++
++// 美元/百万 token，Gemini 付费档。免费档不扣费，但同一端点按付费价参考，宁高不低。
++// https://ai.google.dev/gemini-api/docs/pricing
++const gemini: Book = {
++  currency: "USD",
++  rates: new Map<string, Rates>([
++    ["gemini-3.1-flash-lite", [0.025, 0.25, 1.5]],
++    ["gemini-3.5-flash-lite", [0.03, 0.3, 2.5]],
++  ]),
++};
++
++const local: Book = {
++  currency: "USD",
++  anyModel: true,
++  rates: new Map<string, Rates>([["*", [0, 0, 0]]]),
++};
++
++const miraBook: Book = { currency: "USD", rates: mira };
++const books = new Map<string, Book>([
++  ["https://api.deepseek.com", deepseek],
++  ["https://api.mirarouter.com", miraBook],
++  ["https://generativelanguage.googleapis.com", gemini],
++  ["http://127.0.0.1:11434", local],
++  ["http://localhost:11434", local],
+ ]);
++
+ function referenceCost(raw: any, provider: any, cache: CacheUsage, measuredAt: Date): ReferenceCost | null {
+   if (!object(raw) || !tokens(raw.prompt_tokens) || !tokens(raw.completion_tokens) ||
+       !Number.isFinite(measuredAt.getTime())) return null;
+   if ((provider?.protocol ?? "openai-compatible") !== "openai-compatible") return null;
+   let endpoint: URL;
+   try { endpoint = new URL(provider?.base_url); } catch { return null; }
+-  if (endpoint.origin !== "https://api.deepseek.com" || endpoint.username || endpoint.password) return null;
+-  const rates = prices.get(provider?.model);
++  if (endpoint.username || endpoint.password) return null;
++  const book = books.get(endpoint.origin);
++  if (!book) return null;
++  // Gemini 免费档与付费档同一端点，按 provider id 区分；免费档一律记 0。
++  const freeTier = /free/i.test(String(provider?.id ?? ""));
++  const rates = freeTier ? [0, 0, 0] as Rates : book.rates.get(String(provider?.model)) ??
++    (book.anyModel ? book.rates.get("*") : undefined);
+   if (!rates) return null;
+   // Fixed UTC+8 avoids depending on the host timezone. Public holidays need no local database:
+   // weekday peak windows retain the complete off-peak/peak range instead of guessing holidays.
+   const beijing = new Date(measuredAt.getTime() + 8 * 60 * 60 * 1000);
+   const weekday = beijing.getUTCDay(), hour = beijing.getUTCHours();
+-  const possiblePeak = weekday >= 1 && weekday <= 5 && ((hour >= 9 && hour < 12) || (hour >= 14 && hour < 18));
+-  const period = possiblePeak ? "peak_or_holiday" : "off_peak";
++  const possiblePeak = !!book.peakMultiplier && weekday >= 1 && weekday <= 5 &&
++    ((hour >= 9 && hour < 12) || (hour >= 14 && hour < 18));
++  const multiplier = possiblePeak ? book.peakMultiplier! : 1;
+   const knownCache = cache.hit_tokens !== null && cache.miss_tokens !== null;
+   const inputMin = knownCache ? cache.hit_tokens! * rates[0] + cache.miss_tokens! * rates[1]
+     : raw.prompt_tokens * rates[0];
+   const inputMax = knownCache ? inputMin : raw.prompt_tokens * rates[1];
+   const output = raw.completion_tokens * rates[2];
+   const min = (inputMin + output) / 1000000;
+-  const max = (inputMax + output) / 1000000 * (possiblePeak ? 2 : 1);
+-  return { currency: "CNY", amount: knownCache && !possiblePeak ? min : null, min, max,
+-    price_date: "2026-11-09", period, basis: "reference" };
++  const max = (inputMax + output) * multiplier / 1000000;
++  return { currency: book.currency, amount: knownCache && !possiblePeak ? min : null, min, max,
++    price_date: VERIFIED, period: possiblePeak ? "peak_or_holiday" : "off_peak", basis: "reference" };
+ }
+ 
+ /** Normalize only supported usage fields; do not retain arbitrary provider response metadata. */
+diff --git a/core/receipts.ts b/core/receipts.ts
+new file mode 100644
+index 0000000..141d4ed
+--- /dev/null
++++ b/core/receipts.ts
+@@ -0,0 +1,85 @@
++/*! Copyright (c) 2026 iinukami and contributors.
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
++ */
++/**
++ * 写入回执：写入类工具写成功后上报证据，宿主绑定本轮归属，收尾回读核验。
++ * 只有回读通过、且收尾时磁盘上的版本仍是回执那一版，才算「已验证写入」。
++ */
++import { createHash } from "node:crypto";
++import { readFile, stat } from "node:fs/promises";
++import { resolve, sep } from "node:path";
++
++/**
++ * 写入证据：由写入类工具在写成功后自己上报，只含它自己知道的操作事实
++ * （实际写入的字节、回读结果）。工具名、调用 ID、轮次由宿主补，不采信工具自报。
++ */
++export type WriteEvidence = {
++  kind: "file_write";
++  path: string;
++  bytes?: number;
++  sha256?: string;
++  read_back: "ok" | "failed";
++  error?: string;
++};
++
++/** 宿主签发后的正式回执：证据 + 宿主自己掌握的归属信息。 */
++export type WriteReceipt = WriteEvidence & {
++  tool: string;
++  plugin: string;
++  call_id: string;
++  round: number;
++};
++
++/** 回复末尾「本轮文件」的一行：只写文件名和可否打开，路径与字节数留在执行档案。 */
++export type FileItem = {
++  path: string;
++  name: string;
++  bytes?: number;
++  ok: boolean;
++  error?: string;
++};
++
++/** 工具侧上报证据用：绝对路径 → 相对工作目录路径；越界返回 undefined。 */
++export function receiptPath(root: string, absolute: string): string | undefined {
++  const base = resolve(root);
++  const target = resolve(String(absolute ?? ""));
++  if (!target || target === base || !target.startsWith(base + sep)) return undefined;
++  return target.slice(base.length).replace(/^[\\/]+/, "").replaceAll("\\", "/");
++}
++
++/**
++ * 收尾核验：按路径取最后一条回执，回读一次磁盘。
++ * 回读失败、文件不见了、或者内容已经不是回执那一版，都不算已验证。
++ */
++export async function verifiedFiles(root: string, receipts: WriteReceipt[]): Promise<FileItem[]> {
++  const latest = new Map<string, WriteReceipt>();
++  for (const receipt of receipts) latest.set(receipt.path, receipt);
++  const files: FileItem[] = [];
++  for (const [path, receipt] of latest) {
++    const name = path.split("/").pop() ?? path;
++    if (receipt.read_back !== "ok") {
++      files.push({ path, name, ok: false,
++        error: "写入后回读失败：" + (receipt.error ?? "未取到校验值") });
++      continue;
++    }
++    try {
++      const absolute = resolve(root, path);
++      const info = await stat(absolute);
++      if (!info.isFile()) {
++        files.push({ path, name, ok: false, error: "核验时不是普通文件" });
++        continue;
++      }
++      const digest = createHash("sha256").update(await readFile(absolute)).digest("hex");
++      if (receipt.sha256 && digest !== receipt.sha256) {
++        files.push({ path, name, ok: false, error: "写入后文件已变化，与回执版本不一致" });
++        continue;
++      }
++      files.push({ path, name, bytes: info.size, ok: true });
++    } catch (error: any) {
++      const code = error?.code === "ENOENT" ? "文件不存在" : String(error?.code ?? error?.message ?? "读不到");
++      files.push({ path, name, ok: false, error: "核验时读不到：" + code });
++    }
++  }
++  return files;
++}
+diff --git a/core/session.ts b/core/session.ts
+index 754b582..884d39f 100644
+--- a/core/session.ts
++++ b/core/session.ts
+@@ -15,8 +15,14 @@ import { shortSummaryKey, shortContext, compressShort, consolidateLong, shouldDe
+ import { attribution, historyTail, originNote, originOf, renderHistory } from "./provenance.ts";
+ import { SessionQueue, type QueuePolicy } from "./session-queue.ts";
+ import { TRANSIENT_REPLY, type ToolTurn } from "./tool-retention.ts";
++import { receiptPath, verifiedFiles, type WriteReceipt } from "./receipts.ts";
+ import type { TurnInput } from "./turn-input.ts";
++/** 一轮里随消息一起送进模型的图片（已由 Web 层校验并落盘）。 */
++export type ChatImage = { mimeType: string; data: Uint8Array };
++/** 本轮图片总量上下限：超过 soft 降 detail，超过 total 直接拒（勘 2026-11-16）。 */
++const IMAGE_LIMITS = Object.freeze({ softBytes: 8 * 1024 * 1024, totalBytes: 16 * 1024 * 1024 });
+ import { resolveModelContext } from "./model-context.ts";
++import { resolveDiaryModel } from "./model-config.ts";
+ import { diaryContext, diaryRequestPlan, writeDiary } from "./memory-diary.ts";
+ import { contextFrame, diaryPrefix, fittingDiaryPrefix, historyEntry, recalledMaterial, supportsContextPrefix } from "./context-material.ts";
+ import {
+@@ -26,6 +32,11 @@ import {
+   requestUsage,
+   memoryWindow,
+ } from "./session-context.ts";
++// 日记整理时，原文 token 相对输出上限的最大倍数；超过它压缩比就不现实。
++const DIARY_SOURCE_RATIO = 3;
++// 预算扣掉固定开销后装不下这个规模的原文时，压缩比不现实：不请求模型，等预算归零。
++const MIN_DIARY_SOURCE_TOKENS = 4000;
++
+ export class Sessions {
+   memoryMaintenance = false;
+   blockedSessions = new Set<string>();
+@@ -114,12 +125,25 @@ export class Sessions {
+     const history = matchingHistory(rows, p.revision, policy.history_scope);
+     const last = rows.findLast((row: any) => row.role === "assistant" && !row.delivery_id);
+     const usage = last?.request_usage;
+-    const matches =
++    // 分级路由每轮换模型，记录里的 model_id 常不等于绑定模型（绑定
++    // deepseek-flash、实测 mr-deepseek-v41-low）。只要那条记录对应的模型仍在
++    // 配置里启用、端点也对得上，就认这一条，否则换过模型后会一直判成“无用量”。
++    const recorded = usage && (this.config.models ?? []).find(
++      (m: any) =>
++        m.id === usage.model_id &&
++        m.model === usage.model &&
++        m.provider === usage.provider_id,
++    );
++    // 严格匹配：记录与当前绑定模型完全一致（原始行为）。
++    const strictMatch =
+       usage &&
+-      last.persona_revision === p.revision &&
+       usage.model_id === (p.provider.model_id || p.provider.model) &&
+       usage.model === p.provider.model &&
+       usage.provider_id === p.provider.id;
++    const matches =
++      usage &&
++      last.persona_revision === p.revision &&
++      (strictMatch || (usage.provider_id === p.provider.id && !!recorded && recorded.enabled !== false));
+     const legacy = policy.memory_mode === "legacy";
+     const window = legacy ? memoryWindow(history, policy)
+       : { short: history.filter((row: any) => row.type === "message"), long: [] };
+@@ -191,9 +215,9 @@ export class Sessions {
+       usage: matches
+         ? {
+             ...usage,
+-            context_window: limit.tokens,
+-            percent: limit.tokens
+-              ? (usage.used_tokens / limit.tokens) * 100
++            context_window: usage.context_window ?? limit.tokens,
++            percent: (usage.context_window ?? limit.tokens)
++              ? (usage.used_tokens / (usage.context_window ?? limit.tokens)) * 100
+               : null,
+             settings_changed:
+               JSON.stringify(last.context_policy) !== JSON.stringify(policy) ||
+@@ -248,9 +272,11 @@ export class Sessions {
+     route?: ChannelRoute,
+     transient = false,
+     queue?: QueuePolicy,
++    images?: ChatImage[],
++    input?: TurnInput,
+   ) {
+     const captured = this.captureRoute(id, route);
+-    return this.dispatch(id, captured.signal, () => this.runChat(id, text, onChunk, captured.signal!, onContext, expectedPersona, captured, transient), queue);
++    return this.dispatch(id, captured.signal, () => this.runChat(id, text, onChunk, captured.signal!, onContext, expectedPersona, captured, transient, { transient: false }, input, images), queue);
+   }
+   /** Capture arrival metadata before any asynchronous routing or queue wait. */
+   async outgoingIdentity(id: string, route: ChannelRoute) {
+@@ -291,6 +317,7 @@ export class Sessions {
+     transient = false,
+     turn: ToolTurn = { transient: false },
+     input?: TurnInput,
++    images?: ChatImage[],
+   ) {
+     signal.throwIfAborted();
+     if (this.memoryMaintenance) throw Error("记忆恢复中，请稍后重试");
+@@ -302,6 +329,10 @@ export class Sessions {
+     if (this.memoryMaintenance || this.blockedSessions.has(id))
+       throw Error("会话维护中，请稍后重试");
+     if (!text.trim() || text.length > 16000) throw Error("请输入 1–16000 字");
++    // 写入回执只由写入类工具在写成功后上报；读文件、正文提到路径、通用命令都不算。
++    const writeReceipts: WriteReceipt[] = [];
++    // 当前正在执行的工具调用，用来给回执补归属；插件自报的身份和数字都不采信。
++    let callFrame: { tool: string; plugin: string; call_id: string; round: number } | null = null;
+     const receivedAt = route?.receivedAt ?? new Date().toISOString(), zone = route?.timezone ?? timezone(this.config.timezone);
+     const { memory, memoryEngine: engine, llm, tools, logger } = this.services;
+     const execution = await this.services.executionArchive?.start(id, {
+@@ -328,6 +359,19 @@ export class Sessions {
+       signal.throwIfAborted();
+       const p = await persona(this.root, this.config, channel.persona);
+       this.identities.set(id, { persona_id: p.id, persona_name: p.name, persona_revision: p.revision, timezone: zone });
++      const routed = transient
++        ? null
++        : await this.services.modelRouter?.route({ text, sessionId: id, fallbackProvider: p.provider });
++      if (routed?.provider) {
++        p.provider = routed.provider;
++        await execution?.write("route", {
++          decision: routed.decision,
++          source: routed.source,
++          pool: routed.pool,
++          model: routed.model,
++          ...(routed.reason ? { reason: routed.reason } : {}),
++        });
++      }
+       await execution?.write("context", { persona: p.id, provider: p.provider.id, model: p.provider.model });
+       if (expectedPersona && expectedPersona !== p.id)
+         throw Error("当前人格已在其他窗口切换，请刷新后重试");
+@@ -356,6 +400,24 @@ export class Sessions {
+         personaId: p.id,
+         permission: channel.permission ?? p.permission,
+         signal,
++        evidence: (entry: any) => {
++          // 只收写入证据；路径由宿主规范化，越界的、没规范化的都不计。
++          if (String(entry?.kind ?? "") !== "file_write" || !callFrame) return;
++          const normalized = receiptPath(this.root, String(entry?.path ?? ""));
++          if (!normalized) return;
++          writeReceipts.push({
++            kind: "file_write",
++            path: normalized,
++            tool: callFrame.tool,
++            plugin: callFrame.plugin,
++            call_id: callFrame.call_id,
++            round: callFrame.round,
++            ...(typeof entry?.bytes === "number" ? { bytes: entry.bytes } : {}),
++            ...(typeof entry?.sha256 === "string" ? { sha256: entry.sha256 } : {}),
++            read_back: entry?.read_back === "ok" ? "ok" : "failed",
++            ...(entry?.error ? { error: String(entry.error) } : {}),
++          });
++        },
+       };
+       const storedHistory = (engine ? await engine.contextRows(id) : conversationRows(await memory.readSession(id))).filter(
+         (row: any) => row.type !== "channel_receipt",
+@@ -463,18 +525,27 @@ export class Sessions {
+       const reserve = this.outputReserve(p.provider, legacy);
+       const requestBudget = limit.tokens ? Math.max(1, limit.tokens - reserve) : Infinity;
+       const stablePrefix = !legacy && supportsContextPrefix(p.provider);
++      // 图片只在真正发请求时展开；估算一路走 promptText 的占位符，不会被 base64 撑爆预算。
++      // 本轮图片总量守卫：超 8MiB 降到 low，超 16MiB 直接拒，免得 base64 把请求撑爆、或被 provider 静默截断。
++      const imageBytes = (images ?? []).reduce((sum, image) => sum + image.data.byteLength, 0);
++      if (imageBytes > IMAGE_LIMITS.totalBytes)
++        throw Error("本轮图片合计 " + (imageBytes / 1048576).toFixed(1) + "MiB，超过 16MiB 上限，请分几次发或先压缩");
++      const imageDetail: "auto" | "low" = imageBytes > IMAGE_LIMITS.softBytes ? "low" : "auto";
++      const imageContent = (value: string): any => !images?.length ? value
++        : [{ type: "text", text: value }, ...images.map((image) => ({ type: "image_url",
++            image_url: { url: "data:" + image.mimeType + ";base64," + Buffer.from(image.data).toString("base64"), detail: imageDetail } }))];
+       const assemble = (rows = recent, compressed = shortSummary) => {
+         const frame = contextFrame(materials(compressed), rows, historyReference, timing(), stablePrefix);
+         frame.messages.push(transient
+           ? { role: "user", content: "【本轮插件临时输入，不是真人发言，不作为经历保存】\n来源：" + JSON.stringify(source.origin) + "\n" + text }
+-          : { role: "user", content: text });
++          : { role: "user", content: imageContent(text) });
+         return frame;
+       };
+       const assembled = (rows = recent, compressed = shortSummary) => assemble(rows, compressed).messages;
+       const capacity = (compressed = shortSummary) => Math.min(
+         budget - estimateTokens(summary + compressed + (summary ? originNote(summaryOrigin) + summaryTime(summaryOrigin, zone) : "") +
+           (compressed ? originNote(short.checkpoint) + summaryTime(short.checkpoint, zone) : "") + facts.join("\n") + JSON.stringify(snippets)),
+-        requestBudget - estimateTokens(JSON.stringify(assembled([], compressed)) + JSON.stringify(toolList)),
++        requestBudget - estimateTokens(promptText(assembled([], compressed)) + JSON.stringify(toolList)),
+       );
+       let recentTokens = tail(recent, Infinity).tokens;
+       const overBudget = () => recentTokens > capacity();
+@@ -500,24 +571,62 @@ export class Sessions {
+           const inputTokens = estimateTokens(promptText(assembled()) + JSON.stringify(toolList));
+           const target = limit.tokens * policy.compression_target_percent! / 100 - reserve;
+           // Output is a request ceiling, not a forced diary length or a source truncation limit.
+-          const outputTokens = Math.max(256, Math.min(8192, Math.floor(requestBudget * 0.1)));
++          // 输出上限可配：写日记比对话更需要长输出，8192 在长会话里必然被 finish_reason=length 截断。
++          const outputCeiling = Math.max(256, Math.min(65536, Number(this.config.memory?.diary_max_output_tokens) || 8192));
++          const outputTokens = Math.max(256, Math.min(outputCeiling, Math.floor(requestBudget * 0.1)));
++          // 日记整理可单独绑定模型；触发阈值仍按对话模型容量算。
++          const diaryModel = resolveDiaryModel(this.config);
++          const diaryProvider = diaryModel?.provider ?? p.provider;
++          const diaryLimit = (diaryModel ? (await this.modelLimit(diaryProvider, signal)).tokens : null) ?? limit.tokens;
+           const cost = (rows: any[]) => estimateTokens(JSON.stringify(renderHistory(rows.map(historyEntry), zone, historyReference)));
+-          const desired = diaryPrefix(diary.remaining, inputTokens - target + outputTokens, cost);
+-          const selected = fittingDiaryPrefix(desired, rows => diaryRequestPlan({ rows, scope, timezone: zone,
+-            outputTokens }).reserved <= limit.tokens!);
++          // 原文上限：一次整理的原文规模不得超过输出上限的若干倍，否则必然被 finish_reason=length 截断。
++          const sourceCeiling = outputTokens * DIARY_SOURCE_RATIO;
++          const desired = diaryPrefix(diary.remaining, Math.min(inputTokens - target + outputTokens, sourceCeiling), cost);
++          // 预订额度由记忆引擎按「每日记忆预算」卡住；只看模型上下文会挑出一批永远过不了账的段落。
++          const memoryBudget = await engine.memoryRequestBudget(id);
++          const fits = (rows: any[]) => {
++            const reserved = diaryRequestPlan({ rows, scope, timezone: zone, outputTokens }).reserved;
++            return reserved <= diaryLimit! && reserved <= memoryBudget.remaining;
++          };
++          const selected = memoryBudget.remaining > 0 ? fittingDiaryPrefix(desired, fits) : [];
++          const selectedCost = selected.length ? cost(selected) : 0;
+           if (diary.paused) memoryNotice = "日记整理已暂停：" + diary.paused.reason;
++          else if (memoryBudget.remaining <= 0) {
++            memoryNotice = "今日记忆整理预算已用完（" + memoryBudget.reserved + "/" + memoryBudget.budget + "）；明天继续，或提高每日记忆预算。";
++            logger.info("日记整理", { status: "skipped", reason: "memory_budget_exhausted", remaining: diary.remaining.length, budget: diaryLimit, memory_remaining: memoryBudget.remaining });
++          }
+           else if (estimateTokens(promptText(assembled([])) + JSON.stringify(toolList)) >= target)
+             memoryNotice = "已有日记和固定内容已接近压后目标；不会再次压缩旧日记，请提高目标比例或封存后新建会话。";
+-          else if (!selected.length) memoryNotice = "没有可在模型容量内归档的完整旧对话；请更换更大容量模型或封存后新建会话。";
++          else if (!selected.length) {
++            memoryNotice = "没有可归档的完整旧对话：模型容量或今日记忆预算不足（剩余 " + memoryBudget.remaining + " token）；请提高每日记忆预算、更换更大容量模型，或封存后新建会话。";
++            logger.info("日记整理", { status: "skipped", reason: "no_fitting_prefix", remaining: diary.remaining.length, budget: diaryLimit, memory_remaining: memoryBudget.remaining });
++          }
++          else if (selectedCost < MIN_DIARY_SOURCE_TOKENS && selected.length < desired.length) {
++            memoryNotice = "今日记忆整理预算不足以整理出有效压缩比（可归档 " + selected.length + " 条）；等预算归零后再整理。";
++            logger.info("日记整理", { status: "skipped", reason: "budget_too_small", sources: selected.length, cost: selectedCost, memory_remaining: memoryBudget.remaining, remaining: diary.remaining.length, budget: diaryLimit });
++          }
+           else {
+-            const result = await writeDiary({ services: this.services, id, scope, rows: selected,
+-              provider: p.provider, limit: limit.tokens, outputTokens, signal, timezone: zone });
+-            memoryNotice = result.reason;
++            // 输出撞上 max_completion_tokens 只说明这一批原文超出了模型一次能写完的量：
++            // 把原文减半再试，比把整个会话的日记停到人工解封更合适。最多三轮，避免反复花钱。
++            let attempt = selected;
++            let result: any = null;
++            for (let round = 0; ; round += 1) {
++              result = await writeDiary({ services: this.services, id, scope, rows: attempt,
++                provider: diaryProvider, limit: diaryLimit, outputTokens, signal, timezone: zone });
++              if (result.status === "written" || round >= 2) break;
++              if (!String(result.reason ?? "").includes("截断")) break;
++              const half = attempt.slice(0, Math.floor(attempt.length / 2));
++              if (!half.length || cost(half) < MIN_DIARY_SOURCE_TOKENS) break;
++              await engine.retryDiary(id, scope); // 上一轮失败写了暂停标记；不清掉，下一次调用会直接返回 paused
++              attempt = half;
++            }
++            memoryNotice = result?.reason;
+             diary = await diaryContext(engine, id, scope, shortRows);
+             recent = diary.remaining.map(historyEntry);
+-            if (result.status === "written" && estimateTokens(promptText(assembled()) + JSON.stringify(toolList)) > target)
++            if (result?.status === "written" && estimateTokens(promptText(assembled()) + JSON.stringify(toolList)) > target)
+               memoryNotice = "日记已保存；为保留信息，本次尚未降到目标占用，不会立即追加压缩请求。";
+-            await execution?.write("memory_diary", { status: result.status, sources: selected.length, reason: result.reason });
++            await execution?.write("memory_diary", { status: result?.status, sources: attempt.length, reason: result?.reason });
++            logger.info("日记整理", { status: result?.status, sources: attempt.length, reason: result?.reason, remaining: diary.remaining.length, budget: diaryLimit });
+           }
+         }
+       }
+@@ -540,6 +649,7 @@ export class Sessions {
+         after: { materials: materials(), history: recent, input: text, transient,
+           history_scope: policy.history_scope, context_limit: limit.tokens, request_budget: Number.isFinite(requestBudget) ? requestBudget : null } });
+       let final = "";
++      const receipts: { tool: string; ok: boolean; args?: string }[] = [];
+       let measured: any = null;
+       let memoryWriteRejected = false;
+       const mediaSignals: AbortSignal[] = [];
+@@ -613,8 +723,11 @@ export class Sessions {
+           // Seal synchronously after the last await. Unsent candidates never enter history.
+           if (input && !input.tryFinish()) continue;
+           final = reply.text;
++
+           break;
+         }
++        // 上游语义：思考模式下模型没回传 reasoning_content 时默认拒绝执行工具，
++        // 免得把不完整的协议继续下去；确需放行时在模型上开 reasoning_compatibility.fill_missing。
+         if (historyReference && typeof reply.reasoning_content !== "string")
+           throw Error("思考模式工具响应缺少 reasoning_content，未执行本次工具调用");
+         messages.push({
+@@ -638,6 +751,8 @@ export class Sessions {
+           const toolOrigin = tools.entries?.get(call.name)?.origin;
+           let result;
+           superseded ||= input?.hasPending() ?? false;
++          callFrame = superseded ? null : { tool: call.name, plugin: String((toolOrigin as any)?.plugin ?? ""),
++            call_id: String((call as any)?.id ?? ""), round: turn.round };
+           if (superseded) {
+             result = { ok: false, executed: false, reason: "user_input_appended",
+               result: "未执行：用户补充了消息，请结合补充内容重新判断是否仍需调用此工具。" };
+@@ -661,6 +776,8 @@ export class Sessions {
+               tool: turn.transient && !toolOrigin ? "[未注册工具]" : call.name, error: result.result,
+               ...(turn.transient ? {} : { arguments: call.arguments }) });
+           }
++          callFrame = null;
++          if (!superseded) receipts.push({ tool: call.name, ok: result.ok !== false, args: call.arguments });
+           if (!superseded && !result.ok && ["remember_fact", "edit_facts"].includes(call.name))
+             memoryWriteRejected = true;
+           await memory.appendEvent({
+@@ -695,6 +812,10 @@ export class Sessions {
+         messages.push(...attachments);
+         if (attachments.length) diagnostics?.event("context.change", { operation: "append", source: "tool_attachments", after: attachments });
+       }
++      const files = await verifiedFiles(this.root, writeReceipts);
++      if (writeReceipts.length)
++        await execution?.write("write_receipts", { receipts: writeReceipts, files });
++      if (files.length) onContext?.({ files });
+       if (!final) throw Error("模型未返回最终回复，请重试");
+       await memory.appendEvent({
+         type: "message",
+@@ -704,6 +825,7 @@ export class Sessions {
+         role: "assistant",
+         // User-facing conversation is primary history. Technical plugin runs retain their opt-in privacy.
+         text: transient && turn.transient ? TRANSIENT_REPLY : final,
++        ...(files.length ? { files } : {}),
+         ...(transient && turn.transient ? { transient: true } : {}),
+         ...context,
+         request_usage: measured,
+@@ -716,6 +838,8 @@ export class Sessions {
+           provider: p.provider, limit: limit.tokens, signal, timezone: zone,
+           rows: matchingHistory(currentRows, p.revision, policy.history_scope), policy, revision: p.revision });
+       }
++      // Send this turn's measured usage so the page can show what it cost.
++      if (measured) onContext?.({ usage: measured });
+       executionStatus = "completed";
+       return final;
+     } catch (error: any) {
+diff --git a/core/tools.ts b/core/tools.ts
+index a434c0b..866aeb3 100644
+--- a/core/tools.ts
++++ b/core/tools.ts
+@@ -157,7 +157,18 @@ export class Tools {
+             : "工具已关闭",
+         );
+       signal.throwIfAborted();
+-      const result = await tool.run(args, { ...session, signal, ...(turn.transient ? { transientContext: true } : {}) });
++      // 证据通道：工具只报自己知道的操作事实，调用 ID 与插件身份由宿主在这里盖章。
++      const runSession = typeof (session as any).evidence === "function"
++        ? {
++          ...session,
++          evidence: (payload: any) => {
++            try {
++              (session as any).evidence({ ...(payload ?? {}), tool: name, plugin: tool?.owner || "core", call_id: callId });
++            } catch { /* 证据接收方的异常不能改写工具结果 */ }
++          },
++        }
++        : session;
++      const result = await tool.run(args, { ...runSession, signal, ...(turn.transient ? { transientContext: true } : {}) });
+       // Cancellation cannot undo a completed external operation or replace its true result.
+       if (tool.transientResult) {
+         if (!result || typeof result !== "object" || !Object.hasOwn(result, "content") || !Object.hasOwn(result, "receipt"))
+diff --git a/core/ui/api.js b/core/ui/api.js
+index 7d430e0..42d04f3 100644
+--- a/core/ui/api.js
++++ b/core/ui/api.js
+@@ -31,6 +31,7 @@ export const escapeHTML = (value) =>
+   );
+ export const typeNames = {
+   chat: "对话",
++  diary: "日记整理",
+   embedding: "向量 / Embedding",
+   rerank: "重排序",
+   image: "图像生成",
+diff --git a/core/ui/app.js b/core/ui/app.js
+index 55ade77..571e0f9 100644
+--- a/core/ui/app.js
++++ b/core/ui/app.js
+@@ -19,6 +19,8 @@ import {
+   bindChat,
+   renderLogs,
+   bindLogs,
++  renderUsage,
++  bindUsage,
+ } from "./views.js";
+ 
+ const pages = {
+@@ -29,8 +31,11 @@ const pages = {
+   bindings: { name: "使用配置", render: renderBindings, bind: bindBindings },
+   chat: { name: "对话", render: renderChat, bind: bindChat },
+   plugins: { name: "插件管理", render: renderPlugins, bind: bindPlugins },
++  usage: { name: "账本", render: renderUsage, bind: bindUsage },
+   logs: { name: "运行日志", render: renderLogs, bind: bindLogs },
+ };
++const thinkingFaces = ["(｡•ᴗ•｡)","(´｡• ᵕ •｡`)","(๑•̀ㅂ•́)و","(￣▽￣)","(＝ω＝)","(っ˘ω˘ς)","(๑´ω`๑)","(・ω・)","(๑•́ ₃ •̀๑)","( ˘ω˘ )","(´▽`)","(･ω･)ﾉ"];
++const pickThinkingFace = () => thinkingFaces[Math.floor(Math.random() * thinkingFaces.length)];
+ const $ = (id) => document.getElementById(id);
+ document
+   .querySelectorAll("[data-icon]")
+@@ -58,8 +63,12 @@ class ConsoleApp {
+     messages: [],
+     logs: [],
+     logFollow: true,
++    usage: null,
++    usageDays: 7,
++    usageError: "",
+     chatBusy: false,
+     chatDraft: "",
++    pendingImages: [],
+     session: null,
+     sessions: [],
+     memorySession: null,
+@@ -78,7 +87,7 @@ class ConsoleApp {
+         if (this.state.page === "memory") loadMemory(this);
+       }
+     });
+-    window.addEventListener("focus", () => this.syncView());
++    window.addEventListener("focus", () => this.refreshOnFocus());
+     $("login-form").onsubmit = (event) => {
+       event.preventDefault();
+       this.login();
+@@ -167,13 +176,34 @@ class ConsoleApp {
+       this.updateChatControls();
+     }
+   }
++  async renameSession() {
++    const id = this.state.session;
++    if (!id) return;
++    const current = this.state.sessionName || "";
++    this.dialog(
++      "会话改名",
++      `<label for="rename-session-name">名称</label><input id="rename-session-name" name="name" maxlength="80" required value="${e(current)}" placeholder="给这个会话取个名字">`,
++      async (data) => {
++        const name = String(data.get("name") || "").trim();
++        if (!name) throw Error("名称不能为空");
++        await api("/api/memory/session/rename", { id, name });
++        this.state.sessionName = name;
++        const item = (this.state.sessions || []).find((x) => x.id === id);
++        if (item) item.name = name;
++        if (this.state.page === "chat") this.render();
++        this.toast("会话名称已保存");
++      },
++      "保存名称",
++    );
++  }
+   async syncSession(input) {
+     if (this.state.chatBusy || (!input && this.sessionChanging)) return;
+     const sequence = ++this.sessionSync;
+     const { id } = await api("/api/session/current", input ??
+       (this.sessionReady ? undefined : { legacyId: localStorage.whaleSession }));
+-    const [rows, choices] = await Promise.all([
+-      api("/api/session?id=" + encodeURIComponent(id)), api("/api/session/list"),
++    const [page, choices] = await Promise.all([
++      api("/api/session?id=" + encodeURIComponent(id) + "&limit=" + PAGE_SIZE),
++      api("/api/session/list"),
+     ]);
+     if (sequence !== this.sessionSync || this.state.chatBusy) return;
+     this.sessionReady = true;
+@@ -187,14 +217,222 @@ class ConsoleApp {
+       this.state.memoryLoadedTab = null;
+     }
+     localStorage.whaleSession = id;
+-    this.state.messages = rows
++    this.state.msgStart = page.start;
++    this.state.msgTotal = page.total;
++    this.state.msgHasMore = page.hasMore;
++    this.olderLoading = false;
++    this.state.messages = page.items
+       .filter((r) => r.type === "message")
+       .map((r) => ({
+         role: r.role,
+         text: r.text,
+         personaName: r.persona_name,
++        at: r.ts,
++        files: r.files,
+       }));
+   }
++  /** 往上翻一页：用加载行撑住高度，翻完还原滚动位置，不跳。 */
++  async loadOlder() {
++    if (this.olderLoading || !this.state.msgHasMore || this.state.chatBusy) return;
++    const box = $("messages");
++    if (!box) return;
++    this.olderLoading = true;
++    const more = box.querySelector(".chat-history-more");
++    if (more) more.textContent = "加载中…";
++    const id = this.state.session;
++    try {
++      const page = await api(
++        "/api/session?id=" + encodeURIComponent(id) +
++          "&limit=" + PAGE_SIZE + "&before=" + this.state.msgStart,
++      );
++      if (id !== this.state.session) return;
++      const height = box.scrollHeight;
++      const older = page.items
++        .filter((r) => r.type === "message")
++        .map((r) => ({
++          role: r.role,
++          text: r.text,
++          personaName: r.persona_name,
++          at: r.ts,
++          files: r.files,
++        }));
++      this.state.messages = older.concat(this.state.messages);
++      this.state.msgStart = page.start;
++      this.state.msgTotal = page.total;
++      this.state.msgHasMore = page.hasMore;
++      this.olderLoading = false;
++      this.renderMessages();
++      const grow = box.scrollHeight - height;
++      box.scrollTop += grow;
++      requestAnimationFrame(() => { box.scrollTop += grow; });
++      return;
++    } catch (error) {
++      this.toast(error.message, true);
++    } finally {
++      this.olderLoading = false;
++      const stale = $("messages")?.querySelector(".chat-history-more");
++      if (stale) stale.textContent = "加载更早的 " + PAGE_SIZE + " 条";
++    }
++  }
++  /** 左侧段落目录：满 20 条或隔 30 分钟切一段，点一下跳到那段。 */
++  /** 左侧导航轨：一条用户请求一节。轨道上只画刻度，摘要放进悬浮卡（勘 2026-11-16）。 */
++  renderOutline() {
++    const rail = $("chat-rail");
++    if (!rail) return;
++    this.railTurns = [];
++    let turn = null;
++    (this.state.messages || []).forEach((m, index) => {
++      if (m.role === "user") {
++        turn = { from: index, ask: plainText(m.text), answers: [] };
++        this.railTurns.push(turn);
++        return;
++      }
++      if (turn && m.text) turn.answers.push(plainText(m.text));
++    });
++    if (this.railTurns.length < 3) {
++      rail.hidden = true;
++      rail.innerHTML = "";
++      this.hideRailCard();
++      return;
++    }
++    rail.hidden = false;
++    rail.innerHTML =
++      this.railTurns
++        .map(
++          (t, i) =>
++            '<button type="button" class="chat-rail-tick" data-turn="' + i +
++            '" aria-label="' + e(clip(t.ask, 40)) + '"><i></i></button>',
++        )
++        .join("");
++    rail.querySelectorAll("[data-turn]").forEach((tick) => {
++      tick.onmouseenter = () => this.showRailCard(tick);
++      tick.onmouseleave = () => this.hideRailCard();
++      tick.onfocus = () => this.showRailCard(tick);
++      tick.onblur = () => this.hideRailCard();
++      tick.onclick = () => this.jumpToTurn(Number(tick.dataset.turn));
++    });
++    this.watchRail();
++  }
++  railCard() {
++    let card = document.getElementById("chat-rail-card");
++    if (!card) {
++      card = document.createElement("div");
++      card.id = "chat-rail-card";
++      card.className = "chat-rail-card";
++      card.hidden = true;
++      document.body.appendChild(card);
++    }
++    return card;
++  }
++  /** 悬浮卡贴在刻度右边，纵向不许出窗口。 */
++  showRailCard(tick) {
++    const turn = (this.railTurns || [])[Number(tick.dataset.turn)];
++    if (!turn) return;
++    const card = this.railCard();
++    const answer = turn.answers.join(" ");
++    card.innerHTML =
++      "<b>" + e(clip(turn.ask, 120)) + "</b>" +
++      "<span>" + e(clip(answer || "（这一节没有回答）", 260)) + "</span>" +
++      '<span class="chat-rail-card-meta">' + (1 + turn.answers.length) + " 条</span>";
++    card.hidden = false;
++    const rect = tick.getBoundingClientRect();
++    const box = card.getBoundingClientRect();
++    const left = Math.min(rect.right + 12, window.innerWidth - box.width - 12);
++    const top = Math.max(12, Math.min(rect.top - 8, window.innerHeight - box.height - 12));
++    card.style.left = Math.max(12, left) + "px";
++    card.style.top = top + "px";
++  }
++  hideRailCard() {
++    const card = document.getElementById("chat-rail-card");
++    if (card) card.hidden = true;
++  }
++  jumpToTurn(index) {
++    const turn = (this.railTurns || [])[index];
++    if (!turn) return;
++    const nodes = $("messages")?.querySelectorAll(".message") || [];
++    nodes[turn.from]?.scrollIntoView({ block: "start", behavior: "smooth" });
++  }
++  /** 滚动或窗口尺寸一变就重排：刻度按消息的真实位置摆，紫色只留一个（勘 2026-11-16）。
++      旧版一边画按比例插值的游标、一边画按消息判定的高亮，两者位置不一致，
++      看着就是"对不上"；窗口一改尺寸还会同时看到两条紫线。现在只保留刻度本身。 */
++  watchRail() {
++    const rail = $("chat-rail");
++    const box = $("messages");
++    if (!rail || !box) return;
++    // 每次 render() 都会用整页 markup 重建 #messages，拿到的是新节点；
++    // 旧监听还挂在被摘下来的那个节点上，此后滚动手势再也送不到轨道，
++    // 高亮就永远停在最后一次算出来的位置（勘 2026-11-16 修）。
++    if (this.railBox !== box) {
++      if (this.railBox && this.railScrollHandler)
++        this.railBox.removeEventListener("scroll", this.railScrollHandler);
++      this.railScrollHandler = () => this.syncRail();
++      box.addEventListener("scroll", this.railScrollHandler, { passive: true });
++      this.railBox = box;
++    }
++    if (!this.railWatched) {
++      this.railWatched = true;
++      window.addEventListener("resize", () => this.syncRail(), { passive: true });
++      // 切窗口回来时，尺寸没变、滚动没变，一个事件都不会来。
++      // 上一轮若是趁容器被隐藏时算过一遍，高亮就钉死了，得给个重新对账的机会（勘 2026-11-16 修）。
++      window.addEventListener("focus", () => this.syncRail());
++      document.addEventListener("visibilitychange", () => {
++        if (!document.hidden) this.syncRail();
++      });
++    }
++    // ResizeObserver 每次都要盯住"当前的"内容节点。
++    // 旧写法只在第一次 observe：一旦 #messages 的内层被整体换掉，
++    // 观察者盯的就是已经摘下来的节点，此后永不触发（勘 2026-11-16 修）。
++    if (typeof ResizeObserver === "function") {
++      const target = box.firstElementChild || box;
++      if (this.railObserverTarget !== target) {
++        if (!this.railObserver) this.railObserver = new ResizeObserver(() => this.syncRail());
++        this.railObserver.disconnect();
++        this.railObserver.observe(target);
++        this.railObserverTarget = target;
++      }
++    }
++    this.syncRail();
++  }
++  syncRail() {
++    const rail = $("chat-rail");
++    const box = $("messages");
++    if (!rail || !box || rail.hidden) return;
++    // 窗口最小化、切到后台、渲染中途容器被隐藏时，所有 rect 都是 0。
++    // 那时"每条消息都顶在阈值上方"会把高亮钉死在最后一格，
++    // 而尺寸恢复后往往又没有事件再来纠正——干脆不在这时候算（勘 2026-11-16 修）。
++    if (document.hidden || box.clientHeight < 1 || rail.clientHeight < 1) return;
++    const ticks = [...rail.querySelectorAll(".chat-rail-tick")];
++    if (!ticks.length) return;
++    const nodes = [...box.querySelectorAll(".message")];
++    const boxRect = box.getBoundingClientRect();
++    const pad = 12;
++    const usable = Math.max(1, rail.clientHeight - pad * 2);
++    // 刻度等距排开，看着整齐；位置只表示"第几节"，不再对应真实滚动偏移（勘 2026-11-16）
++    const count = ticks.length;
++    const stepRaw = count > 1 ? usable / (count - 1) : 0;
++    const step = Math.max(6, stepRaw);
++    const total = step * Math.max(0, count - 1);
++    const start = pad + (step > stepRaw ? Math.max(0, (usable - total) / 2) : 0);
++    ticks.forEach((tick, i) => {
++      tick.style.top = Math.round((start + i * step) * 10) / 10 + "px";
++    });
++    // 当前那一节：直接拿消息相对视口的位置比，不再掺 scrollTop。
++    // 旧写法假设滚动一定发生在这个容器上；实际一旦滚动落在祖先元素，
++    // scrollTop 恒为 0、每条消息的 rect 却已经在动，于是"全都不超过阈值"，
++    // 高亮永远停在最后一格（勘 2026-11-16 修）。
++    const liveBox = box.getBoundingClientRect();
++    const head = liveBox.top + Math.min(120, box.clientHeight * 0.3);
++    let active = -1;
++    (this.railTurns || []).forEach((turn, i) => {
++      const node = nodes[turn.from];
++      if (!node || !node.isConnected) return;
++      const rect = node.getBoundingClientRect();
++      if (!rect.height && !rect.width) return; // 还没量出来的节点不算
++      if (rect.top <= head) active = i;
++    });
++    if (active < 0) return; // 一个都量不准，就别动上一轮的结果
++    ticks.forEach((tick, i) => tick.classList.toggle("active", i === active));
++  }
+   async refreshSessionContext() {
+     const id = this.state.session;
+     try {
+@@ -210,6 +448,20 @@ class ConsoleApp {
+         $("chat-context").textContent = error.message;
+     }
+   }
++  /** 切回窗口只轻刷状态和上下文，不再走 syncView→load()。
++      旧版那条路会顺带重新 syncSession()：把已经翻出来的历史丢掉、只剩最后 40 条，
++      再按"原来在底部"把滚动条按到最后，看着就是一切窗口就跳回最新（勘 2026-11-16 修）。 */
++  async refreshOnFocus() {
++    if (!this.authenticated) return;
++    try {
++      await this.refreshStatus();
++      this.updateConnection();
++      if (this.state.page === "chat") await this.refreshSessionContext();
++    } catch {
++      // 切窗口不该弹错，刷新失败就保持原样
++    }
++    this.syncRail();
++  }
+   async syncView() {
+     const page = this.state.page;
+     if (this.authenticated && (page.startsWith("extension:") || page.startsWith("plugin:")) && !this.syncing) {
+@@ -364,17 +616,38 @@ class ConsoleApp {
+         if (this.state.page === "logs") this.renderLogs();
+         return;
+       }
++      if (data.type === "append") {
++        if (data.status === "accepted") this.toast("已并入本轮");
++        else if (data.status === "duplicate") this.toast("这句已经并进去了");
++        else if (data.status === "full") this.toast("本轮补充已满，这句没进去", true);
++        else if (data.status === "closed") this.toast("这一轮刚好收尾了，再发一次就成新的一轮", true);
++        else this.toast(data.error || "补充没送进去", true);
++        return;
++      }
+       if (data.type === "context") {
+         if (data.queued) {
+           this.toast("当前会话正在处理其他请求，已排队等待");
+           return;
+         }
++        // Usage arrives at the end of a turn; merge it into the cached context and repaint.
++        if (data.usage) {
++          const merged = { ...(this.state.sessionContext || {}), usage: data.usage };
++          this.state.sessionContext = merged;
++          if ($("chat-context")) $("chat-context").innerHTML = renderContextMeter(merged, true);
++          return;
++        }
++        if (data.files) {
++          if (this.reply) this.reply.files = data.files;
++          if (this.state.page === "chat") this.renderMessages();
++          return;
++        }
+         this.replyPersonaName = data.personaName;
+         this.state.status.persona = data.personaId;
+         this.state.status.personaName = data.personaName;
+-        if (this.state.page === "chat") this.render();
+-        if (data.contextReset)
++        if (data.contextReset) {
+           this.toast("人格已更新，本轮使用新的人格上下文；旧记录保留");
++          if (this.state.page === "chat") this.render();
++        }
+         return;
+       }
+       if (data.type === "chunk") {
+@@ -387,6 +660,10 @@ class ConsoleApp {
+           this.state.messages.push(this.reply);
+         }
+         this.reply.text += data.text;
++        if (this.state.page === "chat") {
++          this.patchReply();
++          return;
++        }
+       } else if (data.type === "done" || data.type === "error") {
+         if (data.type === "error") {
+           this.state.messages.push({ role: "error", text: data.error });
+@@ -457,26 +734,35 @@ class ConsoleApp {
+           m.id === (persona?.model || this.state.config.bindings.chat) &&
+           m.enabled,
+       );
+-      button.disabled = this.state.chatBusy || this.sessionChanging || !this.state.session || !this.chatConnected || !selected;
++      button.disabled = this.sessionChanging || !this.state.session || !this.chatConnected || !selected;
+       button.innerHTML =
+-        (this.state.chatBusy ? "正在回复…" : "发送") + " " + icon("send");
++        (this.state.chatBusy ? "补充" : "发送") + " " + icon("send");
+     }
+     if ($("new-session")) $("new-session").disabled = this.state.chatBusy || this.sessionChanging;
+   }
+   sendMessage() {
+     const text = ($("chat-input")?.value || "").trim();
+-    if (
+-      !text ||
+-      !this.chatConnected ||
+-      this.state.chatBusy ||
+-      $("send").disabled
+-    )
++    const images = this.state.pendingImages.slice();
++    if ((!text && !images.length) || !this.chatConnected || $("send").disabled) return;
++    // 本轮还在跑：不排队，直接并进当前回合，让它中途改方向（勘 2026-11-16）
++    if (this.state.chatBusy) {
++      if (images.length) return this.toast("补充消息先别带图，等这轮跑完再发", true);
++      this.chatWS.send(
++        JSON.stringify({ append: true, session: this.state.session, text }),
++      );
++      this.state.messages.push({ role: "user", text, nudge: true });
++      this.state.chatDraft = "";
++      $("chat-input").value = "";
++      this.renderMessages();
+       return;
+-    this.state.messages.push({ role: "user", text });
++    }
++    this.state.messages.push({ role: "user", text, images: images.map((image) => image.dataUrl) });
+     this.state.chatBusy = true;
+     this.state.chatDraft = "";
++    this.state.pendingImages = [];
+     this.reply = null;
+     $("chat-input").value = "";
++    this.renderPendingImages();
+     this.replyPersonaName = this.state.status.personaName;
+     this.chatWS.send(
+       JSON.stringify({
+@@ -484,11 +770,98 @@ class ConsoleApp {
+         expectedSession: this.state.session,
+         text,
+         persona: this.state.status.persona,
++        ...(images.length
++          ? { images: images.map((image) => ({ mimeType: image.mimeType, data: image.base64 })) }
++          : {}),
+       }),
+     );
+     this.updateChatControls();
+     this.renderMessages();
+   }
++  /** 粘贴、拖拽、文件选择都走这里；超出 4 张或格式不对当场说清楚，不悄悄丢。 */
++  async addImages(files, source = "pick") {
++    const room = 4 - this.state.pendingImages.length;
++    if (room <= 0) return this.toast("一次最多发送 4 张图片", true);
++    const usable = [...files].filter(
++      (file) =>
++        ["image/png", "image/jpeg", "image/webp", "image/bmp"].includes(file.type) ||
++        (source === "paste" && !file.type && file.size > 0),
++    );
++    if (!usable.length) return this.toast("只支持 PNG、JPEG、WebP、BMP 图片", true);
++    if (usable.length > room) this.toast(`只收下前 ${room} 张，一次最多 4 张`, true);
++    let failed = null;
++    for (const file of usable.slice(0, room)) {
++      try {
++        this.state.pendingImages.push(await shrinkImage(file));
++      } catch (error) {
++        failed = error;
++      }
++    }
++    if (failed && source === "paste") {
++      try {
++        this.state.pendingImages.push(await clipboardImage());
++        failed = null;
++      } catch (error) {
++        failed = Error(`${failed.message}；系统剪贴板也没取到：${error.message}`);
++      }
++    }
++    if (failed) this.toast(failed.message, true);
++    this.renderPendingImages();
++  }
++  renderPendingImages() {
++    const strip = $("composer-images");
++    if (!strip) return;
++    strip.innerHTML = this.state.pendingImages
++      .map(
++        (image, index) =>
++          `<figure class="pending-image"><img src="${image.dataUrl}" alt="待发送图片"><button type="button" data-drop="${index}" title="移除">×</button></figure>`,
++      )
++      .join("");
++    strip.querySelectorAll("[data-drop]").forEach((button) => {
++      button.onclick = () => {
++        this.state.pendingImages.splice(Number(button.dataset.drop), 1);
++        this.renderPendingImages();
++      };
++    });
++    strip.hidden = !this.state.pendingImages.length;
++  }
++  bindImageComposer() {
++    const form = $("chat-form"), input = $("chat-input"), picker = $("image-input");
++    const box = $("messages");
++    if (box)
++      box.onscroll = () => {
++        if (box.scrollTop < 48 && this.state.msgHasMore && !this.olderLoading) this.loadOlder();
++      };
++    if (!form || !input) return;
++    this.renderPendingImages();
++    if (picker) {
++      picker.onchange = () => {
++        const files = [...picker.files];
++        picker.value = "";
++        this.addImages(files);
++      };
++    }
++    input.onpaste = (event) => {
++      const files = [...(event.clipboardData?.files || [])].filter(
++        (file) => file.type.startsWith("image/") || (!file.type && file.size > 0),
++      );
++      if (!files.length) return;
++      event.preventDefault();
++      this.addImages(files, "paste");
++    };
++    form.ondragover = (event) => {
++      event.preventDefault();
++      form.classList.add("dragging");
++    };
++    form.ondragleave = () => form.classList.remove("dragging");
++    form.ondrop = (event) => {
++      const files = [...(event.dataTransfer?.files || [])].filter((file) => file.type.startsWith("image/"));
++      if (!files.length) return;
++      event.preventDefault();
++      form.classList.remove("dragging");
++      this.addImages(files);
++    };
++  }
+   async newSession() {
+     if (this.state.chatBusy || this.sessionChanging) return;
+     this.sessionChanging = true;
+@@ -504,21 +877,60 @@ class ConsoleApp {
+       this.updateChatControls();
+     }
+   }
++
+   renderMessages() {
++    this.replyEl = null;
+     const personaName = this.state.status.personaName || "助手";
+     const box = $("messages");
+     if (!box) return;
++    this.renderOutline();
+     if (!this.state.messages.length) {
+       box.innerHTML = `<div class="chat-empty"><span class="brand-mark">${whale}</span><h3>今天想和${e(personaName)}聊点什么？</h3><p>从一句问候开始，或试试「记下这个」。</p></div>`;
+       return;
+     }
++    const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80 || !box.childElementCount;
+     box.innerHTML = this.state.messages
+       .map(
+         (m) =>
+-          `<div class="message ${m.role === "user" ? "user" : m.role === "error" ? "error" : ""}"><span class="mini-avatar" title="${e(m.personaName || "助手")}">${m.role === "user" ? "你" : m.role === "error" ? "!" : e((m.personaName || "助手").slice(0, 1))}</span><div class="bubble">${e(m.text)}</div></div>`,
++          `<div class="message ${m.role === "user" ? "user" : m.role === "error" ? "error" : ""}${m.nudge ? " nudge" : ""}"><span class="mini-avatar" title="${e(m.personaName || "助手")}">${m.role === "user" ? "你" : m.role === "error" ? "!" : e((m.personaName || "助手").slice(0, 1))}</span><div class="bubble">${renderRich(m.text)}${(m.images || []).map((url) => `<img class="msg-media" src="${url}" alt="图片">`).join("")}${renderFiles(m.files)}</div></div>`,
+       )
+       .join("");
+-    box.scrollTop = box.scrollHeight;
++    if (this.state.chatBusy && !this.reply) {
++      box.insertAdjacentHTML(
++        "beforeend",
++        `<div class="message"><span class="mini-avatar">…</span><div class="bubble thinking"><i>·</i><i>·</i><i>·</i><span>思考中 <em class="think-face">${pickThinkingFace()}</em></span></div></div>`,
++      );
++    }
++    if (this.state.msgHasMore)
++      box.insertAdjacentHTML(
++        "afterbegin",
++        '<div class="chat-history-more">' +
++          (this.olderLoading ? "加载中…" : "加载更早的 " + PAGE_SIZE + " 条") +
++          "</div>",
++      );
++    const more = box.querySelector(".chat-history-more");
++    if (more) more.onclick = () => this.loadOlder();
++    if (nearBottom) {
++      box.scrollTop = box.scrollHeight;
++      requestAnimationFrame(() => { box.scrollTop = box.scrollHeight; });
++    }
++  }
++  /** 只更新最后一条回复的气泡，避免整段重建把滚动条打回顶部。 */
++  patchReply() {
++    const box = $("messages");
++    if (!box || !this.reply) return;
++    const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
++    const thinking = box.querySelector(".bubble.thinking");
++    if (thinking) thinking.closest(".message")?.remove();
++    if (!this.replyEl || !box.contains(this.replyEl)) {
++      const wrap = document.createElement("div");
++      wrap.className = "message";
++      wrap.innerHTML = `<span class="mini-avatar" title="${e(this.replyPersonaName || "助手")}">${e((this.replyPersonaName || "助手").slice(0, 1))}</span><div class="bubble"></div>`;
++      box.appendChild(wrap);
++      this.replyEl = wrap.querySelector(".bubble");
++    }
++    this.replyEl.innerHTML = renderRich(this.reply.text) + renderFiles(this.reply.files);
++    if (stick) box.scrollTop = box.scrollHeight;
+   }
+   filteredLogs() {
+     return this.state.logs.filter(
+@@ -529,6 +941,17 @@ class ConsoleApp {
+         line.toLowerCase().includes((this.state.logSearch || "").toLowerCase()),
+     );
+   }
++  async loadUsage() {
++    const days = this.state.usageDays || 7;
++    try {
++      this.state.usage = await api("/api/usage?days=" + days);
++      this.state.usageError = "";
++    } catch (error) {
++      this.state.usage = null;
++      this.state.usageError = error.message;
++    }
++    if (this.state.page === "usage") this.render();
++  }
+   renderLogs() {
+     const box = $("log-output");
+     if (!box) return;
+@@ -544,5 +967,343 @@ class ConsoleApp {
+       `显示 ${lines.length} / ${this.state.logs.length} 条 · ${this.logConnected ? "实时推送中" : "正在重新连接"}`;
+   }
+ }
++/** 一页多少条。服务端上限 200，这里改得比它大没用。 */
++const PAGE_SIZE = 40;
++
++/** 压平成一句：去掉图片标记、markdown 符号和换行。 */
++function plainText(text) {
++  return String(text || "")
++    .replace(/\[\[img:[^\]]+\]\]/g, "［图］")
++    .replace(/[#*`>]+/g, " ")
++    .replace(/\s+/g, " ")
++    .trim();
++}
++
++/** 截短，超了就加省略号。 */
++function clip(text, max) {
++  const flat = String(text || "").trim();
++  return flat.length > max ? flat.slice(0, max) + "…" : flat;
++}
++
++/** 点图片开遮罩看原图，再点一下或按 Esc 关掉。 */
++function installImageZoom() {
++  const box = document.createElement("div");
++  box.className = "image-zoom";
++  box.hidden = true;
++  box.innerHTML = '<img alt="放大查看">';
++  document.body.appendChild(box);
++  const close = () => { box.hidden = true; box.querySelector("img").src = ""; };
++  box.onclick = close;
++  document.addEventListener("keydown", (evt) => { if (evt.key === "Escape") close(); });
++  document.addEventListener("click", (evt) => {
++    const img = evt.target.closest && evt.target.closest(".bubble img, .messages img");
++    if (!img || !img.src) return;
++    evt.preventDefault();
++    box.querySelector("img").src = img.src;
++    box.hidden = false;
++  });
++}
++
+ const app = new ConsoleApp();
++installImageZoom();
+ app.start();
++
++/** 浏览器解不开时，回头问系统剪贴板要图：服务端用 GDI+ 存成 PNG 再送回来。 */
++async function clipboardImage() {
++  const value = await api("/api/clipboard-image", {});
++  const blob = await (await fetch(value.dataUrl)).blob();
++  return await shrinkImage(new File([blob], "clipboard.png", { type: "image/png" }));
++}
++
++/** 读成 data URL。 */
++function readDataUrl(file) {
++  return new Promise((resolve, reject) => {
++    const reader = new FileReader();
++    reader.onload = () => resolve(String(reader.result));
++    reader.onerror = () => reject(Error("图片读取失败"));
++    reader.readAsDataURL(file);
++  });
++}
++
++/** 裸 DIB（缺 "BM" 文件头的位图）补一个文件头，浏览器才认得。微信截图走剪贴板常常给的是这个。 */
++async function dibToBmp(file) {
++  if (file.size < 64) return null;
++  const head = new Uint8Array(await file.slice(0, 64).arrayBuffer());
++  if (head[0] === 0x42 && head[1] === 0x4d) return null;
++  const view = new DataView(head.buffer);
++  const headerSize = view.getUint32(0, true);
++  const bits = view.getUint16(14, true);
++  const compression = view.getUint32(16, true);
++  if (![40, 108, 124].includes(headerSize) || ![24, 32].includes(bits) || compression !== 0) return null;
++  const dib = new Uint8Array(await file.arrayBuffer());
++  const bmp = new Uint8Array(14 + dib.length);
++  const out = new DataView(bmp.buffer);
++  bmp[0] = 0x42;
++  bmp[1] = 0x4d;
++  out.setUint32(2, bmp.length, true);
++  out.setUint32(10, 14 + headerSize, true);
++  bmp.set(dib, 14);
++  return new Blob([bmp], { type: "image/bmp" });
++}
++
++/** 解一张图：先 createImageBitmap，再 <img>，最后试修补裸 DIB。三条都挂才报错。 */
++async function decodeImage(file, dataUrl) {
++  const viaBitmap = async (source) => {
++    if (typeof createImageBitmap !== "function") throw Error("no createImageBitmap");
++    const bitmap = await createImageBitmap(source);
++    return {
++      width: bitmap.width,
++      height: bitmap.height,
++      trust: source === file,
++      draw: (context, w, h) => context.drawImage(bitmap, 0, 0, w, h),
++    };
++  };
++  const viaImage = async (url) => {
++    const element = await new Promise((resolve, reject) => {
++      const probe = new Image();
++      probe.onload = () => resolve(probe);
++      probe.onerror = () => reject(Error("decode"));
++      probe.src = url;
++    });
++    return {
++      width: element.naturalWidth,
++      height: element.naturalHeight,
++      trust: url === dataUrl,
++      draw: (context, w, h) => context.drawImage(element, 0, 0, w, h),
++    };
++  };
++  try {
++    return await viaBitmap(file);
++  } catch {}
++  try {
++    return await viaImage(dataUrl);
++  } catch {}
++  const repaired = await dibToBmp(file);
++  if (repaired) {
++    try {
++      return await viaBitmap(repaired);
++    } catch {}
++    try {
++      return await viaImage(await readDataUrl(repaired));
++    } catch {}
++  }
++  const hint = repaired ? "已试过补文件头修裸位图" : "剪贴板给的图数据常是残缺的";
++  throw Error(
++    `图片无法解码（${file.type || "类型未知"}，${Math.max(1, Math.round(file.size / 1024))} KB）——${hint}，改用「图片」按钮直接选文件试试`,
++  );
++}
++
++/** 超过 1600px 或 2MiB 才重编码；小图原样送，截图里的字不会被压糊。 */
++async function shrinkImage(file) {
++  if (file.size > 6 * 1024 * 1024) throw Error("单张图片需在 6MiB 以内");
++  const dataUrl = await readDataUrl(file);
++  const image = await decodeImage(file, dataUrl);
++  const scale = Math.min(1, 1600 / Math.max(image.width, image.height));
++  const passThrough = ["image/png", "image/jpeg", "image/webp"].includes(file.type);
++  if (image.trust && passThrough && scale === 1 && file.size <= 2 * 1024 * 1024)
++    return { mimeType: file.type, dataUrl, base64: dataUrl.slice(dataUrl.indexOf(",") + 1) };
++  const canvas = document.createElement("canvas");
++  canvas.width = Math.max(1, Math.round(image.width * scale));
++  canvas.height = Math.max(1, Math.round(image.height * scale));
++  const context = canvas.getContext("2d");
++  if (!image.trust) {
++    context.fillStyle = "#fff";
++    context.fillRect(0, 0, canvas.width, canvas.height);
++  }
++  image.draw(context, canvas.width, canvas.height);
++  const type = file.type === "image/png" || !image.trust ? "image/png" : "image/jpeg";
++  const shrunk = canvas.toDataURL(type, 0.9);
++  if (shrunk.length * 0.75 > 4 * 1024 * 1024) throw Error("图片压缩后仍超过 4MiB");
++  return { mimeType: type, dataUrl: shrunk, base64: shrunk.slice(shrunk.indexOf(",") + 1) };
++}
++
++const TABLE_SEPARATOR = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/;
++const CODE_FENCE = /^\s*```/;
++const HEADING = /^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/;
++const HR = /^\s{0,3}([-*_])(\s*\1){2,}\s*$/;
++const QUOTE = /^\s{0,3}>\s?(.*)$/;
++const UL_ITEM = /^(\s*)[-*+]\s+(.*)$/;
++const OL_ITEM = /^(\s*)(\d{1,9})[.)]\s+(.*)$/;
++const LINK = /\[([^\]\n]*)\]\(([^()\s]*)\)/g;
++const SAFE_URL = /^(https?:\/\/|mailto:|\/|#|\.{1,2}\/)/i;
++
++/** [[img:路径]] / [[voice:路径]] 标记换成媒体元素；入参必须已经过转义。 */
++function inlineRich(escaped) {
++  const media = (path) => `/api/media?path=${encodeURIComponent(path)}`;
++  return escaped
++    .replace(/\[\[img:([^\]]+)\]\]/g, (_, path) =>
++      `<img class="msg-media" src="${media(path.replace(/&amp;/g, "&"))}" alt="图片" loading="lazy">`)
++    .replace(/\[\[voice:([^\]]+)\]\]/g, (_, path) =>
++      `<audio class="msg-audio" controls preload="none" src="${media(path.replace(/&amp;/g, "&"))}"></audio>`)
++    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
++    .replace(LINK, (whole, label, url) => {
++      const target = url.replace(/&amp;/g, "&").trim();
++      if (!SAFE_URL.test(target)) return whole;
++      return `<a href="${target}" target="_blank" rel="noopener noreferrer">${label}</a>`;
++    })
++    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
++    .replace(/~~([^~\n]+)~~/g, "<del>$1</del>")
++    .replace(/\*([^*\n]+)\*/g, "<em>$1</em>")
++    .replace(/(^|[\s(（])_([^_\n]+)_(?=[\s)）.。，,！!？?]|$)/g, "$1<em>$2</em>");
++}
++
++function splitTableRow(line) {
++  let body = line.trim();
++  if (body.startsWith("|")) body = body.slice(1);
++  if (body.endsWith("|")) body = body.slice(0, -1);
++  return body.split("|").map((cell) => cell.trim());
++}
++
++function renderTable(header, aligns, rows) {
++  const cell = (tag, text, index) => {
++    const align = aligns[index];
++    return `<${tag}${align ? ` style="text-align:${align}"` : ""}>${inlineRich(e(text))}</${tag}>`;
++  };
++  const head = `<thead><tr>${header.map((text, index) => cell("th", text, index)).join("")}</tr></thead>`;
++  const body = rows
++    .map((row) => `<tr>${header.map((_, index) => cell("td", row[index] ?? "", index)).join("")}</tr>`)
++    .join("");
++  return `<div class="md-table"><table>${head}<tbody>${body}</tbody></table></div>`;
++}
++
++/** 列表：按缩进决定嵌套层级，<ul>/<ol> 由相邻项的有序性切换。 */
++function renderListBlock(items) {
++  let html = "";
++  const stack = [];
++  for (const item of items) {
++    const tag = item.ordered ? "ol" : "ul";
++    while (stack.length && item.indent < stack[stack.length - 1].indent) {
++      html += `</li></${stack.pop().tag}>`;
++    }
++    const top = stack[stack.length - 1];
++    if (!top || item.indent > top.indent) {
++      const start = item.ordered && item.start !== 1 ? ` start="${item.start}"` : "";
++      html += `<${tag}${start}>`;
++      stack.push({ tag, indent: item.indent });
++    } else if (top.tag !== tag) {
++      html += `</li></${stack.pop().tag}><${tag}>`;
++      stack.push({ tag, indent: item.indent });
++    } else {
++      html += "</li>";
++    }
++    html += `<li>${inlineRich(e(item.text))}`;
++  }
++  while (stack.length) html += `</li></${stack.pop().tag}>`;
++  return html;
++}
++
++/** 块级：代码围栏、GFM 表格、标题、分割线、引用、列表；其余文字按整段转义。 */
++/** 回复末尾「本轮文件」：只列文件名和打开入口；核验没过就写原因，不给链接。 */
++function renderFiles(files) {
++  if (!files || !files.length) return "";
++  const rows = files.map((file) =>
++    file.ok
++      ? `<a class="msg-file" href="/api/file?path=${encodeURIComponent(file.path)}" target="_blank" rel="noopener">${e(file.name)} · 打开</a>`
++      : `<span class="msg-file failed">${e(file.name)} · ${e(file.error || "未通过核验")}</span>`,
++  );
++  return `<div class="msg-files">${rows.join("")}</div>`;
++}
++
++function renderRich(text) {
++  const lines = String(text).split("\n");
++  const out = [];
++  let buffer = [];
++  const flush = () => {
++    if (!buffer.length) return;
++    out.push(inlineRich(e(buffer.join("\n"))));
++    buffer = [];
++  };
++  for (let i = 0; i < lines.length; i += 1) {
++    const line = lines[i];
++    const next = lines[i + 1];
++
++    if (CODE_FENCE.test(line)) {
++      flush();
++      const lang = line.trim().slice(3).trim();
++      const code = [];
++      i += 1;
++      while (i < lines.length && !CODE_FENCE.test(lines[i])) {
++        code.push(lines[i]);
++        i += 1;
++      }
++      const cls = lang ? ` class="lang-${e(lang)}"` : "";
++      out.push(`<pre class="md-pre"><code${cls}>${e(code.join("\n"))}</code></pre>`);
++      continue;
++    }
++
++    if (line.includes("|") && next !== undefined && next.includes("-") && TABLE_SEPARATOR.test(next)) {
++      flush();
++      const header = splitTableRow(line);
++      const aligns = splitTableRow(next).map((mark) => {
++        const left = mark.startsWith(":");
++        const right = mark.endsWith(":");
++        if (left && right) return "center";
++        if (right) return "right";
++        if (left) return "left";
++        return "";
++      });
++      const rows = [];
++      i += 2;
++      while (i < lines.length && lines[i].includes("|") && lines[i].trim() !== "") {
++        rows.push(splitTableRow(lines[i]));
++        i += 1;
++      }
++      i -= 1;
++      out.push(renderTable(header, aligns, rows));
++      continue;
++    }
++
++    const heading = HEADING.exec(line);
++    if (heading) {
++      flush();
++      const level = Math.min(6, Math.max(3, heading[1].length + 1));
++      out.push(`<h${level}>${inlineRich(e(heading[2]))}</h${level}>`);
++      continue;
++    }
++
++    if (HR.test(line)) {
++      flush();
++      out.push("<hr>");
++      continue;
++    }
++
++    if (QUOTE.test(line)) {
++      flush();
++      const parts = [];
++      while (i < lines.length && QUOTE.test(lines[i])) {
++        parts.push(QUOTE.exec(lines[i])[1]);
++        i += 1;
++      }
++      i -= 1;
++      out.push(`<blockquote>${inlineRich(e(parts.join("\n")))}</blockquote>`);
++      continue;
++    }
++
++    const ulItem = UL_ITEM.exec(line);
++    const olItem = OL_ITEM.exec(line);
++    if (ulItem || olItem) {
++      flush();
++      const items = [];
++      while (i < lines.length) {
++        const ul = UL_ITEM.exec(lines[i]);
++        const ol = OL_ITEM.exec(lines[i]);
++        const m = ul || ol;
++        if (!m) break;
++        items.push({
++          indent: (ul ? m[1] : m[1]).replace(/\t/g, "  ").length,
++          ordered: Boolean(ol),
++          start: ol ? Number(ol[2]) : 1,
++          text: ul ? ul[2] : ol[3],
++        });
++        i += 1;
++      }
++      i -= 1;
++      out.push(renderListBlock(items));
++      continue;
++    }
++
++    buffer.push(line);
++  }
++  flush();
++  return out.join("\n");
++}
+diff --git a/core/ui/context.js b/core/ui/context.js
+index ea8ec82..94628f1 100644
+--- a/core/ui/context.js
++++ b/core/ui/context.js
+@@ -13,9 +13,12 @@ function requestMetrics(usage) {
+   const tokens = value => Number.isSafeInteger(value) && value >= 0 ? number(value) + " tokens" : "未报告";
+   const cacheDetail = `最近一次请求缓存：命中 ${tokens(cache?.hit_tokens)}；未命中 ${tokens(cache?.miss_tokens)}；命中率 ${cachePercent || "未报告"}。`;
+   const validMoney = value => Number.isFinite(value) && value >= 0;
+-  const money = value => value > 0 && value < 0.000001 ? "<¥0.000001" :
+-    "¥" + value.toLocaleString("zh-CN", { maximumFractionDigits: 6 });
+-  const amount = cost?.currency === "CNY" && cost.basis === "reference" ?
++  // 价目表按供应商本币记账：DeepSeek 官方是 CNY，MiraRouter 与 Gemini 是 USD。
++  const symbol = cost?.currency === "USD" ? "$" : "¥";
++  const money = value => value > 0 && value < 0.000001 ? `<${symbol}0.000001` :
++    symbol + value.toLocaleString("zh-CN", { maximumFractionDigits: 6 });
++  const priced = cost?.basis === "reference" && (cost?.currency === "CNY" || cost?.currency === "USD");
++  const amount = priced ?
+     validMoney(cost.amount) ? money(cost.amount) : validMoney(cost.min) && validMoney(cost.max) && cost.max >= cost.min ?
+       `${money(cost.min)}–${money(cost.max)}` : null : null;
+   const costDetail = amount
+@@ -55,7 +58,7 @@ function renderDiarySettings(p) {
+ function renderDiaryState(current) {
+   const diary = current?.diary;
+   if (!diary) return "";
+-  return `<div class="context-diary-state"><p class="muted">日记 ${number(diary.count ?? diary.entries?.length ?? 0)} 篇 · 覆盖 ${number(diary.covered_messages ?? 0)} 条原文 · 剩余 ${number(diary.remaining_messages ?? current.available_messages ?? 0)} 条原文 · ${number(diary.chars ?? 0)} 字符${diary.enabled === false ? "；自动整理已关闭，已有有效日记仍按历史设置使用" : ""}${Number.isFinite(diary.budget_remaining) ? `。今日整理剩余额度 ${number(diary.budget_remaining)} tokens` : ""}。</p>${diary.invalid ? '<p class="muted">部分日记的来源已变化，暂不带入上下文，需根据有效原文重建。</p>' : ""}${diary.notice ? `<p class="muted">${e(diary.notice)}</p>` : ""}${diary.paused ? `<p class="form-error">日记整理已暂停；保留原文与已保存日记。${diary.paused.reason ? e(diary.paused.reason) : ""}</p><button class="btn small" type="button" data-diary-retry>恢复日记整理</button>` : ""}</div>`;
++  return `<div class="context-diary-state"><p class="muted">日记 ${number(diary.count ?? diary.entries?.length ?? 0)} 篇 · 覆盖 ${number(diary.covered_messages ?? 0)} 条原文 · 剩余 ${number(diary.remaining_messages ?? current.available_messages ?? 0)} 条原文 · 日记正文 ${number(diary.chars ?? 0)} 字符${diary.enabled === false ? "；自动整理已关闭，已有有效日记仍按历史设置使用" : ""}${Number.isFinite(diary.budget_remaining) ? `。今日整理剩余额度 ${number(diary.budget_remaining)} tokens` : ""}。</p>${diary.invalid ? '<p class="muted">部分日记的来源已变化，暂不带入上下文，需根据有效原文重建。</p>' : ""}${diary.notice ? `<p class="muted">${e(diary.notice)}</p>` : ""}${diary.paused ? `<p class="form-error">日记整理已暂停；保留原文与已保存日记。${diary.paused.reason ? e(diary.paused.reason) : ""}</p><button class="btn small" type="button" data-diary-retry>恢复日记整理</button>` : ""}</div>`;
+ }
+ export function renderContextPanel(app) {
+   const s = app.state, current = s.memoryContext, selected = viewedSession(s);
+diff --git a/core/ui/index.html b/core/ui/index.html
+index e479d43..52a1868 100644
+--- a/core/ui/index.html
++++ b/core/ui/index.html
+@@ -67,6 +67,9 @@ Copyright (c) 2026 iinukami and contributors.
+           <a href="#plugins" data-page="plugins"
+             ><span data-icon="puzzle"></span>插件管理</a
+           >
++          <a href="#usage" data-page="usage"
++            ><span data-icon="bolt"></span>账本</a
++          >
+           <a href="#logs" data-page="logs"
+             ><span data-icon="terminal"></span>运行日志</a
+           >
+diff --git a/core/ui/styles.css b/core/ui/styles.css
+index 5251c75..ab865de 100644
+--- a/core/ui/styles.css
++++ b/core/ui/styles.css
+@@ -812,7 +812,7 @@ main {
+   min-height: 0;
+   overflow: auto;
+   padding: 22px 28px;
+-  scroll-behavior: smooth;
++  scroll-behavior: auto;
+ }
+ .chat-empty {
+   height: 100%;
+@@ -1393,3 +1393,318 @@ dialog::backdrop {
+ }
+ .extension-panel { overflow: hidden; min-height: 480px; }
+ .extension-frame { display: block; width: 100%; height: max(480px, calc(100dvh - 230px)); border: 0; background: white; }
++
++
++/* 消息内的图片与语音 */
++.msg-media { display: block; max-width: min(360px, 100%); margin-top: 8px; border-radius: 10px; }
++.bubble img {
++  display: block;
++  width: auto;
++  height: auto;
++  max-width: min(320px, 100%);
++  max-height: 220px;
++  margin-top: 8px;
++  border-radius: 10px;
++  border: 1px solid rgba(0, 0, 0, 0.08);
++  object-fit: cover;
++  cursor: zoom-in;
++  background: #f2f3f7;
++}
++.image-zoom {
++  position: fixed;
++  inset: 0;
++  z-index: 999;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  padding: 24px;
++  background: rgba(12, 14, 18, 0.82);
++  cursor: zoom-out;
++}
++.image-zoom[hidden] { display: none; }
++.image-zoom img { max-width: 96vw; max-height: 92vh; border-radius: 8px; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45); }
++.composer.dragging { outline: 2px dashed var(--accent, #c5ac72); outline-offset: -4px; }
++.composer-images { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 12px 0; }
++.composer-images[hidden] { display: none; }
++.pending-image { position: relative; margin: 0; }
++.pending-image img { display: block; width: 72px; height: 72px; object-fit: cover; border-radius: 8px; border: 1px solid rgba(0, 0, 0, 0.12); }
++.pending-image button { position: absolute; top: -6px; right: -6px; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 50%; background: rgba(0, 0, 0, 0.65); color: #fff; font-size: 13px; line-height: 20px; cursor: pointer; }
++.composer .attach { cursor: pointer; margin-right: 8px; }
++.composer .attach input { display: none; }
++.msg-audio { display: block; width: min(320px, 100%); margin-top: 8px; }
++
++/* 思考中提示 */
++.bubble.thinking { display: inline-flex; align-items: center; gap: 5px; color: #8a8f98; letter-spacing: 0.02em; }
++.bubble.thinking i { font-style: normal; animation: think-dot 1.2s infinite ease-in-out; }
++.bubble.thinking i:nth-child(2) { animation-delay: 0.15s; }
++.bubble.thinking i:nth-child(3) { animation-delay: 0.3s; }
++.bubble.thinking span { margin-left: 4px; animation: think-fade 1.8s infinite ease-in-out; }
++.bubble.thinking em.think-face { font-style: normal; letter-spacing: 0; margin-left: 2px; }
++@keyframes think-dot { 0%, 60%, 100% { opacity: 0.25; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-2px); } }
++@keyframes think-fade { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
++/* 对话区：左边导航轨，右边消息流 */
++.chat-body { flex: 1; min-height: 0; display: flex; align-items: stretch; gap: 10px; padding-left: 12px; }
++.chat-body > .messages { flex: 1; min-width: 0; }
++.chat-history-more { text-align: center; font-size: 12px; color: #8a8f98; padding: 6px 0 14px; cursor: pointer; user-select: none; }
++.chat-history-more:hover { color: #2c2f33; }
++@media (max-width: 900px) { .chat-rail { display: none; } }
++
++/* ── 左侧导航轨：一条用户请求一节，摘要放悬浮卡里（勘 2026-11-16） ── */
++.chat-rail {
++  flex: 0 0 18px;
++  width: 18px;
++  position: relative;
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++  padding: 12px 0;
++  overflow: hidden;
++}
++.chat-rail[hidden] { display: none; }
++.chat-rail-tick {
++  position: absolute;
++  left: 0;
++  transform: translateY(-50%);
++  display: flex;
++  align-items: center;
++  width: 100%;
++  min-height: 5px;
++  max-height: 14px;
++  padding: 0;
++  border: 0;
++  background: transparent;
++  cursor: pointer;
++}
++.chat-rail-tick i {
++  display: block;
++  width: 9px;
++  height: 2px;
++  border-radius: 1px;
++  background: #d2d6dd;
++  transition: width 0.12s ease, background 0.12s ease;
++}
++.chat-rail-tick i { pointer-events: none; }
++.chat-rail-tick:hover i { width: 12px; background: #9aa0ab; }
++.chat-rail-tick.active i,
++.chat-rail-tick.active:hover i { width: 14px; background: #6158d9; }
++.chat-rail-card {
++  position: fixed;
++  z-index: 80;
++  width: 300px;
++  padding: 12px 14px;
++  border: 1px solid rgba(20, 24, 40, 0.1);
++  border-radius: 12px;
++  background: var(--surface, #fff);
++  box-shadow: 0 12px 34px rgba(20, 24, 40, 0.16);
++  pointer-events: none;
++  font-size: 12.5px;
++  line-height: 1.55;
++}
++.chat-rail-card[hidden] { display: none; }
++.chat-rail-card b { display: block; margin-bottom: 6px; color: #16181c; font-weight: 600; }
++.chat-rail-card span { display: block; color: #828793; }
++.chat-rail-card .chat-rail-card-meta { margin-top: 8px; font-size: 11px; color: #a3a8b3; }
++
++/* 本轮中途补的那句话：小一号、斜体，跟正常一轮区分开（勘 2026-11-16） */
++.message.nudge .bubble {
++  font-style: italic;
++  font-size: 12px;
++  opacity: 0.78;
++  border-style: dashed;
++}
++
++/* 账本：只有这个页用，权重不高，放在最后避免影响别处 */
++.ledger-table { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
++.ledger-row { display: grid; grid-template-columns: 96px minmax(160px, 1.6fr) 56px 84px 84px 132px; gap: 10px; align-items: center; padding: 9px 12px; border-radius: 10px; font-size: 13px; }
++.ledger-row:nth-child(odd) { background: rgba(120, 130, 155, 0.06); }
++.ledger-head { font-size: 12px; color: var(--muted, #7c8291); background: none !important; }
++.ledger-model { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.ledger-row > span:nth-child(n + 3) { text-align: right; font-variant-numeric: tabular-nums; }
++.ledger-money { color: var(--accent); font-weight: 600; }
++@media (max-width: 860px) {
++  .ledger-row { grid-template-columns: 84px minmax(110px, 1.4fr) 44px 70px 70px 108px; font-size: 12px; gap: 6px; }
++}
++
++/* 账本图表：只用现有数据画，不引入任何依赖 */
++.usage-bars { display: flex; align-items: flex-end; gap: 10px; height: 160px; padding: 8px 2px 0; }
++.usage-bar { flex: 1; min-width: 26px; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; gap: 6px; }
++.usage-bar-fill { width: 100%; max-width: 46px; border-radius: 6px 6px 2px 2px; background: linear-gradient(180deg, var(--accent) 0%, #8f88e8 100%); transition: height .25s ease; }
++.usage-bar:hover .usage-bar-fill { background: var(--accent-hover); }
++.usage-bar > span { font-size: 11px; color: var(--muted, #7c8291); white-space: nowrap; }
++.usage-bar.zero .usage-bar-fill { background: transparent; border-top: 1px dashed rgba(124, 130, 145, .35); border-radius: 0; max-width: none; }
++.usage-bar.zero:hover .usage-bar-fill { background: transparent; }
++.usage-bar.zero > span { opacity: .45; }
++.usage-bars.dense { gap: 3px; }
++.usage-bars.dense .usage-bar { min-width: 6px; }
++.usage-bars.dense .usage-bar-fill { border-radius: 3px 3px 1px 1px; }
++.usage-bars.dense .usage-bar > span { font-size: 9px; writing-mode: vertical-rl; letter-spacing: .5px; }
++.usage-ranking { display: flex; flex-direction: column; gap: 10px; }
++.usage-rank { display: grid; grid-template-columns: minmax(120px, 1.1fr) minmax(120px, 2fr) 132px; gap: 12px; align-items: center; font-size: 13px; }
++.usage-rank-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.usage-rank-track { height: 8px; border-radius: 999px; background: rgba(120, 130, 155, 0.12); overflow: hidden; }
++.usage-rank-fill { height: 100%; border-radius: 999px; background: var(--accent); }
++.usage-rank-value { text-align: right; color: var(--muted, #7c8291); font-variant-numeric: tabular-nums; }
++@media (max-width: 720px) {
++  .usage-rank { grid-template-columns: 1fr; gap: 4px; }
++  .usage-rank-value { text-align: left; }
++  .usage-bars { gap: 4px; }
++}
++
++/* 24 小时按模型堆叠：柱高按总额归一，段色对应图例 */
++.usage-legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--muted); margin-bottom: 14px; }
++.usage-legend .legend-item { display: inline-flex; align-items: center; gap: 6px; }
++.usage-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
++.hour-chart { display: flex; gap: 10px; padding-bottom: 18px; }
++.hour-yaxis { display: flex; flex-direction: column; justify-content: space-between; height: 180px; min-width: 48px; text-align: right; font-size: 10px; color: var(--muted); font-variant-numeric: tabular-nums; }
++.hour-plot { position: relative; flex: 1; min-width: 0; height: 180px; }
++.hour-grid { position: absolute; inset: 0; pointer-events: none; }
++.hour-grid i { position: absolute; left: 0; right: 0; border-top: 1px dashed rgba(124, 130, 145, .22); }
++.hour-bars { position: relative; display: flex; align-items: stretch; gap: 3px; height: 100%; border-bottom: 1px solid var(--line); }
++.hour-bar { position: relative; flex: 1; min-width: 0; }
++.hour-bar:hover { background: rgba(97, 88, 217, .06); border-radius: 3px 3px 0 0; }
++.hour-stack { position: absolute; inset: 0; display: flex; flex-direction: column-reverse; }
++.hour-seg { display: block; width: 100%; min-height: 1px; transition: opacity .15s ease; }
++.hour-seg:first-child { border-radius: 0 0 2px 2px; }
++.hour-seg:last-child { border-radius: 2px 2px 0 0; }
++.hour-bar:hover .hour-seg { opacity: .82; }
++.hour-mark { position: absolute; bottom: -16px; left: 50%; transform: translateX(-50%); font-size: 10px; font-style: normal; color: var(--muted); white-space: nowrap; }
++.hour-tip { position: absolute; z-index: 6; top: 4px; left: calc(100% + 8px); min-width: 168px; padding: 9px 11px; border-radius: 9px; background: var(--surface, #fff); color: var(--text, #272b39); border: 1px solid var(--line, #e9ebf1); box-shadow: 0 8px 22px rgba(39, 43, 57, .13); font-size: 11px; line-height: 1.7; opacity: 0; visibility: hidden; transform: translateY(2px); transition: opacity .12s ease, transform .12s ease; pointer-events: none; }
++.hour-tip.flip { left: auto; right: calc(100% + 8px); }
++.day-zero .hour-mark { opacity: .4; }
++.hour-bar.day-zero .hour-stack { border-bottom: 1px dashed rgba(124, 130, 145, .35); }
++.hour-bar:hover .hour-tip { opacity: 1; visibility: visible; transform: none; }
++.hour-tip strong { display: block; font-size: 12px; margin-bottom: 4px; font-weight: 600; }
++.hour-tip-row { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
++.hour-tip-row i { width: 8px; height: 8px; border-radius: 2px; flex: none; }
++.hour-tip-row b { margin-left: auto; font-weight: 500; font-variant-numeric: tabular-nums; }
++.hour-tip-row.empty { color: var(--muted, #818696); }
++@media (max-width: 720px) {
++  .hour-plot, .hour-yaxis { height: 130px; }
++  .hour-tip { min-width: 140px; font-size: 10px; }
++  .usage-legend { font-size: 11px; gap: 10px; }
++}
++.heading-actions .icon-only{padding:9px 10px;gap:0}
++
++/* 对话里的表格：无外框，只有横线；表头浅灰，数字列用等宽数字方便对齐 */
++.message .bubble .md-table {
++  white-space: normal;
++  margin: 8px 0;
++  max-width: 100%;
++  overflow-x: auto;
++}
++.message .bubble .md-table table {
++  border-collapse: collapse;
++  font-size: 12.5px;
++  line-height: 1.55;
++}
++.message .bubble .md-table th,
++.message .bubble .md-table td {
++  border: 0;
++  border-bottom: 1px solid var(--line);
++  padding: 7px 14px 7px 0;
++  vertical-align: top;
++  text-align: left;
++}
++.message .bubble .md-table th:last-child,
++.message .bubble .md-table td:last-child { padding-right: 0; }
++.message .bubble .md-table th {
++  color: var(--muted);
++  font-weight: 500;
++  font-size: 11.5px;
++  white-space: nowrap;
++  border-bottom-color: #dfe2ea;
++}
++.message .bubble .md-table tbody tr:last-child td { border-bottom: 0; }
++.message .bubble .md-table th[style*="right"],
++.message .bubble .md-table td[style*="right"] { font-variant-numeric: tabular-nums; }
++.message .bubble .md-table td:first-child { white-space: normal; }
++@media (max-width: 720px) {
++  .message .bubble .md-table table { font-size: 12px; }
++  .message .bubble .md-table th,
++  .message .bubble .md-table td { padding: 6px 9px 6px 0; }
++}
++
++/* 行内语法：粗体 / 行内代码 / 删除线 —— 勘 20261116 */
++.message .bubble strong {
++  font-weight: 650;
++  color: var(--ink);
++}
++.message .bubble code {
++  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
++  font-size: 0.92em;
++  padding: 1px 5px;
++  border-radius: 4px;
++  background: rgba(0, 0, 0, 0.055);
++  border: 1px solid rgba(0, 0, 0, 0.04);
++}
++.message .bubble del {
++  color: var(--muted);
++  text-decoration-thickness: 1px;
++}
++
++/* 块级排版：标题 / 列表 / 引用 / 分割线 / 代码围栏 / 链接 / 斜体 */
++.message .bubble h3,
++.message .bubble h4,
++.message .bubble h5,
++.message .bubble h6 {
++  margin: 12px 0 6px;
++  line-height: 1.35;
++  color: var(--ink);
++  font-weight: 650;
++}
++.message .bubble h3 { font-size: 1.08em; }
++.message .bubble h4 { font-size: 1.02em; }
++.message .bubble h5,
++.message .bubble h6 { font-size: 0.98em; color: var(--muted); }
++.message .bubble > :first-child,
++.message .bubble .md-table + p { margin-top: 0; }
++.message .bubble ul,
++.message .bubble ol {
++  margin: 6px 0;
++  padding-left: 20px;
++}
++.message .bubble ul { list-style: disc; }
++.message .bubble ol { list-style: decimal; }
++.message .bubble ul ul { list-style: circle; margin: 3px 0; }
++.message .bubble li { margin: 2px 0; }
++.message .bubble li > ul,
++.message .bubble li > ol { margin: 3px 0 0; }
++.message .bubble blockquote {
++  margin: 8px 0;
++  padding: 2px 0 2px 11px;
++  border-left: 2px solid var(--line, rgba(0, 0, 0, 0.14));
++  color: var(--muted);
++}
++.message .bubble hr {
++  margin: 12px 0;
++  border: 0;
++  border-top: 1px solid var(--line, rgba(0, 0, 0, 0.12));
++}
++.message .bubble a {
++  color: var(--accent, #2563eb);
++  text-decoration: underline;
++  text-underline-offset: 2px;
++}
++.message .bubble em { font-style: italic; }
++.message .bubble .md-pre {
++  margin: 8px 0;
++  padding: 9px 11px;
++  border-radius: 6px;
++  background: rgba(0, 0, 0, 0.045);
++  border: 1px solid rgba(0, 0, 0, 0.05);
++  overflow-x: auto;
++}
++.message .bubble .md-pre code {
++  padding: 0;
++  border: 0;
++  background: none;
++  font-size: 0.9em;
++  line-height: 1.5;
++  white-space: pre;
++}
++
++/* 回复末尾「本轮文件」：程序核验过的写入才出现在这里（勘 2026-11-17）。 */
++.msg-files { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
++.msg-file { font-size: 12px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 999px; color: var(--accent); text-decoration: none; }
++.msg-file:hover { border-color: var(--accent); }
++.msg-file.failed { color: var(--muted); }
+diff --git a/core/ui/views.js b/core/ui/views.js
+index 7884c7e..fb5e162 100644
+--- a/core/ui/views.js
++++ b/core/ui/views.js
+@@ -120,13 +120,15 @@ export function renderBindings(app) {
+   const sessionSettings = `<section class="panel panel-body" style="margin-bottom:22px"><h2>当前会话</h2><p>正在使用：<strong>${e(sessionName(app.state))}</strong> <small>${e(app.state.session)}</small></p><div class="row context-session-select"><label for="active-session">切换到</label><select id="active-session" ${app.state.chatBusy ? "disabled" : ""}>${sessions.map(item => `<option value="${e(item.id)}" ${item.id === app.state.session ? "selected" : ""}>${e(item.name || item.id)}${item.id === app.state.session ? "（正在使用）" : ""}</option>`).join("")}</select><button id="apply-session" class="btn primary small" type="button" disabled>切换会话</button><button id="new-session" class="btn small" type="button" ${app.state.chatBusy ? "disabled" : ""}>${icon("plus")}新建并使用</button></div><p class="hint">选好后点击“切换会话”才生效。网页和跟随当前会话的插件共用此选择，正在处理的请求仍留在原会话。浏览记忆档案不会切换这里。</p><p id="session-switch-error" class="form-error" role="alert"></p></section>`;
+   const activePersona = c.activePersona || app.state.status?.persona || "";
+   const personaSettings = `<label class="form-field"><span>当前聊天人格</span><select id="active-persona" name="activePersona" required ${app.state.chatBusy || !c.personas.length ? "disabled" : ""}>${!activePersona ? '<option value="">请选择人格</option>' : ""}${c.personas.map((p) => `<option value="${e(p.id)}" ${p.id === activePersona ? "selected" : ""}>${e(p.name)}</option>`).join("")}</select></label><p id="active-persona-routing" class="hint" style="margin-top:16px">${e(personaRoutingText(c, activePersona))}</p><p class="hint" style="margin-top:12px">与模型选择一起保存后生效。切换人格保持当前会话和聊天记录；请等待当前回复结束后切换。</p><a href="#personas" class="btn tonal" style="margin-top:18px">编辑人格 ${icon("arrow")}</a>`;
+-  const options = (type, selected, inherit = false) =>
+-    `<option value="">${inherit ? "使用工作空间的对话模型" : "未配置"}</option>` +
++  const options = (type, selected, inherit = false) => {
++    // 日记整理借用对话模型那一类；模型本身没有 type=diary。
++    const kind = type === "diary" ? "chat" : type;
++    return `<option value="">${inherit ? "使用工作空间的对话模型" : "未配置"}</option>` +
+     c.models
+       .filter(
+         (m) =>
+-          m.type === type &&
+-          (type !== "chat" || coreChatModel(c, m)) &&
++          m.type === kind &&
++          (kind !== "chat" || coreChatModel(c, m)) &&
+           m.enabled &&
+           !m.configuration_error &&
+           c.providers.find((p) => p.id === m.provider)?.enabled,
+@@ -136,9 +138,10 @@ export function renderBindings(app) {
+           `<option value="${e(m.id)}" ${m.id === selected ? "selected" : ""}>${e(m.name)} · ${e(c.providers.find((p) => p.id === m.provider)?.name || m.provider)}</option>`,
+       )
+       .join("");
++  };
+   const field = (type, description) =>
+     `<div class="binding-row"><div class="row">${icon(typeIcon(type))}<h3>${typeNames[type]}模型</h3></div><select name="binding_${type}" aria-label="${typeNames[type]}模型">${options(type, c.bindings[type])}</select><p>${description}</p></div>`;
+-  return `<div class="page-heading"><div><div class="eyebrow">MODEL ROUTING</div><h1>使用配置</h1><p>明确选择每种能力使用的模型。未配置的用途保持关闭。</p></div><div class="heading-actions"><button type="submit" form="bindings-form" class="btn primary" id="save-bindings">${icon("check")}保存配置</button></div></div><div class="info-banner">${icon("info")}选择已启用的模型，保存后从下一次请求开始生效。</div>${sessionSettings}<form id="bindings-form"><div class="bindings-grid"><section class="panel"><div class="panel-header"><h2>工作空间模型</h2><a href="#models" class="btn small link">管理模型 ${icon("arrow")}</a></div><div class="panel-body">${field("chat", "用于鲸鲸的日常对话和会话摘要。")}${field("embedding", "供插件使用的向量模型。当前支持配置与接口测试；检索由插件实现。")}${field("rerank", "供重排序插件使用的模型选择，可留空。")}<details style="margin-top:20px"><summary class="muted">更多模型用途</summary><div style="margin-top:20px">${field("image", "图像生成服务的模型选择。")}${field("stt", "语音识别服务的模型选择。")}${field("tts", "语音合成服务的模型选择。")}<p class="hint" style="margin-top:16px">这里保存模型选择，图像、语音与重排序的具体调用由对应插件实现。</p></div></details></div></section><section class="panel"><div class="panel-header"><h2>人格配置</h2></div><div class="panel-body">${personaSettings}${timeSettings}</div></section></div><p id="bindings-error" class="form-error" role="alert"></p></form>`;
++  return `<div class="page-heading"><div><div class="eyebrow">MODEL ROUTING</div><h1>使用配置</h1><p>明确选择每种能力使用的模型。未配置的用途保持关闭。</p></div><div class="heading-actions"><button type="submit" form="bindings-form" class="btn primary" id="save-bindings">${icon("check")}保存配置</button></div></div><div class="info-banner">${icon("info")}选择已启用的模型，保存后从下一次请求开始生效。</div>${sessionSettings}<form id="bindings-form"><div class="bindings-grid"><section class="panel"><div class="panel-header"><h2>工作空间模型</h2><a href="#models" class="btn small link">管理模型 ${icon("arrow")}</a></div><div class="panel-body">${field("chat", "用于鲸鲸的日常对话和会话摘要。")}${field("diary", "日记整理单独使用的模型。留空则沿用对话模型。")}${field("embedding", "供插件使用的向量模型。当前支持配置与接口测试；检索由插件实现。")}${field("rerank", "供重排序插件使用的模型选择，可留空。")}<details style="margin-top:20px"><summary class="muted">更多模型用途</summary><div style="margin-top:20px">${field("image", "图像生成服务的模型选择。")}${field("stt", "语音识别服务的模型选择。")}${field("tts", "语音合成服务的模型选择。")}<p class="hint" style="margin-top:16px">这里保存模型选择，图像、语音与重排序的具体调用由对应插件实现。</p></div></details></div></section><section class="panel"><div class="panel-header"><h2>人格配置</h2></div><div class="panel-body">${personaSettings}${timeSettings}</div></section></div><p id="bindings-error" class="form-error" role="alert"></p></form>`;
+ }
+ export function bindBindings(app) {
+   app.bindingsDirty = false;
+@@ -184,7 +187,7 @@ export function bindBindings(app) {
+     button.disabled = true;
+     const next = app.configDraft();
+     if (selectedPersona) next.activePersona = selectedPersona;
+-    for (const key of ["chat", "embedding", "rerank", "image", "stt", "tts"])
++    for (const key of ["chat", "diary", "embedding", "rerank", "image", "stt", "tts"])
+       next.bindings[key] = data.get("binding_" + key) || null;
+     try {
+       await app.saveConfig(next);
+@@ -208,7 +211,8 @@ export function bindPlugins(app) {
+ export function renderChat(app) {
+   const model = activeChat(app);
+   const personaName = app.state.status.personaName || "助手";
+-  return `<div class="page-heading"><div><div class="eyebrow">PLAYGROUND</div><h1>和${e(personaName)}聊聊</h1><p>测试当前人格的回复，也可以要求记下一条事实。</p></div><div class="heading-actions"><a class="btn" href="#bindings">当前会话：${e(sessionName(app.state))} ${icon("sliders")}</a></div></div><section class="panel chat-panel"><div class="chat-header"><span class="avatar">${e(personaName.slice(0, 1))}</span><div><h3>${e(app.state.status.personaName || "鲸鲸")}</h3><small>${e(model?.name || "请先选择对话模型")} <span>·</span> ${e(app.state.status.persona)}</small></div><div class="spacer"></div><a href="#bindings" class="btn small link">更换模型 ${icon("sliders")}</a></div><div id="chat-context">${renderContextMeter(app.state.sessionContext, true)}</div><div id="messages" class="messages" aria-live="polite"></div><form id="chat-form" class="composer"><textarea id="chat-input" aria-label="聊天消息" placeholder="和${e(personaName)}说点什么…" rows="2"></textarea><div class="composer-footer"><small>Enter 发送 · Shift + Enter 换行</small><button id="send" class="btn primary small" type="submit" ${app.state.chatBusy || !app.chatConnected || !model ? "disabled" : ""}>${app.state.chatBusy ? "正在回复…" : "发送"} ${icon("send")}</button></div></form></section>`;
++  return `<div class="page-heading"><div><div class="eyebrow">PLAYGROUND</div><h1>和${e(personaName)}聊聊</h1><p>测试当前人格的回复，也可以要求记下一条事实。</p></div><div class="heading-actions"><a class="btn" href="#bindings">当前会话：${e(sessionName(app.state))} ${icon("sliders")}</a><button type="button" class="btn icon-only" id="rename-session" title="给当前会话改名" aria-label="给当前会话改名">${icon("edit")}</button></div></div><section class="panel chat-panel"><div class="chat-header"><span class="avatar">${e(personaName.slice(0, 1))}</span><div><h3>${e(app.state.status.personaName || "鲸鲸")}</h3><small>${e(model?.name || "请先选择对话模型")} <span>·</span> ${e(app.state.status.persona)}</small></div><div class="spacer"></div><a href="#bindings" class="btn small link">更换模型 ${icon("sliders")}</a></div><div id="chat-context">${renderContextMeter(app.state.sessionContext, true)}</div><div class="chat-body"><aside id="chat-rail" class="chat-rail" hidden></aside><div id="messages" class="messages" aria-live="polite"></div></div><form id="chat-form" class="composer"><textarea id="chat-input" aria-label="聊天消息" placeholder="和${e(personaName)}说点什么…" rows="2"></textarea><div id="composer-images" class="composer-images" hidden></div>
++<div class="composer-footer"><small>Enter 发送 · Shift + Enter 换行</small><label class="btn small attach" title="添加图片（也可直接粘贴或拖进来）">图片<input id="image-input" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden></label><button id="send" class="btn primary small" type="submit" ${app.state.chatBusy || !app.chatConnected || !model ? "disabled" : ""}>${app.state.chatBusy ? "正在回复…" : "发送"} ${icon("send")}</button></div></form></section>`;
+ }
+ export function bindChat(app) {
+   app.refreshSessionContext();
+@@ -216,6 +220,9 @@ export function bindChat(app) {
+   const input = document.querySelector("#chat-input");
+   input.value = app.state.chatDraft || "";
+   input.oninput = () => (app.state.chatDraft = input.value);
++  app.bindImageComposer();
++  const renameBtn = document.querySelector("#rename-session");
++  if (renameBtn) renameBtn.onclick = () => app.renameSession();
+   input.onkeydown = (event) => {
+     if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+       event.preventDefault();
+@@ -268,3 +275,345 @@ export function bindLogs(app) {
+   };
+   app.renderLogs();
+ }
++
++const ledgerMoney = (value) => value.toFixed(4);
++/** 一段区间的金额：峰谷或按量计价的区间原样给出，绝不给一个假的确切数。 */
++const ledgerAmount = (row) => {
++  if (!row.max.CNY && !row.max.USD) return "无价";
++  return ["CNY", "USD"]
++    .filter((currency) => row.max[currency] > 0)
++    .map((currency) => {
++      const sign = currency === "CNY" ? "¥" : "$";
++      const low = sign + ledgerMoney(row.min[currency]);
++      if (row.exact) return low;
++      return low + "–" + sign + ledgerMoney(row.max[currency]);
++    })
++    .join(" / ");
++};
++const ledgerKilo = (value) => value.toLocaleString("en-US");
++
++/** 按天汇总，只收账本里真出现的日子，不补空天，避免画出一条尾巴。 */
++const usageByDay = (rows) => {
++  const map = new Map();
++  for (const row of rows) {
++    const item = map.get(row.day) || { day: row.day, input: 0, output: 0, requests: 0 };
++    item.input += row.input;
++    item.output += row.output;
++    item.requests += row.requests;
++    map.set(row.day, item);
++  }
++  return [...map.values()].sort((a, b) => a.day.localeCompare(b.day));
++};
++
++/** 按 provider / 模型汇总，取输入 token 前八名。 */
++const usageModels = (rows) => {
++  const map = new Map();
++  for (const row of rows) {
++    const key = row.provider + " / " + row.model;
++    const item = map.get(key) || { key, input: 0, output: 0, requests: 0 };
++    item.input += row.input;
++    item.output += row.output;
++    item.requests += row.requests;
++    map.set(key, item);
++  }
++  return [...map.values()].sort((a, b) => b.input - a.input).slice(0, 8);
++};
++
++/** 把统计范围铺成连续日期轴，没有用量的日子也占一格，柱子才排得密。 */
++const usageAxis = (days) => {
++  const pad = (value) => String(value).padStart(2, "0");
++  const list = [];
++  for (let back = days - 1; back >= 0; back--) {
++    const date = new Date();
++    date.setDate(date.getDate() - back);
++    list.push(date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" + pad(date.getDate()));
++  }
++  return list;
++};
++
++/** token 数量在纵轴上的短写：4.4M / 200k / 12，省得一行宽到挤掉图。 */
++const kiloShort = (value) => {
++  const trim = (text) => text.replace(/\.0$/, "");
++  if (value >= 1e9) return trim((value / 1e9).toFixed(1)) + "B";
++  if (value >= 1e6) return trim((value / 1e6).toFixed(1)) + "M";
++  if (value >= 1e3) return trim((value / 1e3).toFixed(1)) + "k";
++  return String(Math.round(value));
++};
++
++/** 纵轴顶抬到 1 / 2 / 2.5 / 5 / 10 这类刻度上。 */
++const dayCeil = (value) => {
++  if (!(value > 0)) return 1;
++  const exp = Math.pow(10, Math.floor(Math.log10(value)));
++  const ratio = value / exp;
++  const nice = ratio <= 1 ? 1 : ratio <= 2 ? 2 : ratio <= 2.5 ? 2.5 : ratio <= 5 ? 5 : 10;
++  return nice * exp;
++};
++
++/** 每日输入 token：纵轴刻度、日期横轴、悬停给出当天的输入 / 输出 / 次数。 */
++const usageBars = (series, days = 7) => {
++  const map = new Map(series.map((item) => [item.day, item]));
++  const axis = usageAxis(days).map((day) => map.get(day) || { day, input: 0, output: 0, requests: 0 });
++  const raw = Math.max(...axis.map((item) => item.input), 0);
++  const step = dayCeil(raw / 4);
++  const top = step * 4;
++  const ticks = [4, 3, 2, 1, 0].map((index) => kiloShort(step * index));
++  const grid = [4, 3, 2, 1].map((index) => '<i style="bottom:' + index * 25 + '%"></i>').join("");
++  const dense = axis.length > 14;
++  const every = dense ? Math.ceil(axis.length / 6) : 1;
++  const bars = axis
++    .map((item, index) => {
++      const height = item.input ? Math.max(1.5, (item.input / top) * 100) : 0;
++      const flip = index > axis.length * 0.72 ? " flip" : "";
++      const fill = height
++        ? '<span class="hour-seg" style="height:' + height.toFixed(3) + '%;background:var(--accent)"></span>'
++        : "";
++      const tip = item.input
++        ? '<div class="hour-tip' + flip + '"><strong>' + item.day + " · " + kiloShort(item.input) + "</strong>" +
++          '<span class="hour-tip-row"><i style="background:var(--accent)"></i>输入<b>' + kiloShort(item.input) + "</b></span>" +
++          '<span class="hour-tip-row"><i style="background:#8f88e8"></i>输出<b>' + kiloShort(item.output || 0) + "</b></span>" +
++          '<span class="hour-tip-row">调用<b>' + item.requests + " 次</b></span></div>"
++        : '<div class="hour-tip' + flip + '"><strong>' + item.day + '</strong><span class="hour-tip-row empty">无记录</span></div>';
++      const mark = !dense || index % every === 0 ? '<em class="hour-mark">' + item.day.slice(5) + "</em>" : "";
++      return (
++        '<div class="hour-bar' + (item.input ? "" : " day-zero") + '">' +
++        '<div class="hour-stack">' + fill + "</div>" + mark + tip + "</div>"
++      );
++    })
++    .join("");
++  return (
++    '<div class="hour-chart"><div class="hour-yaxis">' +
++    ticks.map((tick) => "<span>" + tick + "</span>").join("") +
++    '</div><div class="hour-plot"><div class="hour-grid">' + grid +
++    '</div><div class="hour-bars">' + bars + "</div></div></div>"
++  );
++};
++const usageRanking = (models) => {
++  const max = Math.max(...models.map((item) => item.input), 1);
++  return (
++    '<div class="usage-ranking">' +
++    models
++      .map((item) => {
++        const width = Math.max(4, Math.round((item.input / max) * 100));
++        return `<div class="usage-rank"><span class="usage-rank-name" title="${e(item.key)}">${e(item.key)}</span><div class="usage-rank-track"><div class="usage-rank-fill" style="width:${width}%"></div></div><span class="usage-rank-value">${ledgerKilo(item.requests)} 次 · ${ledgerKilo(item.input)}</span></div>`;
++      })
++      .join("") +
++    "</div>"
++  );
++};
++
++const HOUR_COLORS = ["#5b7cfa", "#8b5cf6", "#22c55e", "#f59e0b", "#ef4444", "#06b6d4", "#e879f9", "#84cc16"];
++
++/** 把最大值抬到 1 / 2 / 2.5 / 5 / 10 这类刻度上，柱顶不贴边，纵轴数字好读。 */
++const hourCeil = (value) => {
++  if (!(value > 0)) return 0.01;
++  const exp = Math.pow(10, Math.floor(Math.log10(value)));
++  const ratio = value / exp;
++  const nice = ratio <= 1 ? 1 : ratio <= 2 ? 2 : ratio <= 2.5 ? 2.5 : ratio <= 5 ? 5 : 10;
++  return nice * exp;
++};
++
++/** 24 小时按模型堆叠的金额图：纵轴刻度、整点横轴、悬停给出该小时的分解。 */
++const usageHourly = (hourly) => {
++  const rows = hourly && hourly.hours ? hourly.hours : [];
++  if (!rows.length) return "";
++  const models = [];
++  for (const row of rows) {
++    const key = row.provider + " / " + row.model;
++    if (!models.includes(key)) models.push(key);
++  }
++  const colorOf = (key) => HOUR_COLORS[models.indexOf(key) % HOUR_COLORS.length];
++  const sumOf = (currency) => rows.reduce((sum, row) => sum + (row.max[currency] || 0), 0);
++  const currency = sumOf("CNY") > sumOf("USD") ? "CNY" : "USD";
++  const other = currency === "CNY" ? "USD" : "CNY";
++  const label = currency === "CNY" ? "¥" : "$";
++  const cells = [];
++  for (let hour = 0; hour < 24; hour++) {
++    const inHour = rows.filter((row) => row.hour === hour);
++    const segments = models
++      .map((key) => {
++        const own = inHour.filter((row) => row.provider + " / " + row.model === key);
++        return {
++          key,
++          value: own.reduce((sum, row) => sum + (row.max[currency] || 0), 0),
++          low: own.reduce((sum, row) => sum + (row.min[currency] || 0), 0),
++        };
++      })
++      .filter((segment) => segment.value > 0)
++      .sort((a, b) => b.value - a.value);
++    const total = segments.reduce((sum, segment) => sum + segment.value, 0);
++    const low = segments.reduce((sum, segment) => sum + segment.low, 0);
++    cells.push({ hour, segments, total, low });
++  }
++  const raw = Math.max(...cells.map((cell) => cell.total), 0);
++  const step = hourCeil(raw / 4);
++  const top = step * 4;
++  const digits = top >= 1 ? 2 : top >= 0.1 ? 3 : 4;
++  const money = (value) => label + value.toFixed(digits);
++  /** 峰谷或用量不完整的行只能给区间：高的那端画柱，低的那端一起写出来。 */
++  const moneyRange = (low, high) => (high - low > 1e-9 ? money(low) + "–" + money(high) : money(high));
++  const clock = (hour) => String(hour).padStart(2, "0") + ":00";
++  const ticks = [4, 3, 2, 1, 0].map((index) => money(step * index));
++  const grid = [4, 3, 2, 1].map((index) => '<i style="bottom:' + index * 25 + '%"></i>').join("");
++  const bars = cells
++    .map((cell) => {
++      const flip = cell.hour >= 17 ? " flip" : "";
++      const stack = cell.segments
++        .map(
++          (segment) =>
++            '<span class="hour-seg" style="height:' +
++            ((segment.value / top) * 100).toFixed(3) +
++            "%;background:" +
++            colorOf(segment.key) +
++            '"></span>',
++        )
++        .join("");
++      const tip = cell.total
++        ? '<div class="hour-tip' +
++          flip +
++          '"><strong>' +
++          clock(cell.hour) +
++          " · " +
++          moneyRange(cell.low, cell.total) +
++          "</strong>" +
++          cell.segments
++            .map(
++              (segment) =>
++                '<span class="hour-tip-row"><i style="background:' +
++                colorOf(segment.key) +
++                '"></i>' +
++                e(segment.key) +
++                "<b>" +
++                moneyRange(segment.low, segment.value) +
++                "</b></span>",
++            )
++            .join("") +
++          "</div>"
++        : '<div class="hour-tip' +
++          flip +
++          '"><strong>' +
++          clock(cell.hour) +
++          '</strong><span class="hour-tip-row empty">无记录</span></div>';
++      return (
++        '<div class="hour-bar"><div class="hour-stack">' +
++        stack +
++        "</div>" +
++        (cell.hour % 3 === 0 ? '<em class="hour-mark">' + clock(cell.hour) + "</em>" : "") +
++        tip +
++        "</div>"
++      );
++    })
++    .join("");
++  const legend = models
++    .map(
++      (key) =>
++        '<span class="legend-item"><i style="background:' + colorOf(key) + '"></i>' + e(key) + "</span>",
++    )
++    .join("");
++  const otherTotal = sumOf(other);
++  const note = otherTotal
++    ? "另有 " + (other === "CNY" ? "¥" : "$") + otherTotal.toFixed(4) + " 来自另一种币种的模型，未并入此图。"
++    : "按当前价目重算，仅供参考，不是账单。柱高一律取上界；遇峰谷时段或用量不完整的记录，悬停给出的是区间。";
++  return (
++    '<section class="panel" style="margin-top:22px"><div class="panel-header"><h2>今日每小时消费</h2><span class="badge">' +
++    e(hourly.day || "") +
++    ' · 按模型堆叠</span></div><div class="panel-body"><div class="usage-legend">' +
++    legend +
++    '</div><div class="hour-chart"><div class="hour-yaxis">' +
++    ticks.map((tick) => "<span>" + tick + "</span>").join("") +
++    '</div><div class="hour-plot"><div class="hour-grid">' +
++    grid +
++    '</div><div class="hour-bars">' +
++    bars +
++    '</div></div></div><p class="hint">' +
++    icon("info") +
++    "<span>" +
++    e(note) +
++    "</span></p></div></section>"
++  );
++};
++
++export function renderUsage(app) {
++  const days = app.state.usageDays || 7;
++  const heading = `<div class="page-heading"><div><div class="eyebrow">LEDGER</div><h1>账本</h1><p>按天、按 provider 与模型统计 token 用量，金额按当前价目重算，仅供参考，不是账单。只统计，不拦请求。</p></div><div class="heading-actions"><select id="usage-days" aria-label="统计范围">${[
++    [1, "今天"],
++    [7, "最近 7 天"],
++    [30, "最近 30 天"],
++  ]
++    .map(
++      ([value, label]) =>
++        `<option value="${value}" ${days === value ? "selected" : ""}>${label}</option>`,
++    )
++    .join("")}</select><button id="usage-refresh" class="btn small" type="button">${icon("refresh")}重算</button></div></div>`;
++  if (app.state.usageError)
++    return heading + `<section class="panel empty">读不到账本：${e(app.state.usageError)}</section>`;
++  const data = app.state.usage;
++  if (!data) return heading + '<section class="panel empty">正在读取账本…</section>';
++  const rows = data.rows || [];
++  const totals = { requests: 0, input: 0, output: 0, unpriced: 0, inexact: 0, min: { CNY: 0, USD: 0 }, max: { CNY: 0, USD: 0 }, exact: true };
++  for (const row of rows) {
++    totals.requests += row.requests;
++    totals.input += row.input;
++    totals.output += row.output;
++    totals.unpriced += row.unpriced;
++    for (const currency of ["CNY", "USD"]) {
++      totals.min[currency] += row.min[currency];
++      totals.max[currency] += row.max[currency];
++    }
++    if (!row.exact) {
++      totals.exact = false;
++      totals.inexact += 1;
++    }
++  }
++  const cards = [
++    ["请求", ledgerKilo(totals.requests) + " 次", "这段时间落盘的模型调用", "chat"],
++    ["输入 token", ledgerKilo(totals.input), "每轮都要重发的上下文都在这里", "download"],
++    ["输出 token", ledgerKilo(totals.output), "模型实际写出来的部分", "edit"],
++    ["参考金额", ledgerAmount(totals), totals.exact ? "按当前价目重算" : "含峰谷区间，只能给范围", "bolt"],
++  ]
++    .map(
++      ([name, value, foot, ico]) =>
++        `<div class="panel stat-card"><span class="stat-icon">${icon(ico)}</span><small>${name}</small><div class="stat-value ${name === "请求" ? "" : "text"}">${e(value)}</div><div class="stat-foot">${e(foot)}</div></div>`,
++    )
++    .join("");
++  const table = rows.length
++    ? `<div class="ledger-table" role="table" aria-label="用量明细"><div class="ledger-row ledger-head" role="row"><span>日期</span><span>模型</span><span>次数</span><span>输入</span><span>输出</span><span>参考金额</span></div>${rows
++        .map(
++          (row) =>
++            `<div class="ledger-row" role="row"><span>${e(row.day)}</span><span class="ledger-model" title="${e(row.provider + " / " + row.model)}">${e(row.provider)} / ${e(row.model)}</span><span>${ledgerKilo(row.requests)}</span><span>${ledgerKilo(row.input)}</span><span>${ledgerKilo(row.output)}</span><span class="ledger-money">${e(ledgerAmount(row))}</span></div>`,
++        )
++        .join("")}</div>`
++    : '<div class="panel empty">这段时间还没有用量记录。</div>';
++  const daySeries = usageByDay(rows);
++  const modelRanks = usageModels(rows);
++  const hourlyPanel = usageHourly(data.hourly);
++  const charts = daySeries.length
++    ? `<section class="panel" style="margin-top:22px"><div class="panel-header"><h2>每日输入 token</h2><span class="badge">${daySeries.length} 天</span></div><div class="panel-body">${usageBars(daySeries, days)}<p class="hint">${icon("info")}<span>输入是每轮重发的上下文，钱基本花在这里；输出 token 见下表。</span></p></div></section>` +
++      (modelRanks.length
++        ? `<section class="panel" style="margin-top:22px"><div class="panel-header"><h2>模型排名</h2><span class="badge">按输入 token</span></div><div class="panel-body">${usageRanking(modelRanks)}</div></section>`
++        : "")
++    : "";
++  const budget = data.budget;
++  const budgetText = budget
++    ? `每日预算：${budget.tokens ? ledgerKilo(budget.tokens) + " token" : "未设 token 上限"}${budget.amount ? "，" + (budget.currency === "CNY" ? "¥" : "$") + ledgerMoney(Number(budget.amount)) : ""}${budget.note ? "（" + e(budget.note) + "）" : ""}。只记录，不拦截。`
++    : "还没有设每日预算。";
++  return (
++    heading +
++    `<div class="stats-grid">${cards}</div>` +
++    hourlyPanel +
++    charts +
++    `<section class="panel"><div class="panel-header"><h2>用量明细</h2><span class="badge">${rows.length} 行 · ${e(data.timezone || "")}</span></div><div class="panel-body">${table}<p class="hint">${icon("info")}<span>${totals.unpriced ? `其中 ${totals.unpriced} 次不在价目表里，未计价。` : ""}${totals.inexact ? `其中 ${totals.inexact} 行用量不完整（峰谷时段或中转未上报缓存），金额只能给区间。` : ""}输入是输出的 ${totals.output ? Math.round(totals.input / totals.output) : "—"} 倍，长上下文就是这个数撑起来的；缓存命中能省一部分，但 provider 不上报时这一列是空的。</span></p></div></section>` +
++    `<section class="panel panel-body" style="margin-top:22px"><h2>每日预算</h2><p>${budgetText}</p><p class="hint">${icon("info")}<span>想在聊天里改，直接让助手调 budget_set 工具。</span></p></section>`
++  );
++}
++
++export function bindUsage(app) {
++  const select = document.querySelector("#usage-days");
++  if (select)
++    select.onchange = () => {
++      app.state.usageDays = Number(select.value) || 7;
++      app.loadUsage();
++    };
++  const button = document.querySelector("#usage-refresh");
++  if (button) button.onclick = () => app.loadUsage();
++  if (!app.state.usage && !app.state.usageError) app.loadUsage();
++}
+diff --git a/core/usage-ledger.ts b/core/usage-ledger.ts
+new file mode 100644
+index 0000000..df37097
+--- /dev/null
++++ b/core/usage-ledger.ts
+@@ -0,0 +1,290 @@
++/*! Copyright (c) 2026 iinukami and contributors.
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
++ */
++import { appendFile, readdir, readFile, writeFile } from "node:fs/promises";
++import { resolve } from "node:path";
++import { modelUsageDetails } from "./model-usage.ts";
++
++const DAY_MS = 86400000;
++
++function dayOf(instant: number, timeZone: string) {
++  return new Intl.DateTimeFormat("en-CA", {
++    timeZone, year: "numeric", month: "2-digit", day: "2-digit",
++  }).format(new Date(instant));
++}
++
++/** 判官不在任何会话里跑，它的用量单独落一行流水。 */
++export function judgeUsagePath(root: string) {
++  return resolve(root, "memory/usage-judge.jsonl");
++}
++
++/** 追加一笔判官用量；格式与会话里的 request_usage 一致，账本才认。 */
++export async function appendUsageRecord(root: string, usage: any) {
++  try {
++    const line = JSON.stringify({ type: "usage", role: "assistant", judge: true, request_usage: usage });
++    await appendFile(judgeUsagePath(root), line + "\n");
++  } catch {
++    // 记账是旁路：写不进去就算了，不打断对话。
++  }
++}
++
++/** Sessions keep one jsonl per month; every assistant row may carry request_usage. */
++async function episodeFiles(root: string) {
++  const base = resolve(root, "memory/sessions");
++  let sessions: string[];
++  try { sessions = await readdir(base); } catch { return []; }
++  // 判官流水跟会话放在一起扫，账本不用为它多写一份聚合逻辑。
++  const files: string[] = [judgeUsagePath(root)];
++  for (const id of sessions) {
++    const dir = resolve(base, id, "episodes");
++    let names: string[];
++    try { names = await readdir(dir); } catch { continue; }
++    for (const name of names) if (name.endsWith(".jsonl")) files.push(resolve(dir, name));
++  }
++  return files;
++}
++
++export type UsageBucket = {
++  day: string;
++  provider: string;
++  model: string;
++  requests: number;
++  input: number;
++  output: number;
++  priced: number;
++  unpriced: number;
++  exact: boolean;
++  min: { CNY: number; USD: number };
++  max: { CNY: number; USD: number };
++};
++
++/** Re-price stored usage with the current price book: old rows were written before rates existed. */
++export async function collectUsage(root: string, config: any, days: number): Promise<UsageBucket[]> {
++  const timeZone = config.timezone || "Australia/Brisbane";
++  const now = Date.now();
++  const wanted = new Set<string>();
++  for (let i = 0; i < days; i++) wanted.add(dayOf(now - i * DAY_MS, timeZone));
++  const providers = new Map<string, any>((config.providers || []).map((p: any) => [p.id, p]));
++  const buckets = new Map<string, UsageBucket>();
++  for (const file of await episodeFiles(root)) {
++    let text: string;
++    try { text = await readFile(file, "utf8"); } catch { continue; }
++    if (!text.includes("request_usage")) continue;
++    for (const line of text.split("\n")) {
++      if (!line.includes("request_usage")) continue;
++      let row: any;
++      try { row = JSON.parse(line); } catch { continue; }
++      const usage = row?.request_usage;
++      if (!usage?.measured_at) continue;
++      const at = Date.parse(usage.measured_at);
++      if (!Number.isFinite(at)) continue;
++      const day = dayOf(at, timeZone);
++      if (!wanted.has(day)) continue;
++      const key = `${day}|${usage.provider_id}|${usage.model}`;
++      const bucket = buckets.get(key) ?? {
++        day, provider: String(usage.provider_id ?? "?"), model: String(usage.model ?? "?"),
++        requests: 0, input: 0, output: 0, priced: 0, unpriced: 0, exact: true,
++        min: { CNY: 0, USD: 0 }, max: { CNY: 0, USD: 0 },
++      };
++      bucket.requests += 1;
++      bucket.input += Number.isSafeInteger(usage.input_tokens) ? usage.input_tokens : 0;
++      bucket.output += Number.isSafeInteger(usage.output_tokens) ? usage.output_tokens : 0;
++      const provider = providers.get(usage.provider_id);
++      const hit = usage.cache?.hit_tokens, miss = usage.cache?.miss_tokens;
++      const raw = {
++        prompt_tokens: usage.input_tokens,
++        completion_tokens: usage.output_tokens,
++        ...(Number.isSafeInteger(hit) && Number.isSafeInteger(miss)
++          ? { prompt_cache_hit_tokens: hit, prompt_cache_miss_tokens: miss } : {}),
++      };
++      const cost = provider
++        ? modelUsageDetails(raw, { ...provider, model: usage.model }, new Date(at)).cost
++        : null;
++      if (!cost) bucket.unpriced += 1;
++      else {
++        bucket.priced += 1;
++        bucket.min[cost.currency] += cost.min;
++        bucket.max[cost.currency] += cost.max;
++        // Peak windows carry a range, so the exact figure is unknown for those rows.
++        if (cost.amount === null) bucket.exact = false;
++      }
++      buckets.set(key, bucket);
++    }
++  }
++  return [...buckets.values()].sort((a, b) => (b.input + b.output) - (a.input + a.output));
++}
++
++export type HourBucket = {
++  hour: number;
++  provider: string;
++  model: string;
++  requests: number;
++  input: number;
++  output: number;
++  exact: boolean;
++  unpriced: number;
++  min: { CNY: number; USD: number };
++  max: { CNY: number; USD: number };
++};
++
++/** 浠婂ぉ锛堟寜閰嶇疆鏃跺尯锛夋瘡灏忔椂銆佹瘡妯″瀷鐨勭敤閲忥紝鐢ㄦ潵鐢?24 灏忔椂鍫嗗彔鏌便€?*/
++export async function collectHourly(root: string, config: any) {
++  const timeZone = config.timezone || "Australia/Brisbane";
++  const today = dayOf(Date.now(), timeZone);
++  const hourOf = (instant: number) => {
++    const text = new Intl.DateTimeFormat("en-GB", {
++      timeZone, hour: "2-digit", hourCycle: "h23",
++    }).format(new Date(instant));
++    const hour = Number(text);
++    if (!Number.isFinite(hour)) return 0;
++    return hour === 24 ? 0 : hour;
++  };
++  const providers = new Map<string, any>((config.providers || []).map((p: any) => [p.id, p]));
++  const buckets = new Map<string, HourBucket>();
++  for (const file of await episodeFiles(root)) {
++    let text: string;
++    try { text = await readFile(file, "utf8"); } catch { continue; }
++    if (!text.includes("request_usage")) continue;
++    for (const line of text.split("\n")) {
++      if (!line.includes("request_usage")) continue;
++      let row: any;
++      try { row = JSON.parse(line); } catch { continue; }
++      const usage = row?.request_usage;
++      if (!usage?.measured_at) continue;
++      const at = Date.parse(usage.measured_at);
++      if (!Number.isFinite(at)) continue;
++      if (dayOf(at, timeZone) !== today) continue;
++      const hour = hourOf(at);
++      const key = `${hour}|${usage.provider_id}|${usage.model}`;
++      const bucket = buckets.get(key) ?? {
++        hour, provider: String(usage.provider_id ?? "?"), model: String(usage.model ?? "?"),
++        requests: 0, input: 0, output: 0, exact: true, unpriced: 0,
++        min: { CNY: 0, USD: 0 }, max: { CNY: 0, USD: 0 },
++      };
++      bucket.requests += 1;
++      bucket.input += Number.isSafeInteger(usage.input_tokens) ? usage.input_tokens : 0;
++      bucket.output += Number.isSafeInteger(usage.output_tokens) ? usage.output_tokens : 0;
++      const provider = providers.get(usage.provider_id);
++      const hit = usage.cache?.hit_tokens, miss = usage.cache?.miss_tokens;
++      const raw = {
++        prompt_tokens: usage.input_tokens,
++        completion_tokens: usage.output_tokens,
++        ...(Number.isSafeInteger(hit) && Number.isSafeInteger(miss)
++          ? { prompt_cache_hit_tokens: hit, prompt_cache_miss_tokens: miss } : {}),
++      };
++      const cost = provider
++        ? modelUsageDetails(raw, { ...provider, model: usage.model }, new Date(at)).cost
++        : null;
++      if (!cost) bucket.unpriced += 1;
++      else {
++        bucket.min[cost.currency] += cost.min;
++        bucket.max[cost.currency] += cost.max;
++        if (cost.amount === null) bucket.exact = false;
++      }
++      buckets.set(key, bucket);
++    }
++  }
++  return { day: today, hours: [...buckets.values()].sort((a, b) => a.hour - b.hour) };
++}
++
++export function budgetPath(root: string) {
++  return resolve(root, "memory/usage-budget.json");
++}
++
++export async function readBudget(root: string) {
++  try { return JSON.parse((await readFile(budgetPath(root), "utf8")).replace(/^\uFEFF/, "")); }
++  catch { return null; }
++}
++
++const money = (value: number, currency: string) => `${currency === "CNY" ? "¥" : "$"}${value.toFixed(4)}`;
++const kilo = (value: number) => value.toLocaleString("en-US");
++
++export function registerUsageTools(tools: any, root: string, config: any) {
++  const disposers = [
++    tools.register({
++      name: "usage_today",
++      description:
++        "查最近若干天各 provider 与模型的 token 用量和参考金额，数据取自会话记录的 request_usage。只统计、不拦截；金额按当前价目重算，仅供参考，不是账单。",
++      schema: { days: { type: "integer", minimum: 1, maximum: 31 } },
++      danger: "safe",
++      run: async (args: any) => {
++        if (args && Object.keys(args).some(k => k !== "days")) throw Error("仅接受 days；不接受其他参数");
++        const days = Number.isSafeInteger(args?.days) ? args.days : 1;
++        if (days < 1 || days > 31) throw Error("days 应为 1–31 的整数");
++        const rows = await collectUsage(root, config, days);
++        const budget = await readBudget(root);
++        const totals: any = { requests: 0, input: 0, output: 0, min: { CNY: 0, USD: 0 },
++          max: { CNY: 0, USD: 0 }, unpriced: 0 };
++        for (const row of rows) {
++          totals.requests += row.requests;
++          totals.input += row.input;
++          totals.output += row.output;
++          totals.unpriced += row.unpriced;
++          for (const currency of ["CNY", "USD"] as const) {
++            totals.min[currency] += row.min[currency];
++            totals.max[currency] += row.max[currency];
++          }
++        }
++        const lines = rows.map(row => {
++          const amount = ["CNY", "USD"].every(c => row.max[c as "CNY" | "USD"] === 0)
++            ? "无价"
++            : (["CNY", "USD"] as const).filter(c => row.max[c] > 0)
++              .map(c => row.exact ? money(row.min[c], c) : `${money(row.min[c], c)}–${money(row.max[c], c)}`)
++              .join(" / ");
++          return `${row.day} ${row.provider}/${row.model}：${row.requests} 次，入 ${kilo(row.input)}，出 ${kilo(row.output)}，${amount}`;
++        });
++        const totalText = (["CNY", "USD"] as const)
++          .filter(c => totals.max[c] > 0)
++          .map(c => `${money(totals.min[c], c)}–${money(totals.max[c], c)}`)
++          .join(" / ") || "无";
++        return {
++          timezone: config.timezone || "Australia/Brisbane",
++          days,
++          rows,
++          totals,
++          budget: budget ?? null,
++          summary: [
++            `最近 ${days} 天：${totals.requests} 次请求，入 ${kilo(totals.input)}，出 ${kilo(totals.output)} token，参考金额 ${totalText}。`,
++            totals.unpriced ? `其中 ${totals.unpriced} 次不在价目表里，未计价。` : "",
++            ...lines,
++            budget ? `日预算：${budget.tokens ? `${kilo(budget.tokens)} token` : "未设 token 上限"}${budget.amount ? `，${money(budget.amount, budget.currency || "USD")}` : ""}（只记录，不拦截）` : "还没有设日预算。",
++          ].filter(Boolean).join("\n"),
++        };
++      },
++    }),
++    tools.register({
++      name: "budget_set",
++      description:
++        "设置每日用量预算，仅作记录与对照，不会拦截请求。tokens 为每日 token 上限，amount 为每日金额上限，currency 为 CNY 或 USD。",
++      schema: {
++        tokens: { type: ["integer", "null"], minimum: 0 },
++        amount: { type: ["number", "null"], minimum: 0 },
++        currency: { type: "string", enum: ["CNY", "USD"] },
++        note: { type: "string", maxLength: 100 },
++      },
++      danger: "safe",
++      run: async (args: any) => {
++        const allowed = ["tokens", "amount", "currency", "note"];
++        const extra = Object.keys(args ?? {}).filter(k => !allowed.includes(k));
++        if (extra.length) throw Error("不认识的参数：" + extra.join("、"));
++        const tokens = args?.tokens ?? null, amount = args?.amount ?? null;
++        if (tokens !== null && (!Number.isSafeInteger(tokens) || tokens < 0))
++          throw Error("tokens 应为非负整数或 null");
++        if (amount !== null && (!Number.isFinite(amount) || amount < 0))
++          throw Error("amount 应为非负数或 null");
++        const currency = args?.currency ?? "USD";
++        if (!["CNY", "USD"].includes(currency)) throw Error("currency 只能是 CNY 或 USD");
++        const note = args?.note ?? "";
++        if (typeof note !== "string" || note.length > 100) throw Error("note 最多 100 字");
++        const value = { tokens, amount, currency, note, updated_at: new Date().toISOString() };
++        await writeFile(budgetPath(root), JSON.stringify(value, null, 2), "utf8");
++        return {
++          ...value,
++          text: `日预算已记下：${tokens ? `${kilo(tokens)} token` : "无 token 上限"}${amount ? `，${money(amount, currency)}` : ""}。这只是账，不会拦住请求。`,
++        };
++      },
++    }),
++  ];
++  return () => disposers.forEach(dispose => dispose());
++}
+diff --git a/core/web.ts b/core/web.ts
+index 1d8286d..9ea8ba9 100644
+--- a/core/web.ts
++++ b/core/web.ts
+@@ -3,22 +3,68 @@
+  * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
+  */
+ import { createServer } from "node:http";
+-import { clock } from "./time.ts";
+-import { readFile } from "node:fs/promises";
++import { clock, timezone } from "./time.ts";
++import { mkdir, readFile, writeFile } from "node:fs/promises";
++import { resolve as resolvePath, sep as pathSep, dirname } from "node:path";
++import { fileURLToPath } from "node:url";
++import { execFile } from "node:child_process";
+ import { randomBytes, timingSafeEqual } from "node:crypto";
+ import { WebSocketServer, WebSocket } from "ws";
+ import { Channels } from "./channels.ts";
+ import { conversationRows } from "./channel-history.ts";
++import { toolContentSnapshot } from "./tool-content.ts";
+ import { PluginWebRegistry } from "./plugin-web.ts";
++import { TurnInput } from "./turn-input.ts";
++import { collectHourly, collectUsage, readBudget } from "./usage-ledger.ts";
+ export async function startWeb(config: any, services: any, runtime: any) {
+   const { logger, memory, sessions } = services;
++  // 账本只读 memory/sessions 里的 request_usage，不改任何东西。
++  const ledgerRoot = resolvePath(dirname(fileURLToPath(import.meta.url)), "..");
+   const channels = services.channels ?? new Channels(memory, sessions, config);
+   const { host = "127.0.0.1", port = 9270 } = config.web;
+   if (host !== "127.0.0.1" && (!config.web.lan_enabled || !config.web.password))
+     throw Error("局域网监听需 lan_enabled 与访问密码");
+   const tokens = new Set<string>();
++  // 网页当前正在跑的那一轮：用来接纳中途插话，不排队（勘 2026-11-16）
++  const webInboxes = new Map<string, TurnInput>();
+   const routes = new PluginWebRegistry();
+   const lifetime = new AbortController();
++  // 网页图片上传：一次最多 4 张、单张 4MiB、合计 8MiB，落盘后只在历史里留路径。
++  const uploadLimit = Object.freeze({ images: 4, imageBytes: 4 * 1024 * 1024, totalBytes: 16 * 1024 * 1024 });
++  const saveUploads = async (id: unknown, value: unknown) => {
++    if (value === undefined || value === null) return [] as { path: string; mimeType: string; data: Buffer }[];
++    if (!Array.isArray(value) || !value.length) return [];
++    if (value.length > uploadLimit.images) throw Error("一次最多发送 " + uploadLimit.images + " 张图片");
++    const sessionId = String(id ?? "");
++    if (!/^[A-Za-z0-9_-]{1,80}$/.test(sessionId)) throw Error("会话 ID 无效");
++    const parts: { type: "image"; mimeType: string; data: Buffer }[] = [];
++    for (const item of value) {
++      if (!item || typeof item.mimeType !== "string" || typeof item.data !== "string")
++        throw Error("图片格式无效");
++      if (!["image/png", "image/jpeg", "image/webp"].includes(item.mimeType))
++        throw Error("只支持 PNG、JPEG、WebP 图片");
++      const decoded = Buffer.from(item.data, "base64");
++      if (!decoded.byteLength || decoded.byteLength > uploadLimit.imageBytes)
++        throw Error("单张图片需在 4MiB 以内");
++      parts.push({ type: "image", mimeType: item.mimeType, data: decoded });
++    }
++    if (parts.reduce((sum, part) => sum + part.data.byteLength, 0) > uploadLimit.totalBytes)
++      throw Error("图片合计需在 16MiB 以内");
++    // 复用工具多媒体的签名校验：MIME 与文件头必须对得上。
++    const checked = toolContentSnapshot(parts);
++    const dir = resolvePath("memory", "uploads", sessionId);
++    await mkdir(dir, { recursive: true });
++    const when = Date.now(), saved: { path: string; mimeType: string; data: Buffer }[] = [];
++    for (const [index, part] of checked.entries()) {
++      if (part.type !== "image") continue;
++      const ext = part.mimeType === "image/png" ? "png" : part.mimeType === "image/jpeg" ? "jpg" : "webp";
++      const name = when + "-" + (index + 1) + "." + ext;
++      const bytes = Buffer.from(part.data);
++      await writeFile(resolvePath(dir, name), bytes);
++      saved.push({ path: "memory/uploads/" + sessionId + "/" + name, mimeType: part.mimeType, data: bytes });
++    }
++    return saved;
++  };
+   const register = (method: string, path: string, handler: any) => routes.register("", lifetime.signal, method, path, handler);
+   let origin = `http://${host}:${port}`;
+   const assets = new Set([
+@@ -100,7 +146,7 @@ export async function startWeb(config: any, services: any, runtime: any) {
+           "Cache-Control": "no-store",
+           "X-Frame-Options": "DENY",
+           "Content-Security-Policy":
+-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'",
++            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'",
+         });
+         res.end(await readFile(new URL("./ui/index.html", import.meta.url)));
+         return;
+@@ -345,7 +391,24 @@ export async function startWeb(config: any, services: any, runtime: any) {
+       if (req.method === "GET" && req.url?.startsWith("/api/session?")) {
+         const id = new URL(req.url, origin).searchParams.get("id");
+         if (!id) return send(400, { error: "请提供会话 ID" });
+-        return send(200, conversationRows(await memory.readSession(id)).slice(-100));
++        const rows = conversationRows(await memory.readSession(id)).filter(
++          (row: any) => row.type === "message",
++        );
++        const paging = new URL(req.url, origin).searchParams;
++        const limit = Math.min(Math.max(Number(paging.get("limit") || 40) || 40, 1), 200);
++        const beforeRaw = paging.get("before");
++        const end =
++          beforeRaw === null || beforeRaw === ""
++            ? rows.length
++            : Math.min(Math.max(Number(beforeRaw) || 0, 0), rows.length);
++        const start = Math.max(0, end - limit);
++        return send(200, {
++          items: rows.slice(start, end),
++          total: rows.length,
++          start,
++          end,
++          hasMore: start > 0,
++        });
+       }
+       if (req.method === "GET" && req.url === "/api/status")
+         return send(200, {
+@@ -365,8 +428,103 @@ export async function startWeb(config: any, services: any, runtime: any) {
+           pluginPages: routes.pages(),
+           diagnostics: services.diagnostics?.status(),
+         });
++      if (req.method === "POST" && req.url === "/api/clipboard-image") {
++        // Paste fallback: Chromium often cannot decode a WeChat screenshot that
++        // arrives as a bare DIB. Ask Windows for the bitmap and hand back a PNG.
++        const script = fileURLToPath(
++          new URL("./clipboard-image.ps1", import.meta.url),
++        );
++        const text = await new Promise<string>((done, fail) => {
++          execFile(
++            "powershell",
++            ["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", script],
++            { timeout: 15000, windowsHide: true, maxBuffer: 64 * 1024 * 1024 },
++            (error: any, stdout: string) => {
++              if (error && !stdout) return fail(error);
++              done(String(stdout ?? "").trim());
++            },
++          );
++        });
++        if (text === "NOIMAGE")
++          return send(409, { error: "系统剪贴板里没有图片" });
++        if (!text || text.startsWith("ERROR:"))
++          return send(500, { error: "读取系统剪贴板失败" });
++        return send(200, { dataUrl: "data:image/png;base64," + text });
++      }
++      if (req.method === "GET" && memoryUrl.pathname === "/api/media") {
++        const raw = memoryUrl.searchParams.get("path") ?? "";
++        if (!raw) return send(400, { error: "缺少 path" });
++        const target = resolvePath(raw);
++        const roots = [
++          resolvePath("memory"),
++          resolvePath("plugins"),
++          ...((config.web?.media_roots ?? []) as string[]).map((x) => resolvePath(x)),
++        ];
++        const allowed = roots.some((r) => target === r || target.startsWith(r + pathSep));
++        if (!allowed) return send(403, { error: "路径不在允许范围" });
++        const ext = target.slice(target.lastIndexOf(".")).toLowerCase();
++        const types: Record<string, string> = {
++          ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
++          ".gif": "image/gif", ".webp": "image/webp",
++          ".wav": "audio/wav", ".mp3": "audio/mpeg", ".ogg": "audio/ogg",
++        };
++        const type = types[ext];
++        if (!type) return send(415, { error: "不支持的文件类型" });
++        try {
++          const buf = await readFile(target);
++          res.writeHead(200, { "Content-Type": type, "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
++          res.end(buf);
++        } catch {
++          send(404, { error: "文件不存在" });
++        }
++        return;
++      }
++
++      if (req.method === "GET" && memoryUrl.pathname === "/api/file") {
++        // 回复末尾「本轮文件」的打开入口：只读工作目录里的普通文件，隐藏目录和密钥文件一律不给。
++        const raw = memoryUrl.searchParams.get("path") ?? "";
++        if (!raw) return send(400, { error: "缺少 path" });
++        const base = resolvePath(".");
++        const target = resolvePath(raw);
++        if (target !== base && !target.startsWith(base + pathSep))
++          return send(403, { error: "路径不在工作目录内" });
++        const relative = target.slice(base.length).replace(/^[\\/]+/, "").replaceAll("\\", "/");
++        const segments = relative.split("/");
++        if (!relative || segments.some((seg: string) => seg.startsWith(".") || seg === "node_modules"))
++          return send(403, { error: "这个路径不允许打开" });
++        if (/^(config|credentials?|secrets?)\.json$/i.test(segments[segments.length - 1] ?? ""))
++          return send(403, { error: "sensitive config file blocked" });
++        if (/\.(env|key|pem|p12)$/i.test(relative))
++          return send(403, { error: "这个文件不允许打开" });
++        try {
++          const buf = await readFile(target);
++          const text = /\.(md|markdown|patch|diff|txt|ts|tsx|js|mjs|cjs|json|css|html|py|yml|yaml|toml|sh|ps1|log|csv)$/i.test(relative);
++          const name = segments[segments.length - 1] ?? "file";
++          res.writeHead(200, {
++            "Content-Type": text ? "text/plain; charset=utf-8" : "application/octet-stream",
++            "Content-Disposition": (text ? "inline" : "attachment") + "; filename*=UTF-8''" + encodeURIComponent(name),
++            "Cache-Control": "no-store",
++            "X-Content-Type-Options": "nosniff",
++          });
++          res.end(buf);
++        } catch {
++          send(404, { error: "文件不存在或读不到" });
++        }
++        return;
++      }
+       if (req.method === "GET" && req.url === "/api/logs")
+         return send(200, logger.lines);
++      if (req.method === "GET" && memoryUrl.pathname === "/api/usage") {
++        const raw = memoryUrl.searchParams.get("days");
++        const days = Math.min(Math.max(Number(raw || 7) || 7, 1), 31);
++        return send(200, {
++          days,
++          timezone: config.timezone || "Australia/Brisbane",
++          rows: await collectUsage(ledgerRoot, config, days),
++          hourly: await collectHourly(ledgerRoot, config),
++          budget: await readBudget(ledgerRoot),
++        });
++      }
+       if (req.method === "POST" && req.url === "/api/plugin") {
+         const data = await body(req);
+         await runtime.action(data.id, data.action);
+@@ -388,7 +546,7 @@ export async function startWeb(config: any, services: any, runtime: any) {
+       else res.end();
+     }
+   });
+-  const wss = new WebSocketServer({ noServer: true, maxPayload: 65536 });
++  const wss = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 * 1024 });
+   server.on("upgrade", (req, socket, head) => {
+     if (
+       !allowedOrigin(req) ||
+@@ -421,23 +579,62 @@ export async function startWeb(config: any, services: any, runtime: any) {
+     }
+     let busy = false;
+     ws.on("message", async (raw) => {
++      let data: any;
++      try { data = JSON.parse(raw.toString()); }
++      catch { send({ type: "error", error: "请求不是合法 JSON" }); return; }
++      // 中途插话：本轮还在跑时直接并进当前回合，改方向不用等下一轮。
++      // 它插不进已经发出去的那批工具调用，只能在下一次请求模型前生效。
++      if (data.append) {
++        const inbox = webInboxes.get(String(data.session ?? ""));
++        if (!inbox) { send({ type: "append", status: "closed" }); return; }
++        try {
++          const result = await inbox.append({
++            messageId: "web_" + randomBytes(8).toString("hex"),
++            text: String(data.text ?? ""),
++            receivedAt: new Date().toISOString(),
++            timezone: timezone(config.timezone),
++          }, async () => {});
++          send({ type: "append", status: result.status });
++        } catch (error: any) {
++          send({ type: "append", status: "rejected", error: error?.message ?? "补充失败" });
++        }
++        return;
++      }
+       if (busy) {
+         send({ type: "error", error: "正在回复，请稍候" });
+         return;
+       }
+       busy = true;
+       try {
+-        const data = JSON.parse(raw.toString());
+         if (data.expectedSession !== undefined &&
+           (data.session !== data.expectedSession || data.expectedSession !== await sessions.current({}, lifetime.signal)))
+           throw Error("当前会话已在其他窗口切换，请刷新后重试");
+-        await channels.web(
+-          data.session,
+-          String(data.text ?? ""),
+-          (text: string) => send({ type: "chunk", text }),
+-          (context: any) => send({ type: "context", ...context }),
+-          typeof data.persona === "string" ? data.persona : undefined,
+-        );
++        const images = await saveUploads(data.session, data.images);
++        const typed = String(data.text ?? "");
++        const marked = images.length
++          ? [typed.trim(), ...images.map((image) => "[[img:" + image.path + "]]")].filter(Boolean).join("\n")
++          : typed;
++        const inbox = new TurnInput({
++          messageId: "web_" + randomBytes(8).toString("hex"),
++          text: marked,
++          receivedAt: new Date().toISOString(),
++          timezone: timezone(config.timezone),
++        }, lifetime.signal);
++        webInboxes.set(String(data.session), inbox);
++        try {
++          await channels.web(
++            data.session,
++            marked,
++            (text: string) => send({ type: "chunk", text }),
++            (context: any) => send({ type: "context", ...context }),
++            typeof data.persona === "string" ? data.persona : undefined,
++            images.map((image) => ({ mimeType: image.mimeType, data: image.data })),
++            inbox,
++          );
++        } finally {
++          inbox.closeInput();
++          if (webInboxes.get(String(data.session)) === inbox) webInboxes.delete(String(data.session));
++        }
+         send({ type: "done" });
+       } catch (error: any) {
+         logger.error("聊天失败", { error });
+diff --git a/tests/console.test.ts b/tests/console.test.ts
+index 82097ed..2f875e6 100644
+--- a/tests/console.test.ts
++++ b/tests/console.test.ts
+@@ -273,7 +273,7 @@ test("console config API persists model selection, protects secrets and changes
+     );
+     assert.equal(requested.at(-1), "chat-b");
+     assert.equal(
+-      (await (await get("/api/session?id=console-test")).json()).length,
++      (await (await get("/api/session?id=console-test")).json()).total,
+       2,
+     );
+     const pluginReply = await app.llm.chat({
+diff --git a/tests/current-session.test.ts b/tests/current-session.test.ts
+index 84ef2ee..c56e4d6 100644
+--- a/tests/current-session.test.ts
++++ b/tests/current-session.test.ts
+@@ -50,14 +50,32 @@ async function fixture(t: TestContext) {
+     return value;
+   };
+   const plugin = () => app.runtime.services.get("current-probe").value;
++  // 最小 DOM 元素桩：app.js 的轨道、放大图与上传预览会用到这些接口。
++  const element = (): any => ({
++    addEventListener() {}, removeEventListener() {}, appendChild() {}, remove() {},
++    setAttribute() {}, getAttribute() { return null; }, removeAttribute() {},
++    querySelector: () => null, querySelectorAll: () => [], closest: () => null,
++    classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
++    style: {}, dataset: {}, hidden: false, className: "", id: "", value: "",
++    innerHTML: "", textContent: "", children: [], childNodes: [],
++    getBoundingClientRect: () => ({ top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 }),
++    scrollHeight: 0, clientHeight: 0, scrollTop: 0, scrollWidth: 0, clientWidth: 0,
++    scrollIntoView() {}, focus() {}, click() {}, contains() { return false; },
++  });
+   const browser = async (legacyId?: string, browserApi = api) => {
+     const source = (await readFile("core/ui/app.js", "utf8"))
+       .replace(/^import[\s\S]*?;\r?\n/gm, "")
+       .replace("const app = new ConsoleApp();\napp.start();", "globalThis.consoleApp = new ConsoleApp();")
+-      .replace("const app = new ConsoleApp();\r\napp.start();", "globalThis.consoleApp = new ConsoleApp();");
++      // app.js 末尾现在是 new ConsoleApp(); installImageZoom(); start(); —— 用正则兼容中间插入的调用。
++      .replace(/const app = new ConsoleApp\(\);\r?\n(?:installImageZoom\(\);\r?\n)?app\.start\(\);/,
++        "globalThis.consoleApp = new ConsoleApp();\r\ninstallImageZoom();");
+     const node = { addEventListener() {}, querySelector: () => ({}) };
+     const sandbox: any = { api: browserApi, localStorage: { whaleSession: legacyId }, location: { hash: "#chat" },
+-      document: { getElementById: () => node, querySelectorAll: () => [] },
++      document: {
++        getElementById: () => node, querySelector: () => null, querySelectorAll: () => [],
++        createElement: () => element(), createDocumentFragment: () => element(), body: element(),
++        addEventListener() {}, removeEventListener() {},
++      },
+       window: { addEventListener() {} } };
+     for (const file of ["views", "memory", "personas", "models"])
+       Object.assign(sandbox, await import(new URL(`../core/ui/${file}.js`, import.meta.url).href));
+diff --git a/tests/diary-console.test.ts b/tests/diary-console.test.ts
+index cc7ec1d..9377306 100644
+--- a/tests/diary-console.test.ts
++++ b/tests/diary-console.test.ts
+@@ -52,7 +52,7 @@ test("unified context defaults automatic diaries off while keeping existing diar
+   app.state.memoryContext.diary.paused = { reason: "合成失败", at: "2026-11-08T00:00:00Z" };
+   const diary = renderContextPanel(app);
+   assert.match(diary, /已有日记按篇追加，不重新总结/);
+-  assert.match(diary, /日记 2 篇 · 覆盖 20 条原文 · 剩余 5 条原文 · 500 字符/);
++  assert.match(diary, /日记 2 篇 · 覆盖 20 条原文 · 剩余 5 条原文 · 日记正文 500 字符/);
+   assert.match(diary, /今日整理剩余额度 1,000 tokens/);
+   assert.match(diary, /今日记忆整理额度不足，原文保留/);
+   assert.match(diary, /data-diary-retry/);
+diff --git a/tests/diary-context.test.ts b/tests/diary-context.test.ts
+index 3ae11a3..c0778e8 100644
+--- a/tests/diary-context.test.ts
++++ b/tests/diary-context.test.ts
+@@ -123,19 +123,23 @@ for (const cached of [false, true]) test(`diary triggers by occupation and stays
+   const firstDiary = structuredClone(state.diaries![0]);
+   f.config.channels.web.persona = "two";
+   await f.sessions.chat("one", "换人格继续", () => {});
+-  assert.equal(f.calls.filter(c => c.max_tokens).length, 1);
++  const written = f.calls.filter(c => c.max_tokens).length;
++  const saved = (await f.engine.state("one")).diaries ?? [];
++  assert.ok(written >= 1, "a narrow window writes one diary per maintenance batch");
++  assert.equal(saved.length, written, "each maintenance request writes exactly one diary");
+   const before = await f.sessions.contextStatus("one");
+   await f.sessions.updateContext("one", { ...before.policy, diary_enabled: false });
+   f.config.models[0].context_window = Math.ceil(before.context_estimate.total_tokens / 0.85);
+   const disabled = await f.sessions.contextStatus("one");
+   assert.equal(disabled.diary.enabled, false);
+   assert.ok(disabled.context_estimate.percent! >= 80, "the next turn would be eligible for automatic generation if enabled");
+-  assert.equal(disabled.diary.count, 1); assert.equal(disabled.diary.covered_messages, ids.size);
++  assert.equal(disabled.diary.count, saved.length);
++  assert.equal(disabled.diary.covered_messages, new Set(saved.flatMap(d => d.source_ids)).size);
+   await f.sessions.chat("one", "关闭自动生成后继续", () => {});
+   assert.match(JSON.stringify(f.calls.at(-1).messages), /【长期日记/);
+   for (const row of original.filter(r => ids.has(r.id)))
+     assert.ok(!JSON.stringify(f.calls.at(-1).messages).includes(row.text), "switching off cannot restore already covered raw history");
+-  assert.equal(f.calls.filter(c => c.max_tokens).length, 1);
++  assert.equal(f.calls.filter(c => c.max_tokens).length, written);
+   assert.deepEqual((await f.engine.state("one")).diaries![0], firstDiary);
+   await assert.rejects(f.sessions.retryDiary("one"), /先启用/);
+   await f.sessions.updateContext("one", { ...(await f.sessions.contextStatus("one")).policy, history_enabled: false });
+diff --git a/tests/model-usage.test.ts b/tests/model-usage.test.ts
+index 03a97c7..a602ef4 100644
+--- a/tests/model-usage.test.ts
++++ b/tests/model-usage.test.ts
+@@ -4,7 +4,7 @@
+  */
+ import test from "node:test";
+ import assert from "node:assert/strict";
+-import { modelUsageDetails } from "../core/model-usage.ts";
++import { modelUsageDetails, VERIFIED } from "../core/model-usage.ts";
+ import { requestUsage } from "../core/session-context.ts";
+ 
+ const provider = { id: "deepseek", model_id: "flash-config", model: "deepseek-flash",
+@@ -73,7 +73,7 @@ test("official Flash names and Pro use their verified CNY reference rates", () =
+     close(cost.amount!, 0.000665);
+     assert.equal(cost.min, cost.amount); assert.equal(cost.max, cost.amount);
+     assert.equal(cost.currency, "CNY"); assert.equal(cost.basis, "reference");
+-    assert.equal(cost.price_date, "2026-11-09"); assert.equal(cost.period, "off_peak");
++    assert.equal(cost.price_date, VERIFIED); assert.equal(cost.period, "off_peak");
+   }
+   close(details({ prompt_cache_hit_tokens: 750 }, { ...provider, model: "deepseek-v4-pro" }).cost!.amount!, 0.0025875);
+   close(details({ prompt_cache_hit_tokens: 1, prompt_tokens: 1, completion_tokens: 0 }).cost!.amount!, 0.00000002);
+diff --git a/tests/receipts.test.ts b/tests/receipts.test.ts
+new file mode 100644
+index 0000000..d3832c4
+--- /dev/null
++++ b/tests/receipts.test.ts
+@@ -0,0 +1,97 @@
++/*! Copyright (c) 2026 iinukami and contributors.
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
++ */
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { createHash } from "node:crypto";
++import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join, resolve } from "node:path";
++import { receiptPath, verifiedFiles, type WriteReceipt } from "../core/receipts.ts";
++
++const root = () => mkdtempSync(join(tmpdir(), "whalelife-receipts-"));
++const sha = (body: string) => createHash("sha256").update(Buffer.from(body, "utf8")).digest("hex");
++const receipt = (path: string, body: string, over: Partial<WriteReceipt> = {}): WriteReceipt => ({
++  kind: "file_write", tool: "hands_write", plugin: "hands", call_id: "call-1", round: 1,
++  path, bytes: Buffer.byteLength(body), sha256: sha(body), read_back: "ok", ...over,
++});
++
++test("写成功后回读通过的文件才列进本轮文件", async () => {
++  const dir = root();
++  mkdirSync(join(dir, "out"), { recursive: true });
++  writeFileSync(join(dir, "out/a.md"), "# 标题");
++  const files = await verifiedFiles(dir, [receipt("out/a.md", "# 标题")]);
++  assert.equal(files.length, 1);
++  assert.equal(files[0].path, "out/a.md");
++  assert.equal(files[0].name, "a.md");
++  assert.equal(files[0].ok, true);
++  assert.equal(files[0].bytes, Buffer.byteLength("# 标题"));
++});
++
++test("零回执时本轮文件是空的：界面就不会出现列表", async () => {
++  const dir = root();
++  writeFileSync(join(dir, "out.md"), "x");
++  assert.deepEqual(await verifiedFiles(dir, []), []);
++});
++
++test("回读失败照实显示原因，不给打开入口", async () => {
++  const dir = root();
++  const files = await verifiedFiles(dir, [
++    { kind: "file_write", tool: "hands_write", plugin: "hands", call_id: "call-1", round: 1,
++      path: "out/a.md", read_back: "failed", error: "EACCES" },
++  ]);
++  assert.equal(files[0].ok, false);
++  assert.match(String(files[0].error), /回读失败.*EACCES/);
++});
++
++test("写入后文件又被改动，回执那一版对不上就不算已验证", async () => {
++  const dir = root();
++  mkdirSync(join(dir, "out"), { recursive: true });
++  writeFileSync(join(dir, "out/a.md"), "写进去的");
++  writeFileSync(join(dir, "out/a.md"), "被人改了");
++  const files = await verifiedFiles(dir, [receipt("out/a.md", "写进去的")]);
++  assert.equal(files[0].ok, false);
++  assert.match(String(files[0].error), /已变化/);
++});
++
++test("核验时文件不见了，报不存在", async () => {
++  const dir = root();
++  mkdirSync(join(dir, "out"), { recursive: true });
++  writeFileSync(join(dir, "out/a.md"), "x");
++  const files = await verifiedFiles(dir, [receipt("out/a.md", "x")]);
++  rmSync(join(dir, "out/a.md"));
++  const again = await verifiedFiles(dir, [receipt("out/a.md", "x")]);
++  assert.equal(files[0].ok, true);
++  assert.equal(again[0].ok, false);
++  assert.match(String(again[0].error), /不存在/);
++});
++
++test("同一路径取最后一条回执", async () => {
++  const dir = root();
++  mkdirSync(join(dir, "out"), { recursive: true });
++  writeFileSync(join(dir, "out/a.md"), "第二版");
++  const files = await verifiedFiles(dir, [
++    receipt("out/a.md", "第一版", { call_id: "call-1", round: 1 }),
++    receipt("out/a.md", "第二版", { call_id: "call-2", round: 2 }),
++  ]);
++  assert.equal(files.length, 1);
++  assert.equal(files[0].ok, true);
++});
++
++test("两份文件各列一行", async () => {
++  const dir = root();
++  mkdirSync(join(dir, "out"), { recursive: true });
++  writeFileSync(join(dir, "out/a.md"), "甲");
++  writeFileSync(join(dir, "out/b.patch"), "乙");
++  const files = await verifiedFiles(dir, [receipt("out/a.md", "甲"), receipt("out/b.patch", "乙")]);
++  assert.deepEqual(files.map((file) => file.name), ["a.md", "b.patch"]);
++});
++
++test("路径越界不收，工作目录内的绝对路径收敛成相对路径", () => {
++  const dir = root();
++  assert.equal(receiptPath(dir, join(dir, "out", "a.md")), "out/a.md");
++  assert.equal(receiptPath(dir, resolve(dir, "..", "escape.md")), undefined);
++  assert.equal(receiptPath(dir, dir), undefined);
++  assert.equal(receiptPath(dir, ""), undefined);
++});
+diff --git a/tests/temporal-memory-ui.test.ts b/tests/temporal-memory-ui.test.ts
+index 6b09d51..a36826a 100644
+--- a/tests/temporal-memory-ui.test.ts
++++ b/tests/temporal-memory-ui.test.ts
+@@ -73,7 +73,7 @@ test("diary counts describe injected context and do not expand the compact chat
+   };
+   assert.doesNotMatch(renderContextPanel(app), /短期 300 条|长期 0 条|短期摘要 128/);
+   app.state.memoryContext.diary = { count: 1, covered_messages: 40, remaining_messages: 260, chars: 400, enabled: false };
+-  assert.match(renderContextPanel(app), /日记 1 篇 · 覆盖 40 条原文 · 剩余 260 条原文 · 400 字符/);
++  assert.match(renderContextPanel(app), /日记 1 篇 · 覆盖 40 条原文 · 剩余 260 条原文 · 日记正文 400 字符/);
+   assert.doesNotMatch(renderContextPanel(app), /400 \/ 200|仅供查看/);
+   const compact = renderContextMeter(app.state.memoryContext, true);
+   assert.match(compact, /chat-context-compact/);
