@@ -1,5 +1,0 @@
-id: voice
-name: 嗓子
-description: 用本地 GPT-SoVITS 合成语音，可直接从音箱播放并保留文件；带配置页，能启停服务、设定随主程序起停
-version: 0.2.0
-apiVersion: "1"

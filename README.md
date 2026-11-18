@@ -22,37 +22,13 @@
 
 ## 一、插件
 
-| 插件 | 版本 | 做什么 | 状态 | 源码 |
-|---|---|---|---|---|
-| `voice` | 0.2.0 | 嗓子。用本地 GPT-SoVITS 合成语音，可从音箱播放并保留文件；带配置页，能启动/停止服务 | 能用（依赖本机 GPT-SoVITS 部署） | [plugins/voice](plugins/voice) |
+**目前这个库没有插件。** 所有插件都已移走——成品在 [personal](https://github.com/SSSSmallSlimeSmile/whalelife-mod-personal) 库，这里只留补丁和文档。
 
-### `voice` 嗓子
-
-**来源：本机自建。** 搬进 WhaleLife 时从 AstrBot 那边的语音能力并过来的，**没有对应的上游仓库**——作者公开的 8 个仓库里没有 voice，主仓库的 `plugins/` 也只有一份 `AGENTS.md`。GPT-SoVITS 服务、参考音频、参数这些出自我们自己的环境。
-
-因此这份代码没有“上游原版 diff”可附，下面列的改动是相对这份代码最初搬进来时的样子说的。将来若发现某部分确实来自别处，按那边的许可补声明。
-
-（本段之前写的是「基础版本由上游提供」，那是错的，2026-11-18 更正。）
-
-主要改动：
-
-| 位置 | 改动 |
-|---|---|
-| `ui.ts` | 新增文件，嗓子配置页：状态条、启动/停止/刷新、两个伴随开关、服务参数表 |
-| `index.ts` | 新增 `ctx.web.page("/plugins/voice/")` 与四个 api：`status` / `start` / `stop` / `save` |
-| `index.ts` | 修 `pidByPort()` 取列错位。`netstat -ano` 的列是 `0=协议 1=本地地址 2=对端地址 3=状态 4=PID`，原代码用 `cols[1]` 判 `LISTENING`、`cols[2]` 取地址，永远匹配不到，返回空数组 |
-| `index.ts` | 修页面「刷新状态」无可见反馈 |
-| `index.ts` | `DEFAULTS` 里四处本机绝对路径清空，改由 `data/config.json` 提供 |
-| `plugin.yaml` | 名称改「嗓子」，版本升 0.2.0 |
-
-第一个 bug 的表现：状态显示在跑、点停止说没进程、点启动又说已在跑。四个现象同一个原因。
-
-默认值里的本机路径已清空，真实值只在 `data/config.json`（不进库）。
-
-### 原来放这里的另外三个
+### 原来的四个插件去向
 
 | 插件 | 去向 |
 |---|---|
+| `voice` 嗓子 | 移到 personal 库（不能单独跑，只是 WhaleLife 与 GPT-SoVITS 的接口） |
 | `ear` 麦克风听写 | 移到 [personal](https://github.com/SSSSmallSlimeSmile/whalelife-mod-personal) 库（功能已通，安装文档也写全了） |
 | `chime` 提示音 | 移到 personal 库 |
 | `watcher` 信匣监视 | 从库里移除（路径绑死本机，对别人没有意义） |
