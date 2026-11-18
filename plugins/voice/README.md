@@ -1,14 +1,14 @@
-# voice · 嗓子（本地改版）
+# voice · 嗓子
 
-用本地 GPT-SoVITS 合成语音，可直接从音箱播放并保留文件。
+用本地 GPT-SoVITS 合成语音，可直接从音箱播放并保留文件。带配置页，能在页面上启动、停止 GPT-SoVITS 服务。
 
-**这个插件不是我们写的。** 基础版本由上游提供，我们只是在它上面加了配置页、修了两处 bug。放这里是为了留下改动记录，不是发布。
+## 来源：本机自建
 
-## 先说清楚：拿不到上游原版
+**这个插件没有上游仓库。** 搬进 WhaleLife 时从 AstrBot 那边的语音能力并过来的，GPT-SoVITS 服务、参考音频、参数都出自我们自己的环境。
 
-上游仓库（`iinukami/whalelife`）的 `plugins/` 不在版本控制里，仓库里只有一份 `plugins/AGENTS.md`，没有任何插件源码。所以**无法附上游原版的 diff**，下面列的改动是凭本机这份文件反查出来的，不是与原作者逐行比对的结论。
+作者公开的仓库一共 8 个（主仓库 `whalelife`、`plugin-vision`、`plugin-surf`、`plugin-bilibili`、`plugin-qq`、`plugin-qzone`、`plugin-gallery`、`plugin-autonomy`），主仓库的 `plugins/` 下只有一份 `AGENTS.md`，没有任何插件源码。**里面没有 voice。**
 
-用的时候请以上游发布的那份为准，这份只作参考。
+所以没有“上游原版”可附 diff，下面那节写的是相对这份代码最初搬进来时的样子。将来若发现某部分确实来自别处，按那边的许可补声明。
 
 ## 我们动过什么
 
