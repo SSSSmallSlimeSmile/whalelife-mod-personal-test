@@ -11,7 +11,7 @@ index 7d430e0..42d04f3 100644
    rerank: "重排序",
    image: "图像生成",
 diff --git a/core/ui/app.js b/core/ui/app.js
-index 55ade77..db1888d 100644
+index 55ade77..f30c1c1 100644
 --- a/core/ui/app.js
 +++ b/core/ui/app.js
 @@ -31,6 +31,8 @@ const pages = {
@@ -581,7 +581,7 @@ index 55ade77..db1888d 100644
    }
    filteredLogs() {
      return this.state.logs.filter(
-@@ -544,5 +950,378 @@ class ConsoleApp {
+@@ -544,5 +950,379 @@ class ConsoleApp {
        `显示 ${lines.length} / ${this.state.logs.length} 条 · ${this.logConnected ? "实时推送中" : "正在重新连接"}`;
    }
  }
@@ -942,21 +942,22 @@ index 55ade77..db1888d 100644
 +      copy.querySelectorAll(".say-btn, .msg-media, .msg-files").forEach((n) => n.remove());
 +      text = (copy.innerText || "").trim();
 +    }
-+    if (!text) return;
-+    const face = btn.textContent;
++    if (!text) {
++      app.toast("这条消息没有可念的文字", true);
++      return;
++    }
 +    btn.disabled = true;
-+    btn.textContent = "…";
++    btn.classList.add("saying");
++    btn.title = "正在合成并播放…";
 +    try {
-+      await api("/plugins/mouth/say", { text });
-+      btn.textContent = "✓";
++      const r = await api("/plugins/mouth/say", { text });
++      app.toast(`念出来了：${r.segments} 段，${r.chars} 字，用时 ${(r.ms / 1000).toFixed(1)} 秒`);
 +    } catch (error) {
-+      btn.textContent = "✕";
-+      btn.title = String((error && error.message) || error);
++      app.toast("没念成：" + String((error && error.message) || error), true);
 +    } finally {
-+      setTimeout(() => {
-+        btn.textContent = face;
-+        btn.disabled = false;
-+      }, 2000);
++      btn.classList.remove("saying");
++      btn.disabled = false;
++      btn.title = "念出来";
 +    }
 +  });
 +}
@@ -989,8 +990,67 @@ index ea8ec82..94628f1 100644
  }
  export function renderContextPanel(app) {
    const s = app.state, current = s.memoryContext, selected = viewedSession(s);
+diff --git a/core/ui/patch-thinking.mjs b/core/ui/patch-thinking.mjs
+new file mode 100644
+index 0000000..c6984b9
+--- /dev/null
++++ b/core/ui/patch-thinking.mjs
+@@ -0,0 +1,53 @@
++import { readFile, writeFile } from "node:fs/promises";
++
++const faces = [
++  "(｡•ᴗ•｡)",
++  "(´｡• ᵕ •｡`)",
++  "(๑•̀ㅂ•́)و",
++  "(￣▽￣)",
++  "(＝ω＝)",
++  "(っ˘ω˘ς)",
++  "(๑´ω`๑)",
++  "(・ω・)",
++  "(๑•́ ₃ •̀๑)",
++  "( ˘ω˘ )",
++  "(´▽`)",
++  "(･ω･)ﾉ",
++];
++
++const helper = `const thinkingFaces = ${JSON.stringify(faces)};
++const pickThinkingFace = () => thinkingFaces[Math.floor(Math.random() * thinkingFaces.length)];
++const $ = (id) => document.getElementById(id);`;
++
++let app = await readFile("app.js", "utf8");
++if (app.includes("pickThinkingFace")) {
++  console.log("app.js 已经改过，跳过");
++} else {
++  const anchor = 'const $ = (id) => document.getElementById(id);';
++  if (!app.includes(anchor)) throw new Error("找不到 $ 定义");
++  app = app.replace(anchor, helper);
++  const oldBubble = '<span>思考中</span>';
++  if (!app.includes(oldBubble)) throw new Error("找不到思考中气泡");
++  app = app.replace(
++    oldBubble,
++    '<span>思考中 <em class="think-face">${pickThinkingFace()}</em></span>',
++  );
++  await writeFile("app.js", app, "utf8");
++  console.log("app.js 已更新");
++}
++
++let css = await readFile("styles.css", "utf8");
++const cssAnchor =
++  ".bubble.thinking span { margin-left: 4px; animation: think-fade 1.8s infinite ease-in-out; }";
++if (css.includes(".think-face")) {
++  console.log("styles.css 已经改过，跳过");
++} else {
++  if (!css.includes(cssAnchor)) throw new Error("找不到 thinking span 样式");
++  css = css.replace(
++    cssAnchor,
++    cssAnchor +
++      "\n.bubble.thinking em.think-face { font-style: normal; letter-spacing: 0; margin-left: 2px; }",
++  );
++  await writeFile("styles.css", css, "utf8");
++  console.log("styles.css 已更新");
++}
 diff --git a/core/ui/styles.css b/core/ui/styles.css
-index 5251c75..0d0d3ab 100644
+index 5251c75..2560a6c 100644
 --- a/core/ui/styles.css
 +++ b/core/ui/styles.css
 @@ -812,7 +812,7 @@ main {
@@ -1002,7 +1062,7 @@ index 5251c75..0d0d3ab 100644
  }
  .chat-empty {
    height: 100%;
-@@ -1393,3 +1393,348 @@ dialog::backdrop {
+@@ -1393,3 +1393,358 @@ dialog::backdrop {
  }
  .extension-panel { overflow: hidden; min-height: 480px; }
  .extension-frame { display: block; width: 100%; height: max(480px, calc(100dvh - 230px)); border: 0; background: white; }
@@ -1346,6 +1406,16 @@ index 5251c75..0d0d3ab 100644
 +  opacity: 1;
 +  color: #7c5cff;
 +  border-color: rgba(124, 92, 255, 0.5);
++}
++.bubble .say-btn.saying {
++  opacity: 1;
++  color: #7c5cff;
++  border-color: rgba(124, 92, 255, 0.5);
++  animation: sayPulse 1s ease-in-out infinite;
++}
++@keyframes sayPulse {
++  0%, 100% { transform: scale(1); }
++  50% { transform: scale(0.88); }
 +}
 +.bubble .say-btn:disabled {
 +  opacity: 1;
