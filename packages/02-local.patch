@@ -517,7 +517,7 @@ index 0000000..0aad606
 +  return loaded;
 +}
 diff --git a/core/session.ts b/core/session.ts
-index 754b582..40746e4 100644
+index 754b582..3bcf3bf 100644
 --- a/core/session.ts
 +++ b/core/session.ts
 @@ -15,7 +15,12 @@ import { shortSummaryKey, shortContext, compressShort, consolidateLong, shouldDe
@@ -677,7 +677,60 @@ index 754b582..40746e4 100644
        let measured: any = null;
        let memoryWriteRejected = false;
        const mediaSignals: AbortSignal[] = [];
-@@ -613,8 +667,11 @@ export class Sessions {
+@@ -564,16 +618,51 @@ export class Sessions {
+             received_at: message.receivedAt, timezone: message.timezone });
+         }
+       };
++      // 工具循环守卫（勘 2026-11-18）：轮数、同参重复、预算临近三处兜底。
++      // 不硬抛错，只让模型换个做法或收尾——报错会整轮作废，反而更费钱。
++      const loopGuard = Object.assign(
++        { enabled: true, max_rounds: 100, repeat_limit: 3, warn_percent: 85, max_minutes: 20 },
++        (this.config.agent && this.config.agent.loop_guard) || {},
++      );
++      const seenCalls = new Map<string, number>();
++      let budgetWarned = false;
++      let roundsCapped = false;
++      let capReason = "";
++      const loopStartedAt = Date.now();
++      const callKey = (name: string, args: string) => name + "\u0000" + args;
+       // Completion is the model's decision; cancellation, permissions and context capacity still apply.
+       for (let round = 0; ; round++) {
+         turn.round = round + 1;
+-        const activeTools = memoryWriteRejected ? [] : toolList;
++        if (loopGuard.enabled && !roundsCapped) {
++          if (round >= loopGuard.max_rounds) {
++            roundsCapped = true;
++            capReason = "rounds(" + loopGuard.max_rounds + ")";
++          } else if (loopGuard.max_minutes > 0 && Date.now() - loopStartedAt > loopGuard.max_minutes * 60000) {
++            roundsCapped = true;
++            capReason = "time(" + loopGuard.max_minutes + "min)";
++          }
++        }
++        const activeTools = memoryWriteRejected || roundsCapped ? [] : toolList;
+         while (input?.hasPending()) await consumeInput();
+         signal.throwIfAborted();
+         const requestSignal = mediaSignals.length ? AbortSignal.any([signal, ...mediaSignals]) : signal;
+         requestSignal.throwIfAborted();
+         let requestTime = timing();
+         frame.refreshTime(requestTime);
++        // 超预算前先给台阶：不注入，模型就只能撞到下面那行硬抛错。
++        if (loopGuard.enabled && !budgetWarned && activeTools.length) {
++          const used = estimateTokens(promptText(messages) + JSON.stringify(activeTools));
++          if (used > requestBudget * loopGuard.warn_percent / 100 && used <= requestBudget) {
++            budgetWarned = true;
++            messages.push({
++              role: "user",
++              content: "【本轮提示】上下文已用到 " + Math.round(used / requestBudget * 100) +
++                "%，再塞大段工具结果就会超限整轮作废。请尽快收尾：能答就答，剩下的说明没做完。",
++            });
++            await execution?.write("loop_guard", { kind: "budget_warn", round: turn.round,
++              used, budget: requestBudget });
++          }
++        }
+         if (
+           estimateTokens(promptText(messages) + JSON.stringify(activeTools)) >
+           requestBudget
+@@ -613,8 +702,11 @@ export class Sessions {
            // Seal synchronously after the last await. Unsent candidates never enter history.
            if (input && !input.tryFinish()) continue;
            final = reply.text;
@@ -689,7 +742,7 @@ index 754b582..40746e4 100644
          if (historyReference && typeof reply.reasoning_content !== "string")
            throw Error("思考模式工具响应缺少 reasoning_content，未执行本次工具调用");
          messages.push({
-@@ -638,6 +695,8 @@ export class Sessions {
+@@ -638,6 +730,8 @@ export class Sessions {
            const toolOrigin = tools.entries?.get(call.name)?.origin;
            let result;
            superseded ||= input?.hasPending() ?? false;
@@ -698,7 +751,28 @@ index 754b582..40746e4 100644
            if (superseded) {
              result = { ok: false, executed: false, reason: "user_input_appended",
                result: "未执行：用户补充了消息，请结合补充内容重新判断是否仍需调用此工具。" };
-@@ -661,6 +720,8 @@ export class Sessions {
+@@ -645,6 +739,20 @@ export class Sessions {
+               status: "skipped", result });
+             await execution?.write("tool_skipped", { round: turn.round, tool_call_id: call.id,
+               tool: turn.transient && !toolOrigin ? "[未注册工具]" : call.name, reason: "user_input_appended" });
++          } else if (loopGuard.enabled && (() => {
++            const key = callKey(call.name, call.arguments);
++            const n = (seenCalls.get(key) ?? 0) + 1;
++            seenCalls.set(key, n);
++            return n > loopGuard.repeat_limit;
++          })()) {
++            result = { ok: false, executed: false, reason: "loop_guard_repeat",
++              result: "同一工具、完全相同的参数已经调用过 " + loopGuard.repeat_limit +
++                " 次以上，结果不会变。请换个参数、换个做法，或直接回答。" };
++            diagnostics?.event("tool.end", { tool_call_id: call.id, name: call.name, arguments: call.arguments,
++              status: "skipped", result });
++            await execution?.write("tool_skipped", { round: turn.round, tool_call_id: call.id,
++              tool: turn.transient && !toolOrigin ? "[未注册工具]" : call.name, reason: "loop_guard_repeat",
++              arguments: turn.transient ? undefined : call.arguments });
+           } else try {
+             result = await tools.call(
+               call.name,
+@@ -661,6 +769,8 @@ export class Sessions {
                tool: turn.transient && !toolOrigin ? "[未注册工具]" : call.name, error: result.result,
                ...(turn.transient ? {} : { arguments: call.arguments }) });
            }
@@ -707,10 +781,14 @@ index 754b582..40746e4 100644
            if (!superseded && !result.ok && ["remember_fact", "edit_facts"].includes(call.name))
              memoryWriteRejected = true;
            await memory.appendEvent({
-@@ -695,6 +756,10 @@ export class Sessions {
+@@ -695,6 +805,14 @@ export class Sessions {
          messages.push(...attachments);
          if (attachments.length) diagnostics?.event("context.change", { operation: "append", source: "tool_attachments", after: attachments });
        }
++      if (roundsCapped) {
++        logger.info("循环守卫", { status: "rounds_capped", reason: capReason, rounds: loopGuard.max_rounds, session: id });
++        await execution?.write("loop_guard", { kind: "rounds_capped", reason: capReason, rounds: loopGuard.max_rounds });
++      }
 +      const files = await verifiedFiles(this.root, writeReceipts);
 +      if (writeReceipts.length)
 +        await execution?.write("write_receipts", { receipts: writeReceipts, files });
@@ -718,7 +796,7 @@ index 754b582..40746e4 100644
        if (!final) throw Error("模型未返回最终回复，请重试");
        await memory.appendEvent({
          type: "message",
-@@ -704,6 +769,7 @@ export class Sessions {
+@@ -704,6 +822,7 @@ export class Sessions {
          role: "assistant",
          // User-facing conversation is primary history. Technical plugin runs retain their opt-in privacy.
          text: transient && turn.transient ? TRANSIENT_REPLY : final,
@@ -726,7 +804,7 @@ index 754b582..40746e4 100644
          ...(transient && turn.transient ? { transient: true } : {}),
          ...context,
          request_usage: measured,
-@@ -716,6 +782,8 @@ export class Sessions {
+@@ -716,6 +835,8 @@ export class Sessions {
            provider: p.provider, limit: limit.tokens, signal, timezone: zone,
            rows: matchingHistory(currentRows, p.revision, policy.history_scope), policy, revision: p.revision });
        }
