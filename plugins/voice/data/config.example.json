@@ -1,0 +1,21 @@
+{
+  "url": "http://127.0.0.1:9880",
+  "ref_audio": "",
+  "prompt_text": "",
+  "text_lang": "zh",
+  "prompt_lang": "zh",
+  "speed": 1.2,
+  "max_chars": 160,
+  "timeout_ms": 120000,
+  "gsv": {
+    "auto_start": false,
+    "stop_on_exit": true,
+    "python": "",
+    "args": ["api_v2.py", "-a", "127.0.0.1", "-p", "9880"],
+    "cwd": "",
+    "host": "127.0.0.1",
+    "port": 9880,
+    "log": "",
+    "start_wait_ms": 180000
+  }
+}
