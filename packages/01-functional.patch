@@ -659,13 +659,14 @@ index 0000000..0aad606
 +  return loaded;
 +}
 diff --git a/core/session.ts b/core/session.ts
-index 754b582..c9dca87 100644
+index 754b582..89603ac 100644
 --- a/core/session.ts
 +++ b/core/session.ts
-@@ -15,8 +15,14 @@ import { shortSummaryKey, shortContext, compressShort, consolidateLong, shouldDe
+@@ -15,8 +15,15 @@ import { shortSummaryKey, shortContext, compressShort, consolidateLong, shouldDe
  import { attribution, historyTail, originNote, originOf, renderHistory } from "./provenance.ts";
  import { SessionQueue, type QueuePolicy } from "./session-queue.ts";
  import { TRANSIENT_REPLY, type ToolTurn } from "./tool-retention.ts";
++import { salvageToolCallFromText, stripToolProtocol } from "./tool-protocol.ts";
 +import { receiptPath, verifiedFiles, type WriteReceipt } from "./receipts.ts";
  import type { TurnInput } from "./turn-input.ts";
 +/** 一轮里随消息一起送进模型的图片（已由 Web 层校验并落盘）。 */
@@ -677,7 +678,7 @@ index 754b582..c9dca87 100644
  import { diaryContext, diaryRequestPlan, writeDiary } from "./memory-diary.ts";
  import { contextFrame, diaryPrefix, fittingDiaryPrefix, historyEntry, recalledMaterial, supportsContextPrefix } from "./context-material.ts";
  import {
-@@ -26,6 +32,11 @@ import {
+@@ -26,6 +33,11 @@ import {
    requestUsage,
    memoryWindow,
  } from "./session-context.ts";
@@ -689,7 +690,7 @@ index 754b582..c9dca87 100644
  export class Sessions {
    memoryMaintenance = false;
    blockedSessions = new Set<string>();
-@@ -114,12 +125,25 @@ export class Sessions {
+@@ -114,12 +126,25 @@ export class Sessions {
      const history = matchingHistory(rows, p.revision, policy.history_scope);
      const last = rows.findLast((row: any) => row.role === "assistant" && !row.delivery_id);
      const usage = last?.request_usage;
@@ -717,7 +718,7 @@ index 754b582..c9dca87 100644
      const legacy = policy.memory_mode === "legacy";
      const window = legacy ? memoryWindow(history, policy)
        : { short: history.filter((row: any) => row.type === "message"), long: [] };
-@@ -191,9 +215,9 @@ export class Sessions {
+@@ -191,9 +216,9 @@ export class Sessions {
        usage: matches
          ? {
              ...usage,
@@ -730,7 +731,7 @@ index 754b582..c9dca87 100644
                : null,
              settings_changed:
                JSON.stringify(last.context_policy) !== JSON.stringify(policy) ||
-@@ -248,9 +272,11 @@ export class Sessions {
+@@ -248,9 +273,11 @@ export class Sessions {
      route?: ChannelRoute,
      transient = false,
      queue?: QueuePolicy,
@@ -743,7 +744,7 @@ index 754b582..c9dca87 100644
    }
    /** Capture arrival metadata before any asynchronous routing or queue wait. */
    async outgoingIdentity(id: string, route: ChannelRoute) {
-@@ -291,6 +317,7 @@ export class Sessions {
+@@ -291,6 +318,7 @@ export class Sessions {
      transient = false,
      turn: ToolTurn = { transient: false },
      input?: TurnInput,
@@ -751,7 +752,7 @@ index 754b582..c9dca87 100644
    ) {
      signal.throwIfAborted();
      if (this.memoryMaintenance) throw Error("记忆恢复中，请稍后重试");
-@@ -302,6 +329,10 @@ export class Sessions {
+@@ -302,6 +330,10 @@ export class Sessions {
      if (this.memoryMaintenance || this.blockedSessions.has(id))
        throw Error("会话维护中，请稍后重试");
      if (!text.trim() || text.length > 16000) throw Error("请输入 1–16000 字");
@@ -762,7 +763,7 @@ index 754b582..c9dca87 100644
      const receivedAt = route?.receivedAt ?? new Date().toISOString(), zone = route?.timezone ?? timezone(this.config.timezone);
      const { memory, memoryEngine: engine, llm, tools, logger } = this.services;
      const execution = await this.services.executionArchive?.start(id, {
-@@ -328,6 +359,19 @@ export class Sessions {
+@@ -328,6 +360,19 @@ export class Sessions {
        signal.throwIfAborted();
        const p = await persona(this.root, this.config, channel.persona);
        this.identities.set(id, { persona_id: p.id, persona_name: p.name, persona_revision: p.revision, timezone: zone });
@@ -782,7 +783,7 @@ index 754b582..c9dca87 100644
        await execution?.write("context", { persona: p.id, provider: p.provider.id, model: p.provider.model });
        if (expectedPersona && expectedPersona !== p.id)
          throw Error("当前人格已在其他窗口切换，请刷新后重试");
-@@ -356,6 +400,24 @@ export class Sessions {
+@@ -356,6 +401,24 @@ export class Sessions {
          personaId: p.id,
          permission: channel.permission ?? p.permission,
          signal,
@@ -807,7 +808,7 @@ index 754b582..c9dca87 100644
        };
        const storedHistory = (engine ? await engine.contextRows(id) : conversationRows(await memory.readSession(id))).filter(
          (row: any) => row.type !== "channel_receipt",
-@@ -463,18 +525,27 @@ export class Sessions {
+@@ -463,18 +526,27 @@ export class Sessions {
        const reserve = this.outputReserve(p.provider, legacy);
        const requestBudget = limit.tokens ? Math.max(1, limit.tokens - reserve) : Infinity;
        const stablePrefix = !legacy && supportsContextPrefix(p.provider);
@@ -837,7 +838,7 @@ index 754b582..c9dca87 100644
        );
        let recentTokens = tail(recent, Infinity).tokens;
        const overBudget = () => recentTokens > capacity();
-@@ -500,24 +571,62 @@ export class Sessions {
+@@ -500,24 +572,62 @@ export class Sessions {
            const inputTokens = estimateTokens(promptText(assembled()) + JSON.stringify(toolList));
            const target = limit.tokens * policy.compression_target_percent! / 100 - reserve;
            // Output is a request ceiling, not a forced diary length or a source truncation limit.
@@ -910,7 +911,7 @@ index 754b582..c9dca87 100644
            }
          }
        }
-@@ -540,6 +649,7 @@ export class Sessions {
+@@ -540,6 +650,7 @@ export class Sessions {
          after: { materials: materials(), history: recent, input: text, transient,
            history_scope: policy.history_scope, context_limit: limit.tokens, request_budget: Number.isFinite(requestBudget) ? requestBudget : null } });
        let final = "";
@@ -918,25 +919,35 @@ index 754b582..c9dca87 100644
        let measured: any = null;
        let memoryWriteRejected = false;
        const mediaSignals: AbortSignal[] = [];
-@@ -564,16 +674,41 @@ export class Sessions {
+@@ -564,16 +675,51 @@ export class Sessions {
              received_at: message.receivedAt, timezone: message.timezone });
          }
        };
 +      // 工具循环守卫（勘 2026-11-18）：轮数、同参重复、预算临近三处兜底。
 +      // 不硬抛错，只让模型换个做法或收尾——报错会整轮作废，反而更费钱。
 +      const loopGuard = Object.assign(
-+        { enabled: true, max_rounds: 30, repeat_limit: 3, warn_percent: 85 },
++        { enabled: true, max_rounds: 100, repeat_limit: 3, warn_percent: 85, max_minutes: 20 },
 +        (this.config.agent && this.config.agent.loop_guard) || {},
 +      );
 +      const seenCalls = new Map<string, number>();
 +      let budgetWarned = false;
 +      let roundsCapped = false;
++      let capReason = "";
++      const loopStartedAt = Date.now();
 +      const callKey = (name: string, args: string) => name + "\u0000" + args;
        // Completion is the model's decision; cancellation, permissions and context capacity still apply.
        for (let round = 0; ; round++) {
          turn.round = round + 1;
 -        const activeTools = memoryWriteRejected ? [] : toolList;
-+        if (loopGuard.enabled && round >= loopGuard.max_rounds) roundsCapped = true;
++        if (loopGuard.enabled && !roundsCapped) {
++          if (round >= loopGuard.max_rounds) {
++            roundsCapped = true;
++            capReason = "rounds(" + loopGuard.max_rounds + ")";
++          } else if (loopGuard.max_minutes > 0 && Date.now() - loopStartedAt > loopGuard.max_minutes * 60000) {
++            roundsCapped = true;
++            capReason = "time(" + loopGuard.max_minutes + "min)";
++          }
++        }
 +        const activeTools = memoryWriteRejected || roundsCapped ? [] : toolList;
          while (input?.hasPending()) await consumeInput();
          signal.throwIfAborted();
@@ -961,19 +972,56 @@ index 754b582..c9dca87 100644
          if (
            estimateTokens(promptText(messages) + JSON.stringify(activeTools)) >
            requestBudget
-@@ -613,8 +748,11 @@ export class Sessions {
+@@ -612,9 +758,46 @@ export class Sessions {
+         if (!reply.toolCalls.length) {
            // Seal synchronously after the last await. Unsent candidates never enter history.
            if (input && !input.tryFinish()) continue;
-           final = reply.text;
+-          final = reply.text;
+-          break;
++          // 上游省略开始包装、却把完整 invoke 块写进正文时，那其实是一个合法调用，
++          // 只是走错了通道。先试救；名字必须在本轮声明的工具里，救不了才剥。
++          // 见 core/tool-protocol.ts 的 salvageToolCallFromText 与 vllm #49117。
++          const declared = (toolList ?? [])
++            .map((t: any) => String(t?.name ?? t?.function?.name ?? ""))
++            .filter(Boolean);
++          const salvaged = salvageToolCallFromText(reply.text ?? "", declared);
++          // 救回也要过下面那道 reasoning_content 检查。若这道检查会拒（思考模式、
++          // 上游没回传 reasoning_content），就别救——否则整轮直接抛错，比只剥更糟。
++          const salvageable = salvaged &&
++            !(historyReference && typeof reply.reasoning_content !== "string");
++          if (salvaged && !salvageable)
++            logger.warn("工具协议未恢复", { session: id, tool: salvaged.name, reason: "missing_reasoning_content" });
++          if (salvaged && salvageable) {
++            logger.warn("工具协议恢复", { session: id, tool: salvaged.name, args: Object.keys(salvaged.args).length });
++            // 告诉界面层：这轮是救回来的，别把"异常"显示出去（勘 2026-11-19）。
++            onContext?.({ toolProtocolRecovered: salvaged.name });
++            reply.text = salvaged.rest;
++            reply.toolCalls = [{
++              id: "call_salvaged_" + Date.now().toString(36),
++              name: salvaged.name,
++              arguments: JSON.stringify(salvaged.args),
++            }];
++            // 不 break：落到下面按正常工具调用执行。
++            // 下面那条 reasoning_content 检查照样适用——救回不等于绕过安全检查。
++          } else {
++            // 协议标记不进历史：存进去就成了下一轮的"示范"。
++            const stored = stripToolProtocol(reply.text ?? "");
++            if (stored.broken) logger.warn("工具协议异常", { session: id, reason: "dsml_in_content_stored", shape: stored.shape });
++            // 整段正文就是一个泄漏的调用块时，剥完是空串。别让它掉进下面的
++            // 「模型未返回最终回复」——那会把一次可解释的协议故障变成聊天失败。
++            final = stored.text.trim() || !stored.broken
++              ? stored.text
++              : "（本轮上游把工具调用写成了正文，已拦下，没有执行。再发一次。）";
 +
-           break;
++            break;
++          }
          }
 +        // 上游语义：思考模式下模型没回传 reasoning_content 时默认拒绝执行工具，
 +        // 免得把不完整的协议继续下去；确需放行时在模型上开 reasoning_compatibility.fill_missing。
          if (historyReference && typeof reply.reasoning_content !== "string")
            throw Error("思考模式工具响应缺少 reasoning_content，未执行本次工具调用");
          messages.push({
-@@ -638,6 +776,8 @@ export class Sessions {
+@@ -638,6 +821,8 @@ export class Sessions {
            const toolOrigin = tools.entries?.get(call.name)?.origin;
            let result;
            superseded ||= input?.hasPending() ?? false;
@@ -982,11 +1030,11 @@ index 754b582..c9dca87 100644
            if (superseded) {
              result = { ok: false, executed: false, reason: "user_input_appended",
                result: "未执行：用户补充了消息，请结合补充内容重新判断是否仍需调用此工具。" };
-@@ -645,6 +785,20 @@ export class Sessions {
+@@ -645,6 +830,20 @@ export class Sessions {
                status: "skipped", result });
              await execution?.write("tool_skipped", { round: turn.round, tool_call_id: call.id,
                tool: turn.transient && !toolOrigin ? "[未注册工具]" : call.name, reason: "user_input_appended" });
-+          } else if (loopGuard.enabled && (() => {
++          } else if (loopGuard.enabled && tools.entries?.get(call.name)?.danger !== "safe" && (() => {
 +            const key = callKey(call.name, call.arguments);
 +            const n = (seenCalls.get(key) ?? 0) + 1;
 +            seenCalls.set(key, n);
@@ -1003,7 +1051,7 @@ index 754b582..c9dca87 100644
            } else try {
              result = await tools.call(
                call.name,
-@@ -661,6 +815,8 @@ export class Sessions {
+@@ -661,6 +860,8 @@ export class Sessions {
                tool: turn.transient && !toolOrigin ? "[未注册工具]" : call.name, error: result.result,
                ...(turn.transient ? {} : { arguments: call.arguments }) });
            }
@@ -1012,13 +1060,13 @@ index 754b582..c9dca87 100644
            if (!superseded && !result.ok && ["remember_fact", "edit_facts"].includes(call.name))
              memoryWriteRejected = true;
            await memory.appendEvent({
-@@ -695,6 +851,14 @@ export class Sessions {
+@@ -695,6 +896,14 @@ export class Sessions {
          messages.push(...attachments);
          if (attachments.length) diagnostics?.event("context.change", { operation: "append", source: "tool_attachments", after: attachments });
        }
 +      if (roundsCapped) {
-+        logger.info("循环守卫", { status: "rounds_capped", rounds: loopGuard.max_rounds, session: id });
-+        await execution?.write("loop_guard", { kind: "rounds_capped", rounds: loopGuard.max_rounds });
++        logger.info("循环守卫", { status: "rounds_capped", reason: capReason, rounds: loopGuard.max_rounds, session: id });
++        await execution?.write("loop_guard", { kind: "rounds_capped", reason: capReason, rounds: loopGuard.max_rounds });
 +      }
 +      const files = await verifiedFiles(this.root, writeReceipts);
 +      if (writeReceipts.length)
@@ -1027,7 +1075,7 @@ index 754b582..c9dca87 100644
        if (!final) throw Error("模型未返回最终回复，请重试");
        await memory.appendEvent({
          type: "message",
-@@ -704,6 +868,7 @@ export class Sessions {
+@@ -704,6 +913,7 @@ export class Sessions {
          role: "assistant",
          // User-facing conversation is primary history. Technical plugin runs retain their opt-in privacy.
          text: transient && turn.transient ? TRANSIENT_REPLY : final,
@@ -1035,7 +1083,7 @@ index 754b582..c9dca87 100644
          ...(transient && turn.transient ? { transient: true } : {}),
          ...context,
          request_usage: measured,
-@@ -716,6 +881,8 @@ export class Sessions {
+@@ -716,6 +926,8 @@ export class Sessions {
            provider: p.provider, limit: limit.tokens, signal, timezone: zone,
            rows: matchingHistory(currentRows, p.revision, policy.history_scope), policy, revision: p.revision });
        }
@@ -1044,6 +1092,188 @@ index 754b582..c9dca87 100644
        executionStatus = "completed";
        return final;
      } catch (error: any) {
+diff --git a/core/tool-protocol.ts b/core/tool-protocol.ts
+new file mode 100644
+index 0000000..20cb41d
+--- /dev/null
++++ b/core/tool-protocol.ts
+@@ -0,0 +1,176 @@
++/*! Copyright (c) 2026 iinukami and contributors.
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
++ */
++/**
++ * 工具协议标记的识别、恢复与剔除。
++ *
++ * 工具调用退化成正文时，模型把协议标记当普通文字吐出来。这些文字进了历史，
++ * 就成了下一轮请求里的"示范"，越滚越多。
++ *
++ * 判别依据是标签本身（尖括号 + 双竖线 + DSML），不是"DSML"这个词——正文里
++ * 正常讨论这个协议时不该被拦。
++ *
++ * 2026-11-19 修：原先要求 `<` 紧跟竖线，且写死全角。实测泄漏最多的形态是
++ * 闭合标签 `</｜｜DSML｜｜ parameter>`，还有半角竖线 `||`。两种都补上。
++ * 背景：vllm #48931 / #49117，长上下文时开始包装被省略，只剩孤立的 invoke 块。
++ *
++ * 2026-11-19 晚：加恢复。参照 vllm #49117 的 orphan-invoke fallback——
++ * 上游省略 `<…DSML…tool_calls>` 开始包装、却照样输出完整 invoke 块时，那其实
++ * 是一个合法的调用，只是被当正文送出来了。能救就救，救不了才剥。
++ * 救的门槛比官方更严：名字必须在本轮声明的工具里，且只认单个 invoke。
++ */
++export const PROTOCOL_NOTE = "［工具协议标记：本轮未执行］";
++
++/** 竖线：全角 U+FF5C 或半角 U+007C，凑满两个。 */
++const V = "[\\uFF5C|]{2}";
++/** 开标签、闭标签、自闭合，都从尖括号起算。 */
++const TAG = `<\\/?${V}\\s*DSML\\s*${V}`;
++/** 只有双竖线没有尖括号的形态——可能泄漏，但不剥，只记。 */
++const BARE = `${V}\\s*DSML\\s*${V}`;
++
++const HAS_TAG = new RegExp(TAG);
++const HAS_BARE = new RegExp(BARE);
++/** 整块：从任一 DSML 标签起，到 `</…calls>` 结束；未闭合的按到结尾处理。 */
++const BLOCK = new RegExp(`${TAG}[\\s\\S]*?(?:<\\/${V}\\s*DSML\\s*${V}\\s*calls>|$)`, "g");
++/** 单个完整 invoke 块（含闭合），参数体在 [2]。 */
++const INVOKE = new RegExp(
++  `<\\/?${V}\\s*DSML\\s*${V}\\s*invoke\\s+name\\s*=\\s*"([A-Za-z0-9_.-]+)"\\s*>([\\s\\S]*?)<\\/${V}\\s*DSML\\s*${V}\\s*invoke>`,
++);
++/** invoke 块左边可能还挂着一个没有配对的开始包装，一并吃掉。 */
++const LEADING_OPEN = new RegExp(
++  `<${V}\\s*DSML\\s*${V}\\s*(?:tool_calls|calls|invoke)\\s*>\\s*\\s*$`,
++);
++
++/**
++ * 有没有「真东西」——闭合标签，或者带参数的 invoke 块。
++ *
++ * 只提一句 `<…DSML…tool_calls>` 不算：正文里讨论这个协议时也会出现这种字样。
++ * 真正的泄漏一定带闭合标签（孤立 invoke 块必然以 `</…DSML…invoke>` 收尾）。
++ * 流式守卫用它决定「扣住的这段到底是坏文本还是正常讨论」。
++ */
++const EVIDENCE = new RegExp(`</${V}\\s*DSML|<${V}\\s*DSML\\s*${V}\\s*parameter`);
++export function hasLeakEvidence(text: string): boolean {
++  if (!text) return false;
++  return EVIDENCE.test(text);
++}
++
++/**
++ * 泄漏形态归类，只为日志能分辨，不参与判断。
++ * - closing：只有闭合标签（长上下文最常见）
++ * - opening：有开始包装
++ * - bare：无尖括号的双竖线
++ */
++export function protocolShape(text: string): "closing" | "opening" | "bare" | "none" {
++  if (!text) return "none";
++  // 有开始包装（<…DSML…tool_calls> 或 <…DSML…invoke>，前面不带斜杠）就算 opening
++  if (new RegExp(`<${V}\\s*DSML\\s*${V}\\s*(?:tool_calls|invoke)`).test(text)) return "opening";
++  if (new RegExp(`<\\/${V}\\s*DSML`).test(text)) return "closing";
++  if (HAS_TAG.test(text)) return "opening";
++  if (HAS_BARE.test(text)) return "bare";
++  return "none";
++}
++
++/** 粗略判定：这段文字里出现了工具协议标记。用于流式守卫，不用于存储。 */
++export function hasToolProtocol(text: string): boolean {
++  return HAS_TAG.test(text);
++}
++
++/** 第一个协议标签在文本里的位置；没有返回 -1。流式守卫用。 */
++export function findProtocolIndex(text: string): number {
++  if (!text) return -1;
++  const m = new RegExp(TAG).exec(text);
++  return m ? m.index : -1;
++}
++
++/**
++ * 泄漏块的收尾位置：闭合标签之后那一格。没有闭合返回 -1。
++ * 流式守卫用它判断"坏文本到哪结束、后面是不是正常正文"。
++ */
++export function protocolEndIndex(text: string): number {
++  if (!text) return -1;
++  let end = -1;
++  const close = new RegExp(`<\\/${V}\\s*DSML\\s*${V}\\s*(?:tool_calls|invoke)\\s*>`, "g");
++  let m: RegExpExecArray | null;
++  while ((m = close.exec(text)) !== null) end = m.index + m[0].length;
++  return end;
++}
++
++/** 整块剔除协议标记；未闭合的块按到结尾处理。 */
++export function stripToolProtocol(text: string): { text: string; broken: boolean; shape: string } {
++  if (!text || !hasToolProtocol(text)) return { text, broken: false, shape: "none" };
++  const shape = protocolShape(text);
++  const cleaned = text.replace(BLOCK, PROTOCOL_NOTE).trim();
++  return { text: cleaned || PROTOCOL_NOTE, broken: true, shape };
++}
++
++/** 把参数体里所有 `<…DSML…parameter name="k">v</…DSML…parameter>` 读成对象。 */
++function readParams(body: string): Record<string, unknown> {
++  const args: Record<string, unknown> = {};
++  const param = new RegExp(
++    `<\\/?${V}\\s*DSML\\s*${V}\\s*parameter\\s+name\\s*=\\s*"([A-Za-z0-9_.-]+)"[^>]*>([\\s\\S]*?)<\\/${V}\\s*DSML\\s*${V}\\s*parameter>`,
++    "g",
++  );
++  let p: RegExpExecArray | null;
++  while ((p = param.exec(body)) !== null) args[p[1]] = p[2].trim();
++  return args;
++}
++
++/**
++ * 完整调用块能不能救回来。
++ *
++ * 能救的条件：正文里有一整个 `…DSML…invoke name="…">…</…DSML…invoke>`，且
++ * 参数都认得出来。只认最保守的一种——单个 invoke、参数是简单文本。认不出就
++ * 返回 null，交给剥除。
++ *
++ * 注意：这里只解析，不执行。要不要真的执行一个"从正文捞出来的调用"由调用方
++ * 决定。session.ts 的写入侧会先过 salvageToolCallFromText 的白名单版本。
++ */
++export function salvageToolCall(text: string): { name: string; args: Record<string, unknown> } | null {
++  if (!text) return null;
++  const m = INVOKE.exec(text);
++  if (!m) return null;
++  return { name: m[1], args: readParams(m[2]) };
++}
++
++/**
++ * 带白名单的救援：名字必须在本轮声明的工具里，才认。
++ *
++ * 这是参照 vllm #49117 的 orphan-invoke fallback，但刻意更严：
++ * - allowed 为空或缺省时一律不救（宁可不执行，也不凭空造一个调用）
++ * - 只认单个 invoke 块；两个以上视为可疑，不救
++ * - 返回值里的 rest 是**剥掉该块之后**的正文，供调用方存历史
++ *
++ * 返回 null 表示"救不了"，调用方应走 stripToolProtocol。
++ */
++export function salvageToolCallFromText(
++  text: string,
++  allowed?: readonly string[],
++): { name: string; args: Record<string, unknown>; rest: string; start: number; end: number } | null {
++  if (!text || !allowed || !allowed.length) return null;
++  const m = INVOKE.exec(text);
++  if (!m) return null;
++  // 两个 invoke 块 → 不救。正常单轮单调用是我们能保证的形态，多个说明情况不明。
++  const second = INVOKE.exec(text.slice(m.index + m[0].length));
++  if (second) return null;
++  if (!allowed.includes(m[1])) return null;
++
++  let start = m.index;
++  // 左边若还挂着一个孤立的开始包装，一起吃掉，免得留在正文里。
++  const before = text.slice(0, start);
++  const open = LEADING_OPEN.exec(before);
++  if (open) start = open.index;
++
++  // 右边常常还挂着闭合包装（</…DSML…tool_calls>、可能连挂几层），一并吃掉，别留在正文里。
++  let after = text.slice(m.index + m[0].length);
++  const closer = new RegExp(`^\\s*</${V}\\s*DSML\\s*${V}\\s*(?:tool_calls|calls|invoke)\\s*>`);
++  for (let n = 0; n < 4 && closer.test(after); n += 1) after = after.replace(closer, "");
++  const rest = (text.slice(0, start) + after).trim();
++  return {
++    name: m[1],
++    args: readParams(m[2]),
++    rest,
++    start,
++    end: m.index + m[0].length,
++  };
++}
 diff --git a/core/tools.ts b/core/tools.ts
 index a434c0b..866aeb3 100644
 --- a/core/tools.ts
@@ -1365,10 +1595,10 @@ index 0000000..df37097
 +  return () => disposers.forEach(dispose => dispose());
 +}
 diff --git a/core/web.ts b/core/web.ts
-index 1d8286d..69d9559 100644
+index 1d8286d..5bb4d63 100644
 --- a/core/web.ts
 +++ b/core/web.ts
-@@ -3,22 +3,66 @@
+@@ -3,22 +3,189 @@
   * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
   */
  import { createServer } from "node:http";
@@ -1386,6 +1616,129 @@ index 1d8286d..69d9559 100644
 +import { toolContentSnapshot } from "./tool-content.ts";
  import { PluginWebRegistry } from "./plugin-web.ts";
 +import { TurnInput } from "./turn-input.ts";
++import { findProtocolIndex, hasLeakEvidence, protocolEndIndex, protocolShape } from "./tool-protocol.ts";
++
++/**
++ * 流式正文守卫。
++ * 工具调用退化成正文时，会带出工具协议标记（DSML 一类）。这类文本发到界面
++ * 会被当成普通回复，用户分不清是坏了还是在说话。这里拦下来并明说。
++ * 标记可能跨 chunk，所以尾部留 64 字节做哨兵，其余即时放行。
++ */
++/**
++ * 流式正文守卫（2026-11-19 改：先扣住，等回合结束再定）。
++ *
++ * 旧版一见到协议标记就立刻往界面发「工具协议异常」。可是 session 层随后可能
++ * 把这段完整 invoke 块救回来、真的执行——于是用户同时看到「异常」和「工具跑了」，
++ * 自相矛盾。
++ *
++ * 新版：标记一出现就把后面扣住不发（那段本来就是坏文本，不显示更好），
++ * 等调用方 settle() 告知结果，再决定显示什么：
++ *   recovered → 一句轻提示「已恢复执行」
++ *   broken    → 明确说这轮的工具调用没执行
++ * 泄漏块一旦闭合，后面的正文恢复放行，最终回复照常流式出来。
++ */
++export function guardStream(send: (value: any) => void) {
++  const keep = 64;
++  let tail = "";
++  // 扣住的泄漏段；闭合之后清空，后续正文照常放行。
++  let held = "";
++  let holding = false;
++  let captured = "";
++  let leaked = false;
++  let outcome: "unknown" | "recovered" | "broken" = "unknown";
++
++  const drainHeld = (final: boolean) => {
++    if (!holding) return;
++    // 泄漏块闭合点：closing 标签之后就是正文了。未闭合就一直扣到最后。
++    const end = protocolEndIndex(held);
++    if (end < 0) {
++      if (!final) return;
++      holding = false;
++      // 没有闭合也没证据：这就是正常讨论里提到了标记，原样放出去。
++      if (!leaked && held) send({ type: "chunk", text: held });
++      held = "";
++      return;
++    }
++    holding = false;
++    const rest = held.slice(end);
++    held = "";
++    if (!rest) return;
++    if (final) {
++      send({ type: "chunk", text: rest });
++      return;
++    }
++    // 回到正常模式，尾部留哨兵
++    if (rest.length > keep) {
++      send({ type: "chunk", text: rest.slice(0, rest.length - keep) });
++      tail = rest.slice(rest.length - keep);
++    } else tail = rest;
++  };
++
++  return {
++    get broken() {
++      return leaked && outcome !== "recovered";
++    },
++    /** 命中的原文片段，只给日志认形态用。 */
++    get captured() {
++      return captured;
++    },
++    get outcome() {
++      return leaked ? outcome : "clean";
++    },
++    /** 调用方在拿到回合结果后告知：救回来了还是没救回来。 */
++    settle(value: { recovered?: string | null }) {
++      if (!leaked) return;
++      outcome = value && value.recovered ? "recovered" : "broken";
++    },
++    push(text: string) {
++      if (holding) {
++        held += text;
++        if (!leaked && hasLeakEvidence(held)) leaked = true;
++        if (captured.length < 200) captured = held.slice(0, 200);
++        drainHeld(false);
++        return;
++      }
++      const joint = tail + text;
++      const at = findProtocolIndex(joint);
++      if (at >= 0) {
++        const head = joint.slice(0, at);
++        if (head) send({ type: "chunk", text: head });
++        holding = true;
++        held = joint.slice(at);
++        // 只是提到标记不算，看到闭合标签或带参数的 invoke 才认定是泄漏。
++        leaked = hasLeakEvidence(held);
++        tail = "";
++        captured = held.slice(0, 200);
++        drainHeld(false);
++        return;
++      }
++      if (joint.length > keep) {
++        send({ type: "chunk", text: joint.slice(0, joint.length - keep) });
++        tail = joint.slice(joint.length - keep);
++      } else {
++        tail = joint;
++      }
++    },
++    flush() {
++      // 没 settle 就收尾 → 按没救回来处理，并扣住残余。
++      if (leaked && outcome === "unknown") outcome = "broken";
++      drainHeld(true);
++      if (!holding && tail) send({ type: "chunk", text: tail });
++      tail = "";
++      held = "";
++      if (leaked) {
++        send({
++          type: "chunk",
++          text:
++            outcome === "recovered"
++              ? "\n\n（本轮有一次工具调用混进了正文，已按调用恢复执行。）\n"
++              : "\n\n[工具协议异常] 这一轮的工具调用没有真正执行，上面的内容不可信。请重发指令，或换个会话再试。\n",
++        });
++      }
++    },
++  };
++}
++
  export async function startWeb(config: any, services: any, runtime: any) {
    const { logger, memory, sessions } = services;
 +  // 账本只读 memory/sessions 里的 request_usage，不改任何东西。
@@ -1437,7 +1790,7 @@ index 1d8286d..69d9559 100644
    const register = (method: string, path: string, handler: any) => routes.register("", lifetime.signal, method, path, handler);
    let origin = `http://${host}:${port}`;
    const assets = new Set([
-@@ -100,7 +144,7 @@ export async function startWeb(config: any, services: any, runtime: any) {
+@@ -100,7 +267,7 @@ export async function startWeb(config: any, services: any, runtime: any) {
            "Cache-Control": "no-store",
            "X-Frame-Options": "DENY",
            "Content-Security-Policy":
@@ -1446,7 +1799,7 @@ index 1d8286d..69d9559 100644
          });
          res.end(await readFile(new URL("./ui/index.html", import.meta.url)));
          return;
-@@ -345,7 +389,24 @@ export async function startWeb(config: any, services: any, runtime: any) {
+@@ -345,7 +512,24 @@ export async function startWeb(config: any, services: any, runtime: any) {
        if (req.method === "GET" && req.url?.startsWith("/api/session?")) {
          const id = new URL(req.url, origin).searchParams.get("id");
          if (!id) return send(400, { error: "请提供会话 ID" });
@@ -1472,7 +1825,7 @@ index 1d8286d..69d9559 100644
        }
        if (req.method === "GET" && req.url === "/api/status")
          return send(200, {
-@@ -365,6 +426,90 @@ export async function startWeb(config: any, services: any, runtime: any) {
+@@ -365,6 +549,90 @@ export async function startWeb(config: any, services: any, runtime: any) {
            pluginPages: routes.pages(),
            diagnostics: services.diagnostics?.status(),
          });
@@ -1563,7 +1916,7 @@ index 1d8286d..69d9559 100644
        if (req.method === "GET" && req.url === "/api/logs")
          return send(200, logger.lines);
        if (req.method === "POST" && req.url === "/api/plugin") {
-@@ -388,7 +533,7 @@ export async function startWeb(config: any, services: any, runtime: any) {
+@@ -388,7 +656,7 @@ export async function startWeb(config: any, services: any, runtime: any) {
        else res.end();
      }
    });
@@ -1572,7 +1925,7 @@ index 1d8286d..69d9559 100644
    server.on("upgrade", (req, socket, head) => {
      if (
        !allowedOrigin(req) ||
-@@ -421,23 +566,62 @@ export async function startWeb(config: any, services: any, runtime: any) {
+@@ -421,24 +689,77 @@ export async function startWeb(config: any, services: any, runtime: any) {
      }
      let busy = false;
      ws.on("message", async (raw) => {
@@ -1614,6 +1967,7 @@ index 1d8286d..69d9559 100644
 -          (context: any) => send({ type: "context", ...context }),
 -          typeof data.persona === "string" ? data.persona : undefined,
 -        );
+-        send({ type: "done" });
 +        const images = await saveUploads(data.session, data.images);
 +        const typed = String(data.text ?? "");
 +        const marked = images.length
@@ -1626,23 +1980,38 @@ index 1d8286d..69d9559 100644
 +          timezone: timezone(config.timezone),
 +        }, lifetime.signal);
 +        webInboxes.set(String(data.session), inbox);
++        const guard = guardStream(send);
++        // 本轮若把混进正文的调用救回来了，session 会通过 context 告诉我们，
++        // 守卫据此决定收尾显示「已恢复执行」还是「异常未执行」。
++        let recovered: string | null = null;
 +        try {
 +          await channels.web(
 +            data.session,
 +            marked,
-+            (text: string) => send({ type: "chunk", text }),
-+            (context: any) => send({ type: "context", ...context }),
++            (text: string) => guard.push(text),
++            (context: any) => {
++              if (context?.toolProtocolRecovered)
++                recovered = String(context.toolProtocolRecovered);
++              send({ type: "context", ...context });
++            },
 +            typeof data.persona === "string" ? data.persona : undefined,
 +            images.map((image) => ({ mimeType: image.mimeType, data: image.data })),
 +            inbox,
 +          );
 +        } finally {
++          guard.settle({ recovered });
++          guard.flush();
 +          inbox.closeInput();
 +          if (webInboxes.get(String(data.session)) === inbox) webInboxes.delete(String(data.session));
 +        }
-         send({ type: "done" });
++        if (guard.outcome === "recovered")
++          logger.warn("工具协议恢复", { session: data.session, tool: recovered, shape: protocolShape(guard.captured) });
++        else if (guard.broken)
++          logger.warn("工具协议异常", { session: data.session, reason: "dsml_in_content", shape: protocolShape(guard.captured) });
++        send({ type: "done", protocolBroken: guard.broken, protocol: guard.outcome });
        } catch (error: any) {
          logger.error("聊天失败", { error });
+         send({
 diff --git a/tests/console.test.ts b/tests/console.test.ts
 index 82097ed..2f875e6 100644
 --- a/tests/console.test.ts
@@ -1879,3 +2248,71 @@ index 6b09d51..a36826a 100644
    assert.doesNotMatch(renderContextPanel(app), /400 \/ 200|仅供查看/);
    const compact = renderContextMeter(app.state.memoryContext, true);
    assert.match(compact, /chat-context-compact/);
+diff --git a/tests/tool-protocol.test.ts b/tests/tool-protocol.test.ts
+new file mode 100644
+index 0000000..1e75a96
+--- /dev/null
++++ b/tests/tool-protocol.test.ts
+@@ -0,0 +1,62 @@
++/*! Copyright (c) 2026 iinukami and contributors.
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
++ */
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { hasToolProtocol, stripToolProtocol, PROTOCOL_NOTE } from "../core/tool-protocol.ts";
++import { renderHistory } from "../core/provenance.ts";
++
++const BAR = "\uFF5C";
++const open = (tag: string) => `<${BAR}${BAR}DSML${BAR}${BAR} ${tag}>`;
++const close = (tag: string) => `</${BAR}${BAR}DSML${BAR}${BAR} ${tag}>`;
++const block = [
++  open("calls"),
++  open('invoke name="hands_write"'),
++  open('parameter name="path" string="true"') + "tmp/a.md" + close("parameter"),
++  close("invoke"),
++  close("calls"),
++].join("\n");
++
++test("整块协议标记被换成一句说明", () => {
++  const { text, broken } = stripToolProtocol("好的，我来写。\n" + block);
++  assert.equal(broken, true);
++  assert.ok(text.startsWith("好的，我来写。"));
++  assert.ok(text.includes(PROTOCOL_NOTE));
++  assert.ok(!text.includes("hands_write"));
++});
++
++test("未闭合的块按到结尾处理", () => {
++  const { text, broken } = stripToolProtocol("前言\n" + open("calls") + "\n 半截");
++  assert.equal(broken, true);
++  assert.equal(text, "前言\n" + PROTOCOL_NOTE);
++});
++
++test("正文提到这个协议名不算，原样保留", () => {
++  const body = "DSML 是 DeepSeek 的工具调用标记，这段只是讨论。";
++  assert.equal(hasToolProtocol(body), false);
++  assert.deepEqual(stripToolProtocol(body), { text: body, broken: false, shape: "none" });
++});
++
++test("空串与普通回复不受影响", () => {
++  assert.deepEqual(stripToolProtocol(""), { text: "", broken: false, shape: "none" });
++  assert.deepEqual(stripToolProtocol("今天没什么事。"), { text: "今天没什么事。", broken: false, shape: "none" });
++});
++
++test("只有标记时给出说明，不留空", () => {
++  const { text, broken } = stripToolProtocol(block);
++  assert.equal(broken, true);
++  assert.equal(text, PROTOCOL_NOTE);
++});
++
++test("历史里只清洗助手发言，工具结果和用户原文不动", () => {
++  const messages = renderHistory([
++    { role: "user", content: "把这段贴过来：\n" + block },
++    { role: "assistant", content: "我读了。\n" + block },
++    { role: "tool", content: JSON.stringify({ ok: true, result: block }) },
++  ]);
++  assert.ok(messages[0].content.includes("hands_write"), "用户原文不该被改");
++  assert.ok(!messages[1].content.includes("hands_write"), "助手发言里的标记要剔除");
++  assert.ok(messages[1].content.includes(PROTOCOL_NOTE));
++  assert.ok(messages[2].content.includes("hands_write"), "工具结果不该被改");
++});
