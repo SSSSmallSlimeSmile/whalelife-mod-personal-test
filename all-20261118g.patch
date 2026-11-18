@@ -22,6 +22,54 @@ index 07b8678..40694e8 100644
 +chrome_err.txt
 +tests/*.live.out.txt
 +cdp_dump*.ps1
+diff --git a/config.example.json b/config.example.json
+index c206df8..49f84f6 100644
+--- a/config.example.json
++++ b/config.example.json
+@@ -6,6 +6,7 @@
+   "models": [],
+   "model_bindings": {
+     "chat": null,
++    "diary": null,
+     "embedding": null,
+     "rerank": null,
+     "image": null,
+@@ -16,7 +17,6 @@
+     "whale": {
+       "name": "鲸鲸",
+       "file": "memory/personas/whale.md",
+-      "model": null,
+       "permission": "ask"
+     }
+   },
+@@ -24,9 +24,26 @@
+   "memory": {
+     "root": "memory",
+     "history_enabled": true,
+-    "diary_enabled": false,
++    "history_scope": "persona",
++    "context_mode": "diary",
++    "diary_enabled": true,
+     "compression_trigger_percent": 80,
+     "compression_target_percent": 50,
+     "facts_max_lines": 100
++  },
++  "model_router": {
++    "enabled": false,
++    "judge_model": null,
++    "pools": { "fast": null, "mid": null, "high": null },
++    "high_ratio": 20,
++    "fallback_decision": "MID",
++    "simple_max_chars": 20,
++    "rule_prejudge": true,
++    "skip_judge_after_fast": true,
++    "carry_seconds": 600,
++    "carry_max_chars": 24,
++    "cache_ttl_seconds": 600,
++    "cache_max_entries": 500,
++    "judge_timeout_ms": 4000
+   }
+ }
 diff --git a/core/channels.ts b/core/channels.ts
 index 1abf4ef..e980a85 100644
 --- a/core/channels.ts
@@ -150,7 +198,7 @@ index 547be49..d5ac3d9 100644
              ? { max_tokens: opts.max_tokens }
              : {}),
 diff --git a/core/memory-engine.ts b/core/memory-engine.ts
-index 03614a2..86bfc29 100644
+index 03614a2..bfee965 100644
 --- a/core/memory-engine.ts
 +++ b/core/memory-engine.ts
 @@ -253,7 +253,7 @@ export class MemoryEngine {
@@ -162,8 +210,23 @@ index 03614a2..86bfc29 100644
      } catch (e: any) {
        if (e.code === "ENOENT") return fallback;
        throw e;
+@@ -899,6 +899,14 @@ export class MemoryEngine {
+     this.memoryReservations.set(ticket.id, { sessionId: id, ticket });
+     return ticket;
+   }
++  /** 每日记忆请求预算的剩余量；日记归档必须按它来挑段落，否则永远挑不到能过账的一批。 */
++  async memoryRequestBudget(id: string): Promise<{ budget: number; reserved: number; remaining: number }> {
++    const s = await this.state(id);
++    const day = new Date().toISOString().slice(0, 10);
++    const budget = s.settings.daily_memory_tokens ?? 20000;
++    const reserved = s.daily?.day === day ? Math.max(0, s.daily.reserved ?? 0) : 0;
++    return { budget, reserved, remaining: Math.max(0, budget - reserved) };
++  }
+   async settleMemoryRequest(id: string, ticket: MemoryReservation, usage?: any, options: { notSent?: boolean } = {}): Promise<void> {
+     const entry = this.memoryReservations.get(ticket.id);
+     if (!entry) return; // Settled, foreign, or from a prior process: never refund again.
 diff --git a/core/model-config.ts b/core/model-config.ts
-index 1047ebf..347aa1c 100644
+index 1047ebf..0eafce2 100644
 --- a/core/model-config.ts
 +++ b/core/model-config.ts
 @@ -5,6 +5,7 @@
@@ -174,12 +237,22 @@ index 1047ebf..347aa1c 100644
  import { readFileSync } from "node:fs";
  import { readFile, writeFile, rename, unlink, mkdir } from "node:fs/promises";
  import { join, resolve, dirname } from "node:path";
-@@ -34,6 +35,14 @@ export const MODEL_ROLES = [
+@@ -27,6 +28,7 @@ export const MODEL_TYPES = [
+ export type ModelType = (typeof MODEL_TYPES)[number];
+ export const MODEL_ROLES = [
+   "chat",
++  "diary",
+   "embedding",
+   "rerank",
+   "image",
+@@ -34,6 +36,16 @@ export const MODEL_ROLES = [
    "tts",
  ] as const;
  type ModelRole = (typeof MODEL_ROLES)[number];
++/** 用途到模型类型：日记整理借用对话模型，但可单独绑定。 */
 +export const MODEL_ROLE_TYPES: Record<ModelRole, ModelType> = {
 +  chat: "chat",
++  diary: "chat",
 +  embedding: "embedding",
 +  rerank: "rerank",
 +  image: "image",
@@ -189,7 +262,37 @@ index 1047ebf..347aa1c 100644
  export interface ProviderConfig {
    id: string;
    name: string;
-@@ -496,7 +505,7 @@ export class ModelConfig {
+@@ -292,9 +304,9 @@ export function modelConfigurationError(
+   }
+   if (
+     (host === "deepseek.com" || host.endsWith(".deepseek.com")) &&
+-    model.type !== "chat"
++    model.type === "embedding"
+   )
+-    return "DeepSeek 官方接口仅支持对话模型，不能作为 Embedding 等模型的服务；请选择对应的提供商";
++    return "DeepSeek 官方接口不提供 Embedding，不能作为 Embedding 模型的服务商；对话与语音合成可以";
+   if (provider.protocol === "dashscope" && model.type !== "embedding")
+     return "DashScope 原生协议当前仅支持 Embedding；对话模型请使用 OpenAI 兼容协议";
+   return null;
+@@ -387,6 +399,17 @@ function normalize(config: any) {
+   };
+ }
+ 
++/** 日记整理专用模型；未绑定则返回 null，由调用方回落到对话模型。 */
++export function resolveDiaryModel(config: any) {
++  const selected = config?.model_bindings?.diary;
++  if (!selected) return null;
++  try {
++    return resolveModel(config, selected);
++  } catch {
++    return null;
++  }
++}
++
+ export function resolveChatModel(
+   config: any,
+   personaId?: string,
+@@ -496,7 +519,7 @@ export class ModelConfig {
        providers: this.source.providers.map(
          ({ api_key, ...p }: ProviderConfig) => ({
            ...p,
@@ -198,7 +301,7 @@ index 1047ebf..347aa1c 100644
          }),
        ),
        models: this.source.models.map((m: ModelDefinition) => ({
-@@ -544,7 +553,7 @@ export class ModelConfig {
+@@ -544,7 +567,7 @@ export class ModelConfig {
      return structuredClone({
        id: model.id, name: model.name, model: model.model, type: model.type,
        provider_id: provider.id, provider_name: provider.name, protocol: provider.protocol,
@@ -207,7 +310,7 @@ index 1047ebf..347aa1c 100644
        timeout_seconds: provider.timeout_seconds, proxy_url: provider.proxy_url,
        parameters: model.parameters, dimensions: model.dimensions,
        context_window: model.context_window ?? null,
-@@ -739,7 +748,7 @@ export class ModelConfig {
+@@ -739,7 +762,7 @@ export class ModelConfig {
        selected: unknown,
        type: ModelType,
      ): string | null => {
@@ -216,7 +319,7 @@ index 1047ebf..347aa1c 100644
        if (typeof selected !== "string")
          throw new ModelConfigError("每项模型用途需明确选择模型或留空");
        const model = models.find((m) => m.id === selected);
-@@ -760,7 +769,7 @@ export class ModelConfig {
+@@ -760,7 +783,7 @@ export class ModelConfig {
      const bindings = Object.fromEntries(
        MODEL_ROLES.map((role) => [
          role,
@@ -556,10 +659,10 @@ index 0000000..0aad606
 +  return loaded;
 +}
 diff --git a/core/session.ts b/core/session.ts
-index 754b582..3bcf3bf 100644
+index 754b582..c9dca87 100644
 --- a/core/session.ts
 +++ b/core/session.ts
-@@ -15,7 +15,12 @@ import { shortSummaryKey, shortContext, compressShort, consolidateLong, shouldDe
+@@ -15,8 +15,14 @@ import { shortSummaryKey, shortContext, compressShort, consolidateLong, shouldDe
  import { attribution, historyTail, originNote, originOf, renderHistory } from "./provenance.ts";
  import { SessionQueue, type QueuePolicy } from "./session-queue.ts";
  import { TRANSIENT_REPLY, type ToolTurn } from "./tool-retention.ts";
@@ -570,17 +673,23 @@ index 754b582..3bcf3bf 100644
 +/** 本轮图片总量上下限：超过 soft 降 detail，超过 total 直接拒（勘 2026-11-16）。 */
 +const IMAGE_LIMITS = Object.freeze({ softBytes: 8 * 1024 * 1024, totalBytes: 16 * 1024 * 1024 });
  import { resolveModelContext } from "./model-context.ts";
++import { resolveDiaryModel } from "./model-config.ts";
  import { diaryContext, diaryRequestPlan, writeDiary } from "./memory-diary.ts";
  import { contextFrame, diaryPrefix, fittingDiaryPrefix, historyEntry, recalledMaterial, supportsContextPrefix } from "./context-material.ts";
-@@ -26,6 +31,7 @@ import {
+ import {
+@@ -26,6 +32,11 @@ import {
    requestUsage,
    memoryWindow,
  } from "./session-context.ts";
++// 日记整理时，原文 token 相对输出上限的最大倍数；超过它压缩比就不现实。
++const DIARY_SOURCE_RATIO = 3;
++// 预算扣掉固定开销后装不下这个规模的原文时，压缩比不现实：不请求模型，等预算归零。
++const MIN_DIARY_SOURCE_TOKENS = 4000;
 +
  export class Sessions {
    memoryMaintenance = false;
    blockedSessions = new Set<string>();
-@@ -114,12 +120,25 @@ export class Sessions {
+@@ -114,12 +125,25 @@ export class Sessions {
      const history = matchingHistory(rows, p.revision, policy.history_scope);
      const last = rows.findLast((row: any) => row.role === "assistant" && !row.delivery_id);
      const usage = last?.request_usage;
@@ -608,7 +717,7 @@ index 754b582..3bcf3bf 100644
      const legacy = policy.memory_mode === "legacy";
      const window = legacy ? memoryWindow(history, policy)
        : { short: history.filter((row: any) => row.type === "message"), long: [] };
-@@ -191,9 +210,9 @@ export class Sessions {
+@@ -191,9 +215,9 @@ export class Sessions {
        usage: matches
          ? {
              ...usage,
@@ -621,7 +730,7 @@ index 754b582..3bcf3bf 100644
                : null,
              settings_changed:
                JSON.stringify(last.context_policy) !== JSON.stringify(policy) ||
-@@ -248,9 +267,11 @@ export class Sessions {
+@@ -248,9 +272,11 @@ export class Sessions {
      route?: ChannelRoute,
      transient = false,
      queue?: QueuePolicy,
@@ -634,7 +743,7 @@ index 754b582..3bcf3bf 100644
    }
    /** Capture arrival metadata before any asynchronous routing or queue wait. */
    async outgoingIdentity(id: string, route: ChannelRoute) {
-@@ -291,6 +312,7 @@ export class Sessions {
+@@ -291,6 +317,7 @@ export class Sessions {
      transient = false,
      turn: ToolTurn = { transient: false },
      input?: TurnInput,
@@ -642,7 +751,7 @@ index 754b582..3bcf3bf 100644
    ) {
      signal.throwIfAborted();
      if (this.memoryMaintenance) throw Error("记忆恢复中，请稍后重试");
-@@ -302,6 +324,10 @@ export class Sessions {
+@@ -302,6 +329,10 @@ export class Sessions {
      if (this.memoryMaintenance || this.blockedSessions.has(id))
        throw Error("会话维护中，请稍后重试");
      if (!text.trim() || text.length > 16000) throw Error("请输入 1–16000 字");
@@ -653,7 +762,27 @@ index 754b582..3bcf3bf 100644
      const receivedAt = route?.receivedAt ?? new Date().toISOString(), zone = route?.timezone ?? timezone(this.config.timezone);
      const { memory, memoryEngine: engine, llm, tools, logger } = this.services;
      const execution = await this.services.executionArchive?.start(id, {
-@@ -356,6 +382,24 @@ export class Sessions {
+@@ -328,6 +359,19 @@ export class Sessions {
+       signal.throwIfAborted();
+       const p = await persona(this.root, this.config, channel.persona);
+       this.identities.set(id, { persona_id: p.id, persona_name: p.name, persona_revision: p.revision, timezone: zone });
++      const routed = transient
++        ? null
++        : await this.services.modelRouter?.route({ text, sessionId: id, fallbackProvider: p.provider });
++      if (routed?.provider) {
++        p.provider = routed.provider;
++        await execution?.write("route", {
++          decision: routed.decision,
++          source: routed.source,
++          pool: routed.pool,
++          model: routed.model,
++          ...(routed.reason ? { reason: routed.reason } : {}),
++        });
++      }
+       await execution?.write("context", { persona: p.id, provider: p.provider.id, model: p.provider.model });
+       if (expectedPersona && expectedPersona !== p.id)
+         throw Error("当前人格已在其他窗口切换，请刷新后重试");
+@@ -356,6 +400,24 @@ export class Sessions {
          personaId: p.id,
          permission: channel.permission ?? p.permission,
          signal,
@@ -678,7 +807,7 @@ index 754b582..3bcf3bf 100644
        };
        const storedHistory = (engine ? await engine.contextRows(id) : conversationRows(await memory.readSession(id))).filter(
          (row: any) => row.type !== "channel_receipt",
-@@ -463,18 +507,27 @@ export class Sessions {
+@@ -463,18 +525,27 @@ export class Sessions {
        const reserve = this.outputReserve(p.provider, legacy);
        const requestBudget = limit.tokens ? Math.max(1, limit.tokens - reserve) : Infinity;
        const stablePrefix = !legacy && supportsContextPrefix(p.provider);
@@ -708,7 +837,80 @@ index 754b582..3bcf3bf 100644
        );
        let recentTokens = tail(recent, Infinity).tokens;
        const overBudget = () => recentTokens > capacity();
-@@ -540,6 +593,7 @@ export class Sessions {
+@@ -500,24 +571,62 @@ export class Sessions {
+           const inputTokens = estimateTokens(promptText(assembled()) + JSON.stringify(toolList));
+           const target = limit.tokens * policy.compression_target_percent! / 100 - reserve;
+           // Output is a request ceiling, not a forced diary length or a source truncation limit.
+-          const outputTokens = Math.max(256, Math.min(8192, Math.floor(requestBudget * 0.1)));
++          // 输出上限可配：写日记比对话更需要长输出，8192 在长会话里必然被 finish_reason=length 截断。
++          const outputCeiling = Math.max(256, Math.min(65536, Number(this.config.memory?.diary_max_output_tokens) || 8192));
++          const outputTokens = Math.max(256, Math.min(outputCeiling, Math.floor(requestBudget * 0.1)));
++          // 日记整理可单独绑定模型；触发阈值仍按对话模型容量算。
++          const diaryModel = resolveDiaryModel(this.config);
++          const diaryProvider = diaryModel?.provider ?? p.provider;
++          const diaryLimit = (diaryModel ? (await this.modelLimit(diaryProvider, signal)).tokens : null) ?? limit.tokens;
+           const cost = (rows: any[]) => estimateTokens(JSON.stringify(renderHistory(rows.map(historyEntry), zone, historyReference)));
+-          const desired = diaryPrefix(diary.remaining, inputTokens - target + outputTokens, cost);
+-          const selected = fittingDiaryPrefix(desired, rows => diaryRequestPlan({ rows, scope, timezone: zone,
+-            outputTokens }).reserved <= limit.tokens!);
++          // 原文上限：一次整理的原文规模不得超过输出上限的若干倍，否则必然被 finish_reason=length 截断。
++          const sourceCeiling = outputTokens * DIARY_SOURCE_RATIO;
++          const desired = diaryPrefix(diary.remaining, Math.min(inputTokens - target + outputTokens, sourceCeiling), cost);
++          // 预订额度由记忆引擎按「每日记忆预算」卡住；只看模型上下文会挑出一批永远过不了账的段落。
++          const memoryBudget = await engine.memoryRequestBudget(id);
++          const fits = (rows: any[]) => {
++            const reserved = diaryRequestPlan({ rows, scope, timezone: zone, outputTokens }).reserved;
++            return reserved <= diaryLimit! && reserved <= memoryBudget.remaining;
++          };
++          const selected = memoryBudget.remaining > 0 ? fittingDiaryPrefix(desired, fits) : [];
++          const selectedCost = selected.length ? cost(selected) : 0;
+           if (diary.paused) memoryNotice = "日记整理已暂停：" + diary.paused.reason;
++          else if (memoryBudget.remaining <= 0) {
++            memoryNotice = "今日记忆整理预算已用完（" + memoryBudget.reserved + "/" + memoryBudget.budget + "）；明天继续，或提高每日记忆预算。";
++            logger.info("日记整理", { status: "skipped", reason: "memory_budget_exhausted", remaining: diary.remaining.length, budget: diaryLimit, memory_remaining: memoryBudget.remaining });
++          }
+           else if (estimateTokens(promptText(assembled([])) + JSON.stringify(toolList)) >= target)
+             memoryNotice = "已有日记和固定内容已接近压后目标；不会再次压缩旧日记，请提高目标比例或封存后新建会话。";
+-          else if (!selected.length) memoryNotice = "没有可在模型容量内归档的完整旧对话；请更换更大容量模型或封存后新建会话。";
++          else if (!selected.length) {
++            memoryNotice = "没有可归档的完整旧对话：模型容量或今日记忆预算不足（剩余 " + memoryBudget.remaining + " token）；请提高每日记忆预算、更换更大容量模型，或封存后新建会话。";
++            logger.info("日记整理", { status: "skipped", reason: "no_fitting_prefix", remaining: diary.remaining.length, budget: diaryLimit, memory_remaining: memoryBudget.remaining });
++          }
++          else if (selectedCost < MIN_DIARY_SOURCE_TOKENS && selected.length < desired.length) {
++            memoryNotice = "今日记忆整理预算不足以整理出有效压缩比（可归档 " + selected.length + " 条）；等预算归零后再整理。";
++            logger.info("日记整理", { status: "skipped", reason: "budget_too_small", sources: selected.length, cost: selectedCost, memory_remaining: memoryBudget.remaining, remaining: diary.remaining.length, budget: diaryLimit });
++          }
+           else {
+-            const result = await writeDiary({ services: this.services, id, scope, rows: selected,
+-              provider: p.provider, limit: limit.tokens, outputTokens, signal, timezone: zone });
+-            memoryNotice = result.reason;
++            // 输出撞上 max_completion_tokens 只说明这一批原文超出了模型一次能写完的量：
++            // 把原文减半再试，比把整个会话的日记停到人工解封更合适。最多三轮，避免反复花钱。
++            let attempt = selected;
++            let result: any = null;
++            for (let round = 0; ; round += 1) {
++              result = await writeDiary({ services: this.services, id, scope, rows: attempt,
++                provider: diaryProvider, limit: diaryLimit, outputTokens, signal, timezone: zone });
++              if (result.status === "written" || round >= 2) break;
++              if (!String(result.reason ?? "").includes("截断")) break;
++              const half = attempt.slice(0, Math.floor(attempt.length / 2));
++              if (!half.length || cost(half) < MIN_DIARY_SOURCE_TOKENS) break;
++              await engine.retryDiary(id, scope); // 上一轮失败写了暂停标记；不清掉，下一次调用会直接返回 paused
++              attempt = half;
++            }
++            memoryNotice = result?.reason;
+             diary = await diaryContext(engine, id, scope, shortRows);
+             recent = diary.remaining.map(historyEntry);
+-            if (result.status === "written" && estimateTokens(promptText(assembled()) + JSON.stringify(toolList)) > target)
++            if (result?.status === "written" && estimateTokens(promptText(assembled()) + JSON.stringify(toolList)) > target)
+               memoryNotice = "日记已保存；为保留信息，本次尚未降到目标占用，不会立即追加压缩请求。";
+-            await execution?.write("memory_diary", { status: result.status, sources: selected.length, reason: result.reason });
++            await execution?.write("memory_diary", { status: result?.status, sources: attempt.length, reason: result?.reason });
++            logger.info("日记整理", { status: result?.status, sources: attempt.length, reason: result?.reason, remaining: diary.remaining.length, budget: diaryLimit });
+           }
+         }
+       }
+@@ -540,6 +649,7 @@ export class Sessions {
          after: { materials: materials(), history: recent, input: text, transient,
            history_scope: policy.history_scope, context_limit: limit.tokens, request_budget: Number.isFinite(requestBudget) ? requestBudget : null } });
        let final = "";
@@ -716,35 +918,25 @@ index 754b582..3bcf3bf 100644
        let measured: any = null;
        let memoryWriteRejected = false;
        const mediaSignals: AbortSignal[] = [];
-@@ -564,16 +618,51 @@ export class Sessions {
+@@ -564,16 +674,41 @@ export class Sessions {
              received_at: message.receivedAt, timezone: message.timezone });
          }
        };
 +      // 工具循环守卫（勘 2026-11-18）：轮数、同参重复、预算临近三处兜底。
 +      // 不硬抛错，只让模型换个做法或收尾——报错会整轮作废，反而更费钱。
 +      const loopGuard = Object.assign(
-+        { enabled: true, max_rounds: 100, repeat_limit: 3, warn_percent: 85, max_minutes: 20 },
++        { enabled: true, max_rounds: 30, repeat_limit: 3, warn_percent: 85 },
 +        (this.config.agent && this.config.agent.loop_guard) || {},
 +      );
 +      const seenCalls = new Map<string, number>();
 +      let budgetWarned = false;
 +      let roundsCapped = false;
-+      let capReason = "";
-+      const loopStartedAt = Date.now();
 +      const callKey = (name: string, args: string) => name + "\u0000" + args;
        // Completion is the model's decision; cancellation, permissions and context capacity still apply.
        for (let round = 0; ; round++) {
          turn.round = round + 1;
 -        const activeTools = memoryWriteRejected ? [] : toolList;
-+        if (loopGuard.enabled && !roundsCapped) {
-+          if (round >= loopGuard.max_rounds) {
-+            roundsCapped = true;
-+            capReason = "rounds(" + loopGuard.max_rounds + ")";
-+          } else if (loopGuard.max_minutes > 0 && Date.now() - loopStartedAt > loopGuard.max_minutes * 60000) {
-+            roundsCapped = true;
-+            capReason = "time(" + loopGuard.max_minutes + "min)";
-+          }
-+        }
++        if (loopGuard.enabled && round >= loopGuard.max_rounds) roundsCapped = true;
 +        const activeTools = memoryWriteRejected || roundsCapped ? [] : toolList;
          while (input?.hasPending()) await consumeInput();
          signal.throwIfAborted();
@@ -769,7 +961,7 @@ index 754b582..3bcf3bf 100644
          if (
            estimateTokens(promptText(messages) + JSON.stringify(activeTools)) >
            requestBudget
-@@ -613,8 +702,11 @@ export class Sessions {
+@@ -613,8 +748,11 @@ export class Sessions {
            // Seal synchronously after the last await. Unsent candidates never enter history.
            if (input && !input.tryFinish()) continue;
            final = reply.text;
@@ -781,7 +973,7 @@ index 754b582..3bcf3bf 100644
          if (historyReference && typeof reply.reasoning_content !== "string")
            throw Error("思考模式工具响应缺少 reasoning_content，未执行本次工具调用");
          messages.push({
-@@ -638,6 +730,8 @@ export class Sessions {
+@@ -638,6 +776,8 @@ export class Sessions {
            const toolOrigin = tools.entries?.get(call.name)?.origin;
            let result;
            superseded ||= input?.hasPending() ?? false;
@@ -790,7 +982,7 @@ index 754b582..3bcf3bf 100644
            if (superseded) {
              result = { ok: false, executed: false, reason: "user_input_appended",
                result: "未执行：用户补充了消息，请结合补充内容重新判断是否仍需调用此工具。" };
-@@ -645,6 +739,20 @@ export class Sessions {
+@@ -645,6 +785,20 @@ export class Sessions {
                status: "skipped", result });
              await execution?.write("tool_skipped", { round: turn.round, tool_call_id: call.id,
                tool: turn.transient && !toolOrigin ? "[未注册工具]" : call.name, reason: "user_input_appended" });
@@ -811,7 +1003,7 @@ index 754b582..3bcf3bf 100644
            } else try {
              result = await tools.call(
                call.name,
-@@ -661,6 +769,8 @@ export class Sessions {
+@@ -661,6 +815,8 @@ export class Sessions {
                tool: turn.transient && !toolOrigin ? "[未注册工具]" : call.name, error: result.result,
                ...(turn.transient ? {} : { arguments: call.arguments }) });
            }
@@ -820,13 +1012,13 @@ index 754b582..3bcf3bf 100644
            if (!superseded && !result.ok && ["remember_fact", "edit_facts"].includes(call.name))
              memoryWriteRejected = true;
            await memory.appendEvent({
-@@ -695,6 +805,14 @@ export class Sessions {
+@@ -695,6 +851,14 @@ export class Sessions {
          messages.push(...attachments);
          if (attachments.length) diagnostics?.event("context.change", { operation: "append", source: "tool_attachments", after: attachments });
        }
 +      if (roundsCapped) {
-+        logger.info("循环守卫", { status: "rounds_capped", reason: capReason, rounds: loopGuard.max_rounds, session: id });
-+        await execution?.write("loop_guard", { kind: "rounds_capped", reason: capReason, rounds: loopGuard.max_rounds });
++        logger.info("循环守卫", { status: "rounds_capped", rounds: loopGuard.max_rounds, session: id });
++        await execution?.write("loop_guard", { kind: "rounds_capped", rounds: loopGuard.max_rounds });
 +      }
 +      const files = await verifiedFiles(this.root, writeReceipts);
 +      if (writeReceipts.length)
@@ -835,7 +1027,7 @@ index 754b582..3bcf3bf 100644
        if (!final) throw Error("模型未返回最终回复，请重试");
        await memory.appendEvent({
          type: "message",
-@@ -704,6 +822,7 @@ export class Sessions {
+@@ -704,6 +868,7 @@ export class Sessions {
          role: "assistant",
          // User-facing conversation is primary history. Technical plugin runs retain their opt-in privacy.
          text: transient && turn.transient ? TRANSIENT_REPLY : final,
@@ -843,7 +1035,7 @@ index 754b582..3bcf3bf 100644
          ...(transient && turn.transient ? { transient: true } : {}),
          ...context,
          request_usage: measured,
-@@ -716,6 +835,8 @@ export class Sessions {
+@@ -716,6 +881,8 @@ export class Sessions {
            provider: p.provider, limit: limit.tokens, signal, timezone: zone,
            rows: matchingHistory(currentRows, p.revision, policy.history_scope), policy, revision: p.revision });
        }
@@ -876,6 +1068,18 @@ index a434c0b..866aeb3 100644
        // Cancellation cannot undo a completed external operation or replace its true result.
        if (tool.transientResult) {
          if (!result || typeof result !== "object" || !Object.hasOwn(result, "content") || !Object.hasOwn(result, "receipt"))
+diff --git a/core/ui/api.js b/core/ui/api.js
+index 7d430e0..42d04f3 100644
+--- a/core/ui/api.js
++++ b/core/ui/api.js
+@@ -31,6 +31,7 @@ export const escapeHTML = (value) =>
+   );
+ export const typeNames = {
+   chat: "对话",
++  diary: "日记整理",
+   embedding: "向量 / Embedding",
+   rerank: "重排序",
+   image: "图像生成",
 diff --git a/core/ui/app.js b/core/ui/app.js
 index 55ade77..db1888d 100644
 --- a/core/ui/app.js
@@ -2218,16 +2422,18 @@ index 5251c75..0d0d3ab 100644
 +  cursor: default;
 +}
 diff --git a/core/ui/views.js b/core/ui/views.js
-index 7884c7e..63a0554 100644
+index 7884c7e..cc5944b 100644
 --- a/core/ui/views.js
 +++ b/core/ui/views.js
-@@ -120,13 +120,13 @@ export function renderBindings(app) {
+@@ -120,13 +120,15 @@ export function renderBindings(app) {
    const sessionSettings = `<section class="panel panel-body" style="margin-bottom:22px"><h2>当前会话</h2><p>正在使用：<strong>${e(sessionName(app.state))}</strong> <small>${e(app.state.session)}</small></p><div class="row context-session-select"><label for="active-session">切换到</label><select id="active-session" ${app.state.chatBusy ? "disabled" : ""}>${sessions.map(item => `<option value="${e(item.id)}" ${item.id === app.state.session ? "selected" : ""}>${e(item.name || item.id)}${item.id === app.state.session ? "（正在使用）" : ""}</option>`).join("")}</select><button id="apply-session" class="btn primary small" type="button" disabled>切换会话</button><button id="new-session" class="btn small" type="button" ${app.state.chatBusy ? "disabled" : ""}>${icon("plus")}新建并使用</button></div><p class="hint">选好后点击“切换会话”才生效。网页和跟随当前会话的插件共用此选择，正在处理的请求仍留在原会话。浏览记忆档案不会切换这里。</p><p id="session-switch-error" class="form-error" role="alert"></p></section>`;
    const activePersona = c.activePersona || app.state.status?.persona || "";
    const personaSettings = `<label class="form-field"><span>当前聊天人格</span><select id="active-persona" name="activePersona" required ${app.state.chatBusy || !c.personas.length ? "disabled" : ""}>${!activePersona ? '<option value="">请选择人格</option>' : ""}${c.personas.map((p) => `<option value="${e(p.id)}" ${p.id === activePersona ? "selected" : ""}>${e(p.name)}</option>`).join("")}</select></label><p id="active-persona-routing" class="hint" style="margin-top:16px">${e(personaRoutingText(c, activePersona))}</p><p class="hint" style="margin-top:12px">与模型选择一起保存后生效。切换人格保持当前会话和聊天记录；请等待当前回复结束后切换。</p><a href="#personas" class="btn tonal" style="margin-top:18px">编辑人格 ${icon("arrow")}</a>`;
 -  const options = (type, selected, inherit = false) =>
 -    `<option value="">${inherit ? "使用工作空间的对话模型" : "未配置"}</option>` +
 +  const options = (type, selected, inherit = false) => {
++    // 日记整理借用对话模型那一类；模型本身没有 type=diary。
++    const kind = type === "diary" ? "chat" : type;
 +    return `<option value="">${inherit ? "使用工作空间的对话模型" : "未配置"}</option>` +
      c.models
        .filter(
@@ -2239,15 +2445,28 @@ index 7884c7e..63a0554 100644
            m.enabled &&
            !m.configuration_error &&
            c.providers.find((p) => p.id === m.provider)?.enabled,
-@@ -136,6 +136,7 @@ export function renderBindings(app) {
+@@ -136,9 +138,10 @@ export function renderBindings(app) {
            `<option value="${e(m.id)}" ${m.id === selected ? "selected" : ""}>${e(m.name)} · ${e(c.providers.find((p) => p.id === m.provider)?.name || m.provider)}</option>`,
        )
        .join("");
 +  };
    const field = (type, description) =>
      `<div class="binding-row"><div class="row">${icon(typeIcon(type))}<h3>${typeNames[type]}模型</h3></div><select name="binding_${type}" aria-label="${typeNames[type]}模型">${options(type, c.bindings[type])}</select><p>${description}</p></div>`;
-   return `<div class="page-heading"><div><div class="eyebrow">MODEL ROUTING</div><h1>使用配置</h1><p>明确选择每种能力使用的模型。未配置的用途保持关闭。</p></div><div class="heading-actions"><button type="submit" form="bindings-form" class="btn primary" id="save-bindings">${icon("check")}保存配置</button></div></div><div class="info-banner">${icon("info")}选择已启用的模型，保存后从下一次请求开始生效。</div>${sessionSettings}<form id="bindings-form"><div class="bindings-grid"><section class="panel"><div class="panel-header"><h2>工作空间模型</h2><a href="#models" class="btn small link">管理模型 ${icon("arrow")}</a></div><div class="panel-body">${field("chat", "用于鲸鲸的日常对话和会话摘要。")}${field("embedding", "供插件使用的向量模型。当前支持配置与接口测试；检索由插件实现。")}${field("rerank", "供重排序插件使用的模型选择，可留空。")}<details style="margin-top:20px"><summary class="muted">更多模型用途</summary><div style="margin-top:20px">${field("image", "图像生成服务的模型选择。")}${field("stt", "语音识别服务的模型选择。")}${field("tts", "语音合成服务的模型选择。")}<p class="hint" style="margin-top:16px">这里保存模型选择，图像、语音与重排序的具体调用由对应插件实现。</p></div></details></div></section><section class="panel"><div class="panel-header"><h2>人格配置</h2></div><div class="panel-body">${personaSettings}${timeSettings}</div></section></div><p id="bindings-error" class="form-error" role="alert"></p></form>`;
-@@ -208,7 +209,8 @@ export function bindPlugins(app) {
+-  return `<div class="page-heading"><div><div class="eyebrow">MODEL ROUTING</div><h1>使用配置</h1><p>明确选择每种能力使用的模型。未配置的用途保持关闭。</p></div><div class="heading-actions"><button type="submit" form="bindings-form" class="btn primary" id="save-bindings">${icon("check")}保存配置</button></div></div><div class="info-banner">${icon("info")}选择已启用的模型，保存后从下一次请求开始生效。</div>${sessionSettings}<form id="bindings-form"><div class="bindings-grid"><section class="panel"><div class="panel-header"><h2>工作空间模型</h2><a href="#models" class="btn small link">管理模型 ${icon("arrow")}</a></div><div class="panel-body">${field("chat", "用于鲸鲸的日常对话和会话摘要。")}${field("embedding", "供插件使用的向量模型。当前支持配置与接口测试；检索由插件实现。")}${field("rerank", "供重排序插件使用的模型选择，可留空。")}<details style="margin-top:20px"><summary class="muted">更多模型用途</summary><div style="margin-top:20px">${field("image", "图像生成服务的模型选择。")}${field("stt", "语音识别服务的模型选择。")}${field("tts", "语音合成服务的模型选择。")}<p class="hint" style="margin-top:16px">这里保存模型选择，图像、语音与重排序的具体调用由对应插件实现。</p></div></details></div></section><section class="panel"><div class="panel-header"><h2>人格配置</h2></div><div class="panel-body">${personaSettings}${timeSettings}</div></section></div><p id="bindings-error" class="form-error" role="alert"></p></form>`;
++  return `<div class="page-heading"><div><div class="eyebrow">MODEL ROUTING</div><h1>使用配置</h1><p>明确选择每种能力使用的模型。未配置的用途保持关闭。</p></div><div class="heading-actions"><button type="submit" form="bindings-form" class="btn primary" id="save-bindings">${icon("check")}保存配置</button></div></div><div class="info-banner">${icon("info")}选择已启用的模型，保存后从下一次请求开始生效。</div>${sessionSettings}<form id="bindings-form"><div class="bindings-grid"><section class="panel"><div class="panel-header"><h2>工作空间模型</h2><a href="#models" class="btn small link">管理模型 ${icon("arrow")}</a></div><div class="panel-body">${field("chat", "用于鲸鲸的日常对话和会话摘要。")}${field("diary", "日记整理单独使用的模型。留空则沿用对话模型。")}${field("embedding", "供插件使用的向量模型。当前支持配置与接口测试；检索由插件实现。")}${field("rerank", "供重排序插件使用的模型选择，可留空。")}<details style="margin-top:20px"><summary class="muted">更多模型用途</summary><div style="margin-top:20px">${field("image", "图像生成服务的模型选择。")}${field("stt", "语音识别服务的模型选择。")}${field("tts", "语音合成服务的模型选择。")}<p class="hint" style="margin-top:16px">这里保存模型选择，图像、语音与重排序的具体调用由对应插件实现。</p></div></details></div></section><section class="panel"><div class="panel-header"><h2>人格配置</h2></div><div class="panel-body">${personaSettings}${timeSettings}</div></section></div><p id="bindings-error" class="form-error" role="alert"></p></form>`;
+ }
+ export function bindBindings(app) {
+   app.bindingsDirty = false;
+@@ -184,7 +187,7 @@ export function bindBindings(app) {
+     button.disabled = true;
+     const next = app.configDraft();
+     if (selectedPersona) next.activePersona = selectedPersona;
+-    for (const key of ["chat", "embedding", "rerank", "image", "stt", "tts"])
++    for (const key of ["chat", "diary", "embedding", "rerank", "image", "stt", "tts"])
+       next.bindings[key] = data.get("binding_" + key) || null;
+     try {
+       await app.saveConfig(next);
+@@ -208,7 +211,8 @@ export function bindPlugins(app) {
  export function renderChat(app) {
    const model = activeChat(app);
    const personaName = app.state.status.personaName || "助手";
@@ -2257,7 +2476,7 @@ index 7884c7e..63a0554 100644
  }
  export function bindChat(app) {
    app.refreshSessionContext();
-@@ -216,6 +218,9 @@ export function bindChat(app) {
+@@ -216,6 +220,9 @@ export function bindChat(app) {
    const input = document.querySelector("#chat-input");
    input.value = app.state.chatDraft || "";
    input.oninput = () => (app.state.chatDraft = input.value);

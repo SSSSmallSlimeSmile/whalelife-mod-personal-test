@@ -1,0 +1,1418 @@
+diff --git a/core/ui/api.js b/core/ui/api.js
+index 7d430e0..42d04f3 100644
+--- a/core/ui/api.js
++++ b/core/ui/api.js
+@@ -31,6 +31,7 @@ export const escapeHTML = (value) =>
+   );
+ export const typeNames = {
+   chat: "对话",
++  diary: "日记整理",
+   embedding: "向量 / Embedding",
+   rerank: "重排序",
+   image: "图像生成",
+diff --git a/core/ui/app.js b/core/ui/app.js
+index 55ade77..db1888d 100644
+--- a/core/ui/app.js
++++ b/core/ui/app.js
+@@ -31,6 +31,8 @@ const pages = {
+   plugins: { name: "插件管理", render: renderPlugins, bind: bindPlugins },
+   logs: { name: "运行日志", render: renderLogs, bind: bindLogs },
+ };
++const thinkingFaces = ["(｡•ᴗ•｡)","(´｡• ᵕ •｡`)","(๑•̀ㅂ•́)و","(￣▽￣)","(＝ω＝)","(っ˘ω˘ς)","(๑´ω`๑)","(・ω・)","(๑•́ ₃ •̀๑)","( ˘ω˘ )","(´▽`)","(･ω･)ﾉ"];
++const pickThinkingFace = () => thinkingFaces[Math.floor(Math.random() * thinkingFaces.length)];
+ const $ = (id) => document.getElementById(id);
+ document
+   .querySelectorAll("[data-icon]")
+@@ -60,6 +62,7 @@ class ConsoleApp {
+     logFollow: true,
+     chatBusy: false,
+     chatDraft: "",
++    pendingImages: [],
+     session: null,
+     sessions: [],
+     memorySession: null,
+@@ -78,7 +81,7 @@ class ConsoleApp {
+         if (this.state.page === "memory") loadMemory(this);
+       }
+     });
+-    window.addEventListener("focus", () => this.syncView());
++    window.addEventListener("focus", () => this.refreshOnFocus());
+     $("login-form").onsubmit = (event) => {
+       event.preventDefault();
+       this.login();
+@@ -167,13 +170,34 @@ class ConsoleApp {
+       this.updateChatControls();
+     }
+   }
++  async renameSession() {
++    const id = this.state.session;
++    if (!id) return;
++    const current = this.state.sessionName || "";
++    this.dialog(
++      "会话改名",
++      `<label for="rename-session-name">名称</label><input id="rename-session-name" name="name" maxlength="80" required value="${e(current)}" placeholder="给这个会话取个名字">`,
++      async (data) => {
++        const name = String(data.get("name") || "").trim();
++        if (!name) throw Error("名称不能为空");
++        await api("/api/memory/session/rename", { id, name });
++        this.state.sessionName = name;
++        const item = (this.state.sessions || []).find((x) => x.id === id);
++        if (item) item.name = name;
++        if (this.state.page === "chat") this.render();
++        this.toast("会话名称已保存");
++      },
++      "保存名称",
++    );
++  }
+   async syncSession(input) {
+     if (this.state.chatBusy || (!input && this.sessionChanging)) return;
+     const sequence = ++this.sessionSync;
+     const { id } = await api("/api/session/current", input ??
+       (this.sessionReady ? undefined : { legacyId: localStorage.whaleSession }));
+-    const [rows, choices] = await Promise.all([
+-      api("/api/session?id=" + encodeURIComponent(id)), api("/api/session/list"),
++    const [page, choices] = await Promise.all([
++      api("/api/session?id=" + encodeURIComponent(id) + "&limit=" + PAGE_SIZE),
++      api("/api/session/list"),
+     ]);
+     if (sequence !== this.sessionSync || this.state.chatBusy) return;
+     this.sessionReady = true;
+@@ -187,14 +211,222 @@ class ConsoleApp {
+       this.state.memoryLoadedTab = null;
+     }
+     localStorage.whaleSession = id;
+-    this.state.messages = rows
++    this.state.msgStart = page.start;
++    this.state.msgTotal = page.total;
++    this.state.msgHasMore = page.hasMore;
++    this.olderLoading = false;
++    this.state.messages = page.items
+       .filter((r) => r.type === "message")
+       .map((r) => ({
+         role: r.role,
+         text: r.text,
+         personaName: r.persona_name,
++        at: r.ts,
++        files: r.files,
+       }));
+   }
++  /** 往上翻一页：用加载行撑住高度，翻完还原滚动位置，不跳。 */
++  async loadOlder() {
++    if (this.olderLoading || !this.state.msgHasMore || this.state.chatBusy) return;
++    const box = $("messages");
++    if (!box) return;
++    this.olderLoading = true;
++    const more = box.querySelector(".chat-history-more");
++    if (more) more.textContent = "加载中…";
++    const id = this.state.session;
++    try {
++      const page = await api(
++        "/api/session?id=" + encodeURIComponent(id) +
++          "&limit=" + PAGE_SIZE + "&before=" + this.state.msgStart,
++      );
++      if (id !== this.state.session) return;
++      const height = box.scrollHeight;
++      const older = page.items
++        .filter((r) => r.type === "message")
++        .map((r) => ({
++          role: r.role,
++          text: r.text,
++          personaName: r.persona_name,
++          at: r.ts,
++          files: r.files,
++        }));
++      this.state.messages = older.concat(this.state.messages);
++      this.state.msgStart = page.start;
++      this.state.msgTotal = page.total;
++      this.state.msgHasMore = page.hasMore;
++      this.olderLoading = false;
++      this.renderMessages();
++      const grow = box.scrollHeight - height;
++      box.scrollTop += grow;
++      requestAnimationFrame(() => { box.scrollTop += grow; });
++      return;
++    } catch (error) {
++      this.toast(error.message, true);
++    } finally {
++      this.olderLoading = false;
++      const stale = $("messages")?.querySelector(".chat-history-more");
++      if (stale) stale.textContent = "加载更早的 " + PAGE_SIZE + " 条";
++    }
++  }
++  /** 左侧段落目录：满 20 条或隔 30 分钟切一段，点一下跳到那段。 */
++  /** 左侧导航轨：一条用户请求一节。轨道上只画刻度，摘要放进悬浮卡（勘 2026-11-16）。 */
++  renderOutline() {
++    const rail = $("chat-rail");
++    if (!rail) return;
++    this.railTurns = [];
++    let turn = null;
++    (this.state.messages || []).forEach((m, index) => {
++      if (m.role === "user") {
++        turn = { from: index, ask: plainText(m.text), answers: [] };
++        this.railTurns.push(turn);
++        return;
++      }
++      if (turn && m.text) turn.answers.push(plainText(m.text));
++    });
++    if (this.railTurns.length < 3) {
++      rail.hidden = true;
++      rail.innerHTML = "";
++      this.hideRailCard();
++      return;
++    }
++    rail.hidden = false;
++    rail.innerHTML =
++      this.railTurns
++        .map(
++          (t, i) =>
++            '<button type="button" class="chat-rail-tick" data-turn="' + i +
++            '" aria-label="' + e(clip(t.ask, 40)) + '"><i></i></button>',
++        )
++        .join("");
++    rail.querySelectorAll("[data-turn]").forEach((tick) => {
++      tick.onmouseenter = () => this.showRailCard(tick);
++      tick.onmouseleave = () => this.hideRailCard();
++      tick.onfocus = () => this.showRailCard(tick);
++      tick.onblur = () => this.hideRailCard();
++      tick.onclick = () => this.jumpToTurn(Number(tick.dataset.turn));
++    });
++    this.watchRail();
++  }
++  railCard() {
++    let card = document.getElementById("chat-rail-card");
++    if (!card) {
++      card = document.createElement("div");
++      card.id = "chat-rail-card";
++      card.className = "chat-rail-card";
++      card.hidden = true;
++      document.body.appendChild(card);
++    }
++    return card;
++  }
++  /** 悬浮卡贴在刻度右边，纵向不许出窗口。 */
++  showRailCard(tick) {
++    const turn = (this.railTurns || [])[Number(tick.dataset.turn)];
++    if (!turn) return;
++    const card = this.railCard();
++    const answer = turn.answers.join(" ");
++    card.innerHTML =
++      "<b>" + e(clip(turn.ask, 120)) + "</b>" +
++      "<span>" + e(clip(answer || "（这一节没有回答）", 260)) + "</span>" +
++      '<span class="chat-rail-card-meta">' + (1 + turn.answers.length) + " 条</span>";
++    card.hidden = false;
++    const rect = tick.getBoundingClientRect();
++    const box = card.getBoundingClientRect();
++    const left = Math.min(rect.right + 12, window.innerWidth - box.width - 12);
++    const top = Math.max(12, Math.min(rect.top - 8, window.innerHeight - box.height - 12));
++    card.style.left = Math.max(12, left) + "px";
++    card.style.top = top + "px";
++  }
++  hideRailCard() {
++    const card = document.getElementById("chat-rail-card");
++    if (card) card.hidden = true;
++  }
++  jumpToTurn(index) {
++    const turn = (this.railTurns || [])[index];
++    if (!turn) return;
++    const nodes = $("messages")?.querySelectorAll(".message") || [];
++    nodes[turn.from]?.scrollIntoView({ block: "start", behavior: "smooth" });
++  }
++  /** 滚动或窗口尺寸一变就重排：刻度按消息的真实位置摆，紫色只留一个（勘 2026-11-16）。
++      旧版一边画按比例插值的游标、一边画按消息判定的高亮，两者位置不一致，
++      看着就是"对不上"；窗口一改尺寸还会同时看到两条紫线。现在只保留刻度本身。 */
++  watchRail() {
++    const rail = $("chat-rail");
++    const box = $("messages");
++    if (!rail || !box) return;
++    // 每次 render() 都会用整页 markup 重建 #messages，拿到的是新节点；
++    // 旧监听还挂在被摘下来的那个节点上，此后滚动手势再也送不到轨道，
++    // 高亮就永远停在最后一次算出来的位置（勘 2026-11-16 修）。
++    if (this.railBox !== box) {
++      if (this.railBox && this.railScrollHandler)
++        this.railBox.removeEventListener("scroll", this.railScrollHandler);
++      this.railScrollHandler = () => this.syncRail();
++      box.addEventListener("scroll", this.railScrollHandler, { passive: true });
++      this.railBox = box;
++    }
++    if (!this.railWatched) {
++      this.railWatched = true;
++      window.addEventListener("resize", () => this.syncRail(), { passive: true });
++      // 切窗口回来时，尺寸没变、滚动没变，一个事件都不会来。
++      // 上一轮若是趁容器被隐藏时算过一遍，高亮就钉死了，得给个重新对账的机会（勘 2026-11-16 修）。
++      window.addEventListener("focus", () => this.syncRail());
++      document.addEventListener("visibilitychange", () => {
++        if (!document.hidden) this.syncRail();
++      });
++    }
++    // ResizeObserver 每次都要盯住"当前的"内容节点。
++    // 旧写法只在第一次 observe：一旦 #messages 的内层被整体换掉，
++    // 观察者盯的就是已经摘下来的节点，此后永不触发（勘 2026-11-16 修）。
++    if (typeof ResizeObserver === "function") {
++      const target = box.firstElementChild || box;
++      if (this.railObserverTarget !== target) {
++        if (!this.railObserver) this.railObserver = new ResizeObserver(() => this.syncRail());
++        this.railObserver.disconnect();
++        this.railObserver.observe(target);
++        this.railObserverTarget = target;
++      }
++    }
++    this.syncRail();
++  }
++  syncRail() {
++    const rail = $("chat-rail");
++    const box = $("messages");
++    if (!rail || !box || rail.hidden) return;
++    // 窗口最小化、切到后台、渲染中途容器被隐藏时，所有 rect 都是 0。
++    // 那时"每条消息都顶在阈值上方"会把高亮钉死在最后一格，
++    // 而尺寸恢复后往往又没有事件再来纠正——干脆不在这时候算（勘 2026-11-16 修）。
++    if (document.hidden || box.clientHeight < 1 || rail.clientHeight < 1) return;
++    const ticks = [...rail.querySelectorAll(".chat-rail-tick")];
++    if (!ticks.length) return;
++    const nodes = [...box.querySelectorAll(".message")];
++    const boxRect = box.getBoundingClientRect();
++    const pad = 12;
++    const usable = Math.max(1, rail.clientHeight - pad * 2);
++    // 刻度等距排开，看着整齐；位置只表示"第几节"，不再对应真实滚动偏移（勘 2026-11-16）
++    const count = ticks.length;
++    const stepRaw = count > 1 ? usable / (count - 1) : 0;
++    const step = Math.max(6, stepRaw);
++    const total = step * Math.max(0, count - 1);
++    const start = pad + (step > stepRaw ? Math.max(0, (usable - total) / 2) : 0);
++    ticks.forEach((tick, i) => {
++      tick.style.top = Math.round((start + i * step) * 10) / 10 + "px";
++    });
++    // 当前那一节：直接拿消息相对视口的位置比，不再掺 scrollTop。
++    // 旧写法假设滚动一定发生在这个容器上；实际一旦滚动落在祖先元素，
++    // scrollTop 恒为 0、每条消息的 rect 却已经在动，于是"全都不超过阈值"，
++    // 高亮永远停在最后一格（勘 2026-11-16 修）。
++    const liveBox = box.getBoundingClientRect();
++    const head = liveBox.top + Math.min(120, box.clientHeight * 0.3);
++    let active = -1;
++    (this.railTurns || []).forEach((turn, i) => {
++      const node = nodes[turn.from];
++      if (!node || !node.isConnected) return;
++      const rect = node.getBoundingClientRect();
++      if (!rect.height && !rect.width) return; // 还没量出来的节点不算
++      if (rect.top <= head) active = i;
++    });
++    if (active < 0) return; // 一个都量不准，就别动上一轮的结果
++    ticks.forEach((tick, i) => tick.classList.toggle("active", i === active));
++  }
+   async refreshSessionContext() {
+     const id = this.state.session;
+     try {
+@@ -210,6 +442,20 @@ class ConsoleApp {
+         $("chat-context").textContent = error.message;
+     }
+   }
++  /** 切回窗口只轻刷状态和上下文，不再走 syncView→load()。
++      旧版那条路会顺带重新 syncSession()：把已经翻出来的历史丢掉、只剩最后 40 条，
++      再按"原来在底部"把滚动条按到最后，看着就是一切窗口就跳回最新（勘 2026-11-16 修）。 */
++  async refreshOnFocus() {
++    if (!this.authenticated) return;
++    try {
++      await this.refreshStatus();
++      this.updateConnection();
++      if (this.state.page === "chat") await this.refreshSessionContext();
++    } catch {
++      // 切窗口不该弹错，刷新失败就保持原样
++    }
++    this.syncRail();
++  }
+   async syncView() {
+     const page = this.state.page;
+     if (this.authenticated && (page.startsWith("extension:") || page.startsWith("plugin:")) && !this.syncing) {
+@@ -364,17 +610,38 @@ class ConsoleApp {
+         if (this.state.page === "logs") this.renderLogs();
+         return;
+       }
++      if (data.type === "append") {
++        if (data.status === "accepted") this.toast("已并入本轮");
++        else if (data.status === "duplicate") this.toast("这句已经并进去了");
++        else if (data.status === "full") this.toast("本轮补充已满，这句没进去", true);
++        else if (data.status === "closed") this.toast("这一轮刚好收尾了，再发一次就成新的一轮", true);
++        else this.toast(data.error || "补充没送进去", true);
++        return;
++      }
+       if (data.type === "context") {
+         if (data.queued) {
+           this.toast("当前会话正在处理其他请求，已排队等待");
+           return;
+         }
++        // Usage arrives at the end of a turn; merge it into the cached context and repaint.
++        if (data.usage) {
++          const merged = { ...(this.state.sessionContext || {}), usage: data.usage };
++          this.state.sessionContext = merged;
++          if ($("chat-context")) $("chat-context").innerHTML = renderContextMeter(merged, true);
++          return;
++        }
++        if (data.files) {
++          if (this.reply) this.reply.files = data.files;
++          if (this.state.page === "chat") this.renderMessages();
++          return;
++        }
+         this.replyPersonaName = data.personaName;
+         this.state.status.persona = data.personaId;
+         this.state.status.personaName = data.personaName;
+-        if (this.state.page === "chat") this.render();
+-        if (data.contextReset)
++        if (data.contextReset) {
+           this.toast("人格已更新，本轮使用新的人格上下文；旧记录保留");
++          if (this.state.page === "chat") this.render();
++        }
+         return;
+       }
+       if (data.type === "chunk") {
+@@ -387,6 +654,10 @@ class ConsoleApp {
+           this.state.messages.push(this.reply);
+         }
+         this.reply.text += data.text;
++        if (this.state.page === "chat") {
++          this.patchReply();
++          return;
++        }
+       } else if (data.type === "done" || data.type === "error") {
+         if (data.type === "error") {
+           this.state.messages.push({ role: "error", text: data.error });
+@@ -457,26 +728,35 @@ class ConsoleApp {
+           m.id === (persona?.model || this.state.config.bindings.chat) &&
+           m.enabled,
+       );
+-      button.disabled = this.state.chatBusy || this.sessionChanging || !this.state.session || !this.chatConnected || !selected;
++      button.disabled = this.sessionChanging || !this.state.session || !this.chatConnected || !selected;
+       button.innerHTML =
+-        (this.state.chatBusy ? "正在回复…" : "发送") + " " + icon("send");
++        (this.state.chatBusy ? "补充" : "发送") + " " + icon("send");
+     }
+     if ($("new-session")) $("new-session").disabled = this.state.chatBusy || this.sessionChanging;
+   }
+   sendMessage() {
+     const text = ($("chat-input")?.value || "").trim();
+-    if (
+-      !text ||
+-      !this.chatConnected ||
+-      this.state.chatBusy ||
+-      $("send").disabled
+-    )
++    const images = this.state.pendingImages.slice();
++    if ((!text && !images.length) || !this.chatConnected || $("send").disabled) return;
++    // 本轮还在跑：不排队，直接并进当前回合，让它中途改方向（勘 2026-11-16）
++    if (this.state.chatBusy) {
++      if (images.length) return this.toast("补充消息先别带图，等这轮跑完再发", true);
++      this.chatWS.send(
++        JSON.stringify({ append: true, session: this.state.session, text }),
++      );
++      this.state.messages.push({ role: "user", text, nudge: true });
++      this.state.chatDraft = "";
++      $("chat-input").value = "";
++      this.renderMessages();
+       return;
+-    this.state.messages.push({ role: "user", text });
++    }
++    this.state.messages.push({ role: "user", text, images: images.map((image) => image.dataUrl) });
+     this.state.chatBusy = true;
+     this.state.chatDraft = "";
++    this.state.pendingImages = [];
+     this.reply = null;
+     $("chat-input").value = "";
++    this.renderPendingImages();
+     this.replyPersonaName = this.state.status.personaName;
+     this.chatWS.send(
+       JSON.stringify({
+@@ -484,11 +764,98 @@ class ConsoleApp {
+         expectedSession: this.state.session,
+         text,
+         persona: this.state.status.persona,
++        ...(images.length
++          ? { images: images.map((image) => ({ mimeType: image.mimeType, data: image.base64 })) }
++          : {}),
+       }),
+     );
+     this.updateChatControls();
+     this.renderMessages();
+   }
++  /** 粘贴、拖拽、文件选择都走这里；超出 4 张或格式不对当场说清楚，不悄悄丢。 */
++  async addImages(files, source = "pick") {
++    const room = 4 - this.state.pendingImages.length;
++    if (room <= 0) return this.toast("一次最多发送 4 张图片", true);
++    const usable = [...files].filter(
++      (file) =>
++        ["image/png", "image/jpeg", "image/webp", "image/bmp"].includes(file.type) ||
++        (source === "paste" && !file.type && file.size > 0),
++    );
++    if (!usable.length) return this.toast("只支持 PNG、JPEG、WebP、BMP 图片", true);
++    if (usable.length > room) this.toast(`只收下前 ${room} 张，一次最多 4 张`, true);
++    let failed = null;
++    for (const file of usable.slice(0, room)) {
++      try {
++        this.state.pendingImages.push(await shrinkImage(file));
++      } catch (error) {
++        failed = error;
++      }
++    }
++    if (failed && source === "paste") {
++      try {
++        this.state.pendingImages.push(await clipboardImage());
++        failed = null;
++      } catch (error) {
++        failed = Error(`${failed.message}；系统剪贴板也没取到：${error.message}`);
++      }
++    }
++    if (failed) this.toast(failed.message, true);
++    this.renderPendingImages();
++  }
++  renderPendingImages() {
++    const strip = $("composer-images");
++    if (!strip) return;
++    strip.innerHTML = this.state.pendingImages
++      .map(
++        (image, index) =>
++          `<figure class="pending-image"><img src="${image.dataUrl}" alt="待发送图片"><button type="button" data-drop="${index}" title="移除">×</button></figure>`,
++      )
++      .join("");
++    strip.querySelectorAll("[data-drop]").forEach((button) => {
++      button.onclick = () => {
++        this.state.pendingImages.splice(Number(button.dataset.drop), 1);
++        this.renderPendingImages();
++      };
++    });
++    strip.hidden = !this.state.pendingImages.length;
++  }
++  bindImageComposer() {
++    const form = $("chat-form"), input = $("chat-input"), picker = $("image-input");
++    const box = $("messages");
++    if (box)
++      box.onscroll = () => {
++        if (box.scrollTop < 48 && this.state.msgHasMore && !this.olderLoading) this.loadOlder();
++      };
++    if (!form || !input) return;
++    this.renderPendingImages();
++    if (picker) {
++      picker.onchange = () => {
++        const files = [...picker.files];
++        picker.value = "";
++        this.addImages(files);
++      };
++    }
++    input.onpaste = (event) => {
++      const files = [...(event.clipboardData?.files || [])].filter(
++        (file) => file.type.startsWith("image/") || (!file.type && file.size > 0),
++      );
++      if (!files.length) return;
++      event.preventDefault();
++      this.addImages(files, "paste");
++    };
++    form.ondragover = (event) => {
++      event.preventDefault();
++      form.classList.add("dragging");
++    };
++    form.ondragleave = () => form.classList.remove("dragging");
++    form.ondrop = (event) => {
++      const files = [...(event.dataTransfer?.files || [])].filter((file) => file.type.startsWith("image/"));
++      if (!files.length) return;
++      event.preventDefault();
++      form.classList.remove("dragging");
++      this.addImages(files);
++    };
++  }
+   async newSession() {
+     if (this.state.chatBusy || this.sessionChanging) return;
+     this.sessionChanging = true;
+@@ -504,21 +871,60 @@ class ConsoleApp {
+       this.updateChatControls();
+     }
+   }
++
+   renderMessages() {
++    this.replyEl = null;
+     const personaName = this.state.status.personaName || "助手";
+     const box = $("messages");
+     if (!box) return;
++    this.renderOutline();
+     if (!this.state.messages.length) {
+       box.innerHTML = `<div class="chat-empty"><span class="brand-mark">${whale}</span><h3>今天想和${e(personaName)}聊点什么？</h3><p>从一句问候开始，或试试「记下这个」。</p></div>`;
+       return;
+     }
++    const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80 || !box.childElementCount;
+     box.innerHTML = this.state.messages
+       .map(
+         (m) =>
+-          `<div class="message ${m.role === "user" ? "user" : m.role === "error" ? "error" : ""}"><span class="mini-avatar" title="${e(m.personaName || "助手")}">${m.role === "user" ? "你" : m.role === "error" ? "!" : e((m.personaName || "助手").slice(0, 1))}</span><div class="bubble">${e(m.text)}</div></div>`,
++          `<div class="message ${m.role === "user" ? "user" : m.role === "error" ? "error" : ""}${m.nudge ? " nudge" : ""}"><span class="mini-avatar" title="${e(m.personaName || "助手")}">${m.role === "user" ? "你" : m.role === "error" ? "!" : e((m.personaName || "助手").slice(0, 1))}</span><div class="bubble">${renderRich(m.text)}${(m.images || []).map((url) => `<img class="msg-media" src="${url}" alt="图片">`).join("")}${renderFiles(m.files)}${m.role === "user" || m.role === "error" ? "" : '<div class="say-row"><button class="say-btn" title="念出来"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4V5Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg></button></div>'}</div></div>`,
+       )
+       .join("");
+-    box.scrollTop = box.scrollHeight;
++    if (this.state.chatBusy && !this.reply) {
++      box.insertAdjacentHTML(
++        "beforeend",
++        `<div class="message"><span class="mini-avatar">…</span><div class="bubble thinking"><i>·</i><i>·</i><i>·</i><span>思考中 <em class="think-face">${pickThinkingFace()}</em></span></div></div>`,
++      );
++    }
++    if (this.state.msgHasMore)
++      box.insertAdjacentHTML(
++        "afterbegin",
++        '<div class="chat-history-more">' +
++          (this.olderLoading ? "加载中…" : "加载更早的 " + PAGE_SIZE + " 条") +
++          "</div>",
++      );
++    const more = box.querySelector(".chat-history-more");
++    if (more) more.onclick = () => this.loadOlder();
++    if (nearBottom) {
++      box.scrollTop = box.scrollHeight;
++      requestAnimationFrame(() => { box.scrollTop = box.scrollHeight; });
++    }
++  }
++  /** 只更新最后一条回复的气泡，避免整段重建把滚动条打回顶部。 */
++  patchReply() {
++    const box = $("messages");
++    if (!box || !this.reply) return;
++    const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
++    const thinking = box.querySelector(".bubble.thinking");
++    if (thinking) thinking.closest(".message")?.remove();
++    if (!this.replyEl || !box.contains(this.replyEl)) {
++      const wrap = document.createElement("div");
++      wrap.className = "message";
++      wrap.innerHTML = `<span class="mini-avatar" title="${e(this.replyPersonaName || "助手")}">${e((this.replyPersonaName || "助手").slice(0, 1))}</span><div class="bubble"></div>`;
++      box.appendChild(wrap);
++      this.replyEl = wrap.querySelector(".bubble");
++    }
++    this.replyEl.innerHTML = renderRich(this.reply.text) + renderFiles(this.reply.files) + '<div class="say-row"><button class="say-btn" title="念出来"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4V5Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg></button></div>';
++    if (stick) box.scrollTop = box.scrollHeight;
+   }
+   filteredLogs() {
+     return this.state.logs.filter(
+@@ -544,5 +950,378 @@ class ConsoleApp {
+       `显示 ${lines.length} / ${this.state.logs.length} 条 · ${this.logConnected ? "实时推送中" : "正在重新连接"}`;
+   }
+ }
++/** 一页多少条。服务端上限 200，这里改得比它大没用。 */
++const PAGE_SIZE = 40;
++
++/** 压平成一句：去掉图片标记、markdown 符号和换行。 */
++function plainText(text) {
++  return String(text || "")
++    .replace(/\[\[img:[^\]]+\]\]/g, "［图］")
++    .replace(/[#*`>]+/g, " ")
++    .replace(/\s+/g, " ")
++    .trim();
++}
++
++/** 截短，超了就加省略号。 */
++function clip(text, max) {
++  const flat = String(text || "").trim();
++  return flat.length > max ? flat.slice(0, max) + "…" : flat;
++}
++
++/** 点图片开遮罩看原图，再点一下或按 Esc 关掉。 */
++function installImageZoom() {
++  const box = document.createElement("div");
++  box.className = "image-zoom";
++  box.hidden = true;
++  box.innerHTML = '<img alt="放大查看">';
++  document.body.appendChild(box);
++  const close = () => { box.hidden = true; box.querySelector("img").src = ""; };
++  box.onclick = close;
++  document.addEventListener("keydown", (evt) => { if (evt.key === "Escape") close(); });
++  document.addEventListener("click", (evt) => {
++    const img = evt.target.closest && evt.target.closest(".bubble img, .messages img");
++    if (!img || !img.src) return;
++    evt.preventDefault();
++    box.querySelector("img").src = img.src;
++    box.hidden = false;
++  });
++}
++
+ const app = new ConsoleApp();
++installImageZoom();
+ app.start();
++installSayButton();
++
++/** 浏览器解不开时，回头问系统剪贴板要图：服务端用 GDI+ 存成 PNG 再送回来。 */
++async function clipboardImage() {
++  const value = await api("/api/clipboard-image", {});
++  const blob = await (await fetch(value.dataUrl)).blob();
++  return await shrinkImage(new File([blob], "clipboard.png", { type: "image/png" }));
++}
++
++/** 读成 data URL。 */
++function readDataUrl(file) {
++  return new Promise((resolve, reject) => {
++    const reader = new FileReader();
++    reader.onload = () => resolve(String(reader.result));
++    reader.onerror = () => reject(Error("图片读取失败"));
++    reader.readAsDataURL(file);
++  });
++}
++
++/** 裸 DIB（缺 "BM" 文件头的位图）补一个文件头，浏览器才认得。微信截图走剪贴板常常给的是这个。 */
++async function dibToBmp(file) {
++  if (file.size < 64) return null;
++  const head = new Uint8Array(await file.slice(0, 64).arrayBuffer());
++  if (head[0] === 0x42 && head[1] === 0x4d) return null;
++  const view = new DataView(head.buffer);
++  const headerSize = view.getUint32(0, true);
++  const bits = view.getUint16(14, true);
++  const compression = view.getUint32(16, true);
++  if (![40, 108, 124].includes(headerSize) || ![24, 32].includes(bits) || compression !== 0) return null;
++  const dib = new Uint8Array(await file.arrayBuffer());
++  const bmp = new Uint8Array(14 + dib.length);
++  const out = new DataView(bmp.buffer);
++  bmp[0] = 0x42;
++  bmp[1] = 0x4d;
++  out.setUint32(2, bmp.length, true);
++  out.setUint32(10, 14 + headerSize, true);
++  bmp.set(dib, 14);
++  return new Blob([bmp], { type: "image/bmp" });
++}
++
++/** 解一张图：先 createImageBitmap，再 <img>，最后试修补裸 DIB。三条都挂才报错。 */
++async function decodeImage(file, dataUrl) {
++  const viaBitmap = async (source) => {
++    if (typeof createImageBitmap !== "function") throw Error("no createImageBitmap");
++    const bitmap = await createImageBitmap(source);
++    return {
++      width: bitmap.width,
++      height: bitmap.height,
++      trust: source === file,
++      draw: (context, w, h) => context.drawImage(bitmap, 0, 0, w, h),
++    };
++  };
++  const viaImage = async (url) => {
++    const element = await new Promise((resolve, reject) => {
++      const probe = new Image();
++      probe.onload = () => resolve(probe);
++      probe.onerror = () => reject(Error("decode"));
++      probe.src = url;
++    });
++    return {
++      width: element.naturalWidth,
++      height: element.naturalHeight,
++      trust: url === dataUrl,
++      draw: (context, w, h) => context.drawImage(element, 0, 0, w, h),
++    };
++  };
++  try {
++    return await viaBitmap(file);
++  } catch {}
++  try {
++    return await viaImage(dataUrl);
++  } catch {}
++  const repaired = await dibToBmp(file);
++  if (repaired) {
++    try {
++      return await viaBitmap(repaired);
++    } catch {}
++    try {
++      return await viaImage(await readDataUrl(repaired));
++    } catch {}
++  }
++  const hint = repaired ? "已试过补文件头修裸位图" : "剪贴板给的图数据常是残缺的";
++  throw Error(
++    `图片无法解码（${file.type || "类型未知"}，${Math.max(1, Math.round(file.size / 1024))} KB）——${hint}，改用「图片」按钮直接选文件试试`,
++  );
++}
++
++/** 超过 1600px 或 2MiB 才重编码；小图原样送，截图里的字不会被压糊。 */
++async function shrinkImage(file) {
++  if (file.size > 6 * 1024 * 1024) throw Error("单张图片需在 6MiB 以内");
++  const dataUrl = await readDataUrl(file);
++  const image = await decodeImage(file, dataUrl);
++  const scale = Math.min(1, 1600 / Math.max(image.width, image.height));
++  const passThrough = ["image/png", "image/jpeg", "image/webp"].includes(file.type);
++  if (image.trust && passThrough && scale === 1 && file.size <= 2 * 1024 * 1024)
++    return { mimeType: file.type, dataUrl, base64: dataUrl.slice(dataUrl.indexOf(",") + 1) };
++  const canvas = document.createElement("canvas");
++  canvas.width = Math.max(1, Math.round(image.width * scale));
++  canvas.height = Math.max(1, Math.round(image.height * scale));
++  const context = canvas.getContext("2d");
++  if (!image.trust) {
++    context.fillStyle = "#fff";
++    context.fillRect(0, 0, canvas.width, canvas.height);
++  }
++  image.draw(context, canvas.width, canvas.height);
++  const type = file.type === "image/png" || !image.trust ? "image/png" : "image/jpeg";
++  const shrunk = canvas.toDataURL(type, 0.9);
++  if (shrunk.length * 0.75 > 4 * 1024 * 1024) throw Error("图片压缩后仍超过 4MiB");
++  return { mimeType: type, dataUrl: shrunk, base64: shrunk.slice(shrunk.indexOf(",") + 1) };
++}
++
++const TABLE_SEPARATOR = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/;
++const CODE_FENCE = /^\s*```/;
++const HEADING = /^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/;
++const HR = /^\s{0,3}([-*_])(\s*\1){2,}\s*$/;
++const QUOTE = /^\s{0,3}>\s?(.*)$/;
++const UL_ITEM = /^(\s*)[-*+]\s+(.*)$/;
++const OL_ITEM = /^(\s*)(\d{1,9})[.)]\s+(.*)$/;
++const LINK = /\[([^\]\n]*)\]\(([^()\s]*)\)/g;
++const SAFE_URL = /^(https?:\/\/|mailto:|\/|#|\.{1,2}\/)/i;
++
++/** [[img:路径]] / [[voice:路径]] 标记换成媒体元素；入参必须已经过转义。 */
++function inlineRich(escaped) {
++  const media = (path) => `/api/media?path=${encodeURIComponent(path)}`;
++  return escaped
++    .replace(/\[\[img:([^\]]+)\]\]/g, (_, path) =>
++      `<img class="msg-media" src="${media(path.replace(/&amp;/g, "&"))}" alt="图片" loading="lazy">`)
++    .replace(/\[\[voice:([^\]]+)\]\]/g, (_, path) =>
++      `<audio class="msg-audio" controls preload="none" src="${media(path.replace(/&amp;/g, "&"))}"></audio>`)
++    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
++    .replace(LINK, (whole, label, url) => {
++      const target = url.replace(/&amp;/g, "&").trim();
++      if (!SAFE_URL.test(target)) return whole;
++      return `<a href="${target}" target="_blank" rel="noopener noreferrer">${label}</a>`;
++    })
++    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
++    .replace(/~~([^~\n]+)~~/g, "<del>$1</del>")
++    .replace(/\*([^*\n]+)\*/g, "<em>$1</em>")
++    .replace(/(^|[\s(（])_([^_\n]+)_(?=[\s)）.。，,！!？?]|$)/g, "$1<em>$2</em>");
++}
++
++function splitTableRow(line) {
++  let body = line.trim();
++  if (body.startsWith("|")) body = body.slice(1);
++  if (body.endsWith("|")) body = body.slice(0, -1);
++  return body.split("|").map((cell) => cell.trim());
++}
++
++function renderTable(header, aligns, rows) {
++  const cell = (tag, text, index) => {
++    const align = aligns[index];
++    return `<${tag}${align ? ` style="text-align:${align}"` : ""}>${inlineRich(e(text))}</${tag}>`;
++  };
++  const head = `<thead><tr>${header.map((text, index) => cell("th", text, index)).join("")}</tr></thead>`;
++  const body = rows
++    .map((row) => `<tr>${header.map((_, index) => cell("td", row[index] ?? "", index)).join("")}</tr>`)
++    .join("");
++  return `<div class="md-table"><table>${head}<tbody>${body}</tbody></table></div>`;
++}
++
++/** 列表：按缩进决定嵌套层级，<ul>/<ol> 由相邻项的有序性切换。 */
++function renderListBlock(items) {
++  let html = "";
++  const stack = [];
++  for (const item of items) {
++    const tag = item.ordered ? "ol" : "ul";
++    while (stack.length && item.indent < stack[stack.length - 1].indent) {
++      html += `</li></${stack.pop().tag}>`;
++    }
++    const top = stack[stack.length - 1];
++    if (!top || item.indent > top.indent) {
++      const start = item.ordered && item.start !== 1 ? ` start="${item.start}"` : "";
++      html += `<${tag}${start}>`;
++      stack.push({ tag, indent: item.indent });
++    } else if (top.tag !== tag) {
++      html += `</li></${stack.pop().tag}><${tag}>`;
++      stack.push({ tag, indent: item.indent });
++    } else {
++      html += "</li>";
++    }
++    html += `<li>${inlineRich(e(item.text))}`;
++  }
++  while (stack.length) html += `</li></${stack.pop().tag}>`;
++  return html;
++}
++
++/** 块级：代码围栏、GFM 表格、标题、分割线、引用、列表；其余文字按整段转义。 */
++/** 回复末尾「本轮文件」：只列文件名和打开入口；核验没过就写原因，不给链接。 */
++function renderFiles(files) {
++  if (!files || !files.length) return "";
++  const rows = files.map((file) =>
++    file.ok
++      ? `<a class="msg-file" href="/api/file?path=${encodeURIComponent(file.path)}" target="_blank" rel="noopener">${e(file.name)} · 打开</a>`
++      : `<span class="msg-file failed">${e(file.name)} · ${e(file.error || "未通过核验")}</span>`,
++  );
++  return `<div class="msg-files">${rows.join("")}</div>`;
++}
++
++function renderRich(text) {
++  const lines = String(text).split("\n");
++  const out = [];
++  let buffer = [];
++  const flush = () => {
++    if (!buffer.length) return;
++    out.push(inlineRich(e(buffer.join("\n"))));
++    buffer = [];
++  };
++  for (let i = 0; i < lines.length; i += 1) {
++    const line = lines[i];
++    const next = lines[i + 1];
++
++    if (CODE_FENCE.test(line)) {
++      flush();
++      const lang = line.trim().slice(3).trim();
++      const code = [];
++      i += 1;
++      while (i < lines.length && !CODE_FENCE.test(lines[i])) {
++        code.push(lines[i]);
++        i += 1;
++      }
++      const cls = lang ? ` class="lang-${e(lang)}"` : "";
++      out.push(`<pre class="md-pre"><code${cls}>${e(code.join("\n"))}</code></pre>`);
++      continue;
++    }
++
++    if (line.includes("|") && next !== undefined && next.includes("-") && TABLE_SEPARATOR.test(next)) {
++      flush();
++      const header = splitTableRow(line);
++      const aligns = splitTableRow(next).map((mark) => {
++        const left = mark.startsWith(":");
++        const right = mark.endsWith(":");
++        if (left && right) return "center";
++        if (right) return "right";
++        if (left) return "left";
++        return "";
++      });
++      const rows = [];
++      i += 2;
++      while (i < lines.length && lines[i].includes("|") && lines[i].trim() !== "") {
++        rows.push(splitTableRow(lines[i]));
++        i += 1;
++      }
++      i -= 1;
++      out.push(renderTable(header, aligns, rows));
++      continue;
++    }
++
++    const heading = HEADING.exec(line);
++    if (heading) {
++      flush();
++      const level = Math.min(6, Math.max(3, heading[1].length + 1));
++      out.push(`<h${level}>${inlineRich(e(heading[2]))}</h${level}>`);
++      continue;
++    }
++
++    if (HR.test(line)) {
++      flush();
++      out.push("<hr>");
++      continue;
++    }
++
++    if (QUOTE.test(line)) {
++      flush();
++      const parts = [];
++      while (i < lines.length && QUOTE.test(lines[i])) {
++        parts.push(QUOTE.exec(lines[i])[1]);
++        i += 1;
++      }
++      i -= 1;
++      out.push(`<blockquote>${inlineRich(e(parts.join("\n")))}</blockquote>`);
++      continue;
++    }
++
++    const ulItem = UL_ITEM.exec(line);
++    const olItem = OL_ITEM.exec(line);
++    if (ulItem || olItem) {
++      flush();
++      const items = [];
++      while (i < lines.length) {
++        const ul = UL_ITEM.exec(lines[i]);
++        const ol = OL_ITEM.exec(lines[i]);
++        const m = ul || ol;
++        if (!m) break;
++        items.push({
++          indent: (ul ? m[1] : m[1]).replace(/\t/g, "  ").length,
++          ordered: Boolean(ol),
++          start: ol ? Number(ol[2]) : 1,
++          text: ul ? ul[2] : ol[3],
++        });
++        i += 1;
++      }
++      i -= 1;
++      out.push(renderListBlock(items));
++      continue;
++    }
++
++    buffer.push(line);
++  }
++  flush();
++  return out.join("\n");
++}
++
++
++/** 每条回复旁的「念」按钮：交给嘴巴插件合成并播放。 */
++function installSayButton() {
++  document.addEventListener("click", async (evt) => {
++    const btn = evt.target.closest && evt.target.closest(".say-btn");
++    if (!btn || btn.disabled) return;
++    evt.preventDefault();
++    const holder = btn.closest(".message");
++    const bubble = holder && holder.querySelector(".bubble");
++    let text = "";
++    if (bubble) {
++      const copy = bubble.cloneNode(true);
++      copy.querySelectorAll(".say-btn, .msg-media, .msg-files").forEach((n) => n.remove());
++      text = (copy.innerText || "").trim();
++    }
++    if (!text) return;
++    const face = btn.textContent;
++    btn.disabled = true;
++    btn.textContent = "…";
++    try {
++      await api("/plugins/mouth/say", { text });
++      btn.textContent = "✓";
++    } catch (error) {
++      btn.textContent = "✕";
++      btn.title = String((error && error.message) || error);
++    } finally {
++      setTimeout(() => {
++        btn.textContent = face;
++        btn.disabled = false;
++      }, 2000);
++    }
++  });
++}
+diff --git a/core/ui/context.js b/core/ui/context.js
+index ea8ec82..94628f1 100644
+--- a/core/ui/context.js
++++ b/core/ui/context.js
+@@ -13,9 +13,12 @@ function requestMetrics(usage) {
+   const tokens = value => Number.isSafeInteger(value) && value >= 0 ? number(value) + " tokens" : "未报告";
+   const cacheDetail = `最近一次请求缓存：命中 ${tokens(cache?.hit_tokens)}；未命中 ${tokens(cache?.miss_tokens)}；命中率 ${cachePercent || "未报告"}。`;
+   const validMoney = value => Number.isFinite(value) && value >= 0;
+-  const money = value => value > 0 && value < 0.000001 ? "<¥0.000001" :
+-    "¥" + value.toLocaleString("zh-CN", { maximumFractionDigits: 6 });
+-  const amount = cost?.currency === "CNY" && cost.basis === "reference" ?
++  // 价目表按供应商本币记账：DeepSeek 官方是 CNY，MiraRouter 与 Gemini 是 USD。
++  const symbol = cost?.currency === "USD" ? "$" : "¥";
++  const money = value => value > 0 && value < 0.000001 ? `<${symbol}0.000001` :
++    symbol + value.toLocaleString("zh-CN", { maximumFractionDigits: 6 });
++  const priced = cost?.basis === "reference" && (cost?.currency === "CNY" || cost?.currency === "USD");
++  const amount = priced ?
+     validMoney(cost.amount) ? money(cost.amount) : validMoney(cost.min) && validMoney(cost.max) && cost.max >= cost.min ?
+       `${money(cost.min)}–${money(cost.max)}` : null : null;
+   const costDetail = amount
+@@ -55,7 +58,7 @@ function renderDiarySettings(p) {
+ function renderDiaryState(current) {
+   const diary = current?.diary;
+   if (!diary) return "";
+-  return `<div class="context-diary-state"><p class="muted">日记 ${number(diary.count ?? diary.entries?.length ?? 0)} 篇 · 覆盖 ${number(diary.covered_messages ?? 0)} 条原文 · 剩余 ${number(diary.remaining_messages ?? current.available_messages ?? 0)} 条原文 · ${number(diary.chars ?? 0)} 字符${diary.enabled === false ? "；自动整理已关闭，已有有效日记仍按历史设置使用" : ""}${Number.isFinite(diary.budget_remaining) ? `。今日整理剩余额度 ${number(diary.budget_remaining)} tokens` : ""}。</p>${diary.invalid ? '<p class="muted">部分日记的来源已变化，暂不带入上下文，需根据有效原文重建。</p>' : ""}${diary.notice ? `<p class="muted">${e(diary.notice)}</p>` : ""}${diary.paused ? `<p class="form-error">日记整理已暂停；保留原文与已保存日记。${diary.paused.reason ? e(diary.paused.reason) : ""}</p><button class="btn small" type="button" data-diary-retry>恢复日记整理</button>` : ""}</div>`;
++  return `<div class="context-diary-state"><p class="muted">日记 ${number(diary.count ?? diary.entries?.length ?? 0)} 篇 · 覆盖 ${number(diary.covered_messages ?? 0)} 条原文 · 剩余 ${number(diary.remaining_messages ?? current.available_messages ?? 0)} 条原文 · 日记正文 ${number(diary.chars ?? 0)} 字符${diary.enabled === false ? "；自动整理已关闭，已有有效日记仍按历史设置使用" : ""}${Number.isFinite(diary.budget_remaining) ? `。今日整理剩余额度 ${number(diary.budget_remaining)} tokens` : ""}。</p>${diary.invalid ? '<p class="muted">部分日记的来源已变化，暂不带入上下文，需根据有效原文重建。</p>' : ""}${diary.notice ? `<p class="muted">${e(diary.notice)}</p>` : ""}${diary.paused ? `<p class="form-error">日记整理已暂停；保留原文与已保存日记。${diary.paused.reason ? e(diary.paused.reason) : ""}</p><button class="btn small" type="button" data-diary-retry>恢复日记整理</button>` : ""}</div>`;
+ }
+ export function renderContextPanel(app) {
+   const s = app.state, current = s.memoryContext, selected = viewedSession(s);
+diff --git a/core/ui/styles.css b/core/ui/styles.css
+index 5251c75..0d0d3ab 100644
+--- a/core/ui/styles.css
++++ b/core/ui/styles.css
+@@ -812,7 +812,7 @@ main {
+   min-height: 0;
+   overflow: auto;
+   padding: 22px 28px;
+-  scroll-behavior: smooth;
++  scroll-behavior: auto;
+ }
+ .chat-empty {
+   height: 100%;
+@@ -1393,3 +1393,348 @@ dialog::backdrop {
+ }
+ .extension-panel { overflow: hidden; min-height: 480px; }
+ .extension-frame { display: block; width: 100%; height: max(480px, calc(100dvh - 230px)); border: 0; background: white; }
++
++
++/* 消息内的图片与语音 */
++.msg-media { display: block; max-width: min(360px, 100%); margin-top: 8px; border-radius: 10px; }
++.bubble img {
++  display: block;
++  width: auto;
++  height: auto;
++  max-width: min(320px, 100%);
++  max-height: 220px;
++  margin-top: 8px;
++  border-radius: 10px;
++  border: 1px solid rgba(0, 0, 0, 0.08);
++  object-fit: cover;
++  cursor: zoom-in;
++  background: #f2f3f7;
++}
++.image-zoom {
++  position: fixed;
++  inset: 0;
++  z-index: 999;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  padding: 24px;
++  background: rgba(12, 14, 18, 0.82);
++  cursor: zoom-out;
++}
++.image-zoom[hidden] { display: none; }
++.image-zoom img { max-width: 96vw; max-height: 92vh; border-radius: 8px; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45); }
++.composer.dragging { outline: 2px dashed var(--accent, #c5ac72); outline-offset: -4px; }
++.composer-images { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 12px 0; }
++.composer-images[hidden] { display: none; }
++.pending-image { position: relative; margin: 0; }
++.pending-image img { display: block; width: 72px; height: 72px; object-fit: cover; border-radius: 8px; border: 1px solid rgba(0, 0, 0, 0.12); }
++.pending-image button { position: absolute; top: -6px; right: -6px; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 50%; background: rgba(0, 0, 0, 0.65); color: #fff; font-size: 13px; line-height: 20px; cursor: pointer; }
++.composer .attach { cursor: pointer; margin-right: 8px; }
++.composer .attach input { display: none; }
++.msg-audio { display: block; width: min(320px, 100%); margin-top: 8px; }
++
++/* 思考中提示 */
++.bubble.thinking { display: inline-flex; align-items: center; gap: 5px; color: #8a8f98; letter-spacing: 0.02em; }
++.bubble.thinking i { font-style: normal; animation: think-dot 1.2s infinite ease-in-out; }
++.bubble.thinking i:nth-child(2) { animation-delay: 0.15s; }
++.bubble.thinking i:nth-child(3) { animation-delay: 0.3s; }
++.bubble.thinking span { margin-left: 4px; animation: think-fade 1.8s infinite ease-in-out; }
++.bubble.thinking em.think-face { font-style: normal; letter-spacing: 0; margin-left: 2px; }
++@keyframes think-dot { 0%, 60%, 100% { opacity: 0.25; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-2px); } }
++@keyframes think-fade { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
++/* 对话区：左边导航轨，右边消息流 */
++.chat-body { flex: 1; min-height: 0; display: flex; align-items: stretch; gap: 10px; padding-left: 12px; }
++.chat-body > .messages { flex: 1; min-width: 0; }
++.chat-history-more { text-align: center; font-size: 12px; color: #8a8f98; padding: 6px 0 14px; cursor: pointer; user-select: none; }
++.chat-history-more:hover { color: #2c2f33; }
++@media (max-width: 900px) { .chat-rail { display: none; } }
++
++/* ── 左侧导航轨：一条用户请求一节，摘要放悬浮卡里（勘 2026-11-16） ── */
++.chat-rail {
++  flex: 0 0 18px;
++  width: 18px;
++  position: relative;
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++  padding: 12px 0;
++  overflow: hidden;
++}
++.chat-rail[hidden] { display: none; }
++.chat-rail-tick {
++  position: absolute;
++  left: 0;
++  transform: translateY(-50%);
++  display: flex;
++  align-items: center;
++  width: 100%;
++  min-height: 5px;
++  max-height: 14px;
++  padding: 0;
++  border: 0;
++  background: transparent;
++  cursor: pointer;
++}
++.chat-rail-tick i {
++  display: block;
++  width: 9px;
++  height: 2px;
++  border-radius: 1px;
++  background: #d2d6dd;
++  transition: width 0.12s ease, background 0.12s ease;
++}
++.chat-rail-tick i { pointer-events: none; }
++.chat-rail-tick:hover i { width: 12px; background: #9aa0ab; }
++.chat-rail-tick.active i,
++.chat-rail-tick.active:hover i { width: 14px; background: #6158d9; }
++.chat-rail-card {
++  position: fixed;
++  z-index: 80;
++  width: 300px;
++  padding: 12px 14px;
++  border: 1px solid rgba(20, 24, 40, 0.1);
++  border-radius: 12px;
++  background: var(--surface, #fff);
++  box-shadow: 0 12px 34px rgba(20, 24, 40, 0.16);
++  pointer-events: none;
++  font-size: 12.5px;
++  line-height: 1.55;
++}
++.chat-rail-card[hidden] { display: none; }
++.chat-rail-card b { display: block; margin-bottom: 6px; color: #16181c; font-weight: 600; }
++.chat-rail-card span { display: block; color: #828793; }
++.chat-rail-card .chat-rail-card-meta { margin-top: 8px; font-size: 11px; color: #a3a8b3; }
++
++/* 本轮中途补的那句话：小一号、斜体，跟正常一轮区分开（勘 2026-11-16） */
++.message.nudge .bubble {
++  font-style: italic;
++  font-size: 12px;
++  opacity: 0.78;
++  border-style: dashed;
++}
++
++/* 账本：只有这个页用，权重不高，放在最后避免影响别处 */
++.ledger-table { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
++.ledger-row { display: grid; grid-template-columns: 96px minmax(160px, 1.6fr) 56px 84px 84px 132px; gap: 10px; align-items: center; padding: 9px 12px; border-radius: 10px; font-size: 13px; }
++.ledger-row:nth-child(odd) { background: rgba(120, 130, 155, 0.06); }
++.ledger-head { font-size: 12px; color: var(--muted, #7c8291); background: none !important; }
++.ledger-model { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.ledger-row > span:nth-child(n + 3) { text-align: right; font-variant-numeric: tabular-nums; }
++.ledger-money { color: var(--accent); font-weight: 600; }
++@media (max-width: 860px) {
++  .ledger-row { grid-template-columns: 84px minmax(110px, 1.4fr) 44px 70px 70px 108px; font-size: 12px; gap: 6px; }
++}
++
++/* 账本图表：只用现有数据画，不引入任何依赖 */
++.usage-bars { display: flex; align-items: flex-end; gap: 10px; height: 160px; padding: 8px 2px 0; }
++.usage-bar { flex: 1; min-width: 26px; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; gap: 6px; }
++.usage-bar-fill { width: 100%; max-width: 46px; border-radius: 6px 6px 2px 2px; background: linear-gradient(180deg, var(--accent) 0%, #8f88e8 100%); transition: height .25s ease; }
++.usage-bar:hover .usage-bar-fill { background: var(--accent-hover); }
++.usage-bar > span { font-size: 11px; color: var(--muted, #7c8291); white-space: nowrap; }
++.usage-bar.zero .usage-bar-fill { background: transparent; border-top: 1px dashed rgba(124, 130, 145, .35); border-radius: 0; max-width: none; }
++.usage-bar.zero:hover .usage-bar-fill { background: transparent; }
++.usage-bar.zero > span { opacity: .45; }
++.usage-bars.dense { gap: 3px; }
++.usage-bars.dense .usage-bar { min-width: 6px; }
++.usage-bars.dense .usage-bar-fill { border-radius: 3px 3px 1px 1px; }
++.usage-bars.dense .usage-bar > span { font-size: 9px; writing-mode: vertical-rl; letter-spacing: .5px; }
++.usage-ranking { display: flex; flex-direction: column; gap: 10px; }
++.usage-rank { display: grid; grid-template-columns: minmax(120px, 1.1fr) minmax(120px, 2fr) 132px; gap: 12px; align-items: center; font-size: 13px; }
++.usage-rank-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.usage-rank-track { height: 8px; border-radius: 999px; background: rgba(120, 130, 155, 0.12); overflow: hidden; }
++.usage-rank-fill { height: 100%; border-radius: 999px; background: var(--accent); }
++.usage-rank-value { text-align: right; color: var(--muted, #7c8291); font-variant-numeric: tabular-nums; }
++@media (max-width: 720px) {
++  .usage-rank { grid-template-columns: 1fr; gap: 4px; }
++  .usage-rank-value { text-align: left; }
++  .usage-bars { gap: 4px; }
++}
++
++/* 24 小时按模型堆叠：柱高按总额归一，段色对应图例 */
++.usage-legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--muted); margin-bottom: 14px; }
++.usage-legend .legend-item { display: inline-flex; align-items: center; gap: 6px; }
++.usage-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
++.hour-chart { display: flex; gap: 10px; padding-bottom: 18px; }
++.hour-yaxis { display: flex; flex-direction: column; justify-content: space-between; height: 180px; min-width: 48px; text-align: right; font-size: 10px; color: var(--muted); font-variant-numeric: tabular-nums; }
++.hour-plot { position: relative; flex: 1; min-width: 0; height: 180px; }
++.hour-grid { position: absolute; inset: 0; pointer-events: none; }
++.hour-grid i { position: absolute; left: 0; right: 0; border-top: 1px dashed rgba(124, 130, 145, .22); }
++.hour-bars { position: relative; display: flex; align-items: stretch; gap: 3px; height: 100%; border-bottom: 1px solid var(--line); }
++.hour-bar { position: relative; flex: 1; min-width: 0; }
++.hour-bar:hover { background: rgba(97, 88, 217, .06); border-radius: 3px 3px 0 0; }
++.hour-stack { position: absolute; inset: 0; display: flex; flex-direction: column-reverse; }
++.hour-seg { display: block; width: 100%; min-height: 1px; transition: opacity .15s ease; }
++.hour-seg:first-child { border-radius: 0 0 2px 2px; }
++.hour-seg:last-child { border-radius: 2px 2px 0 0; }
++.hour-bar:hover .hour-seg { opacity: .82; }
++.hour-mark { position: absolute; bottom: -16px; left: 50%; transform: translateX(-50%); font-size: 10px; font-style: normal; color: var(--muted); white-space: nowrap; }
++.hour-tip { position: absolute; z-index: 6; top: 4px; left: calc(100% + 8px); min-width: 168px; padding: 9px 11px; border-radius: 9px; background: var(--surface, #fff); color: var(--text, #272b39); border: 1px solid var(--line, #e9ebf1); box-shadow: 0 8px 22px rgba(39, 43, 57, .13); font-size: 11px; line-height: 1.7; opacity: 0; visibility: hidden; transform: translateY(2px); transition: opacity .12s ease, transform .12s ease; pointer-events: none; }
++.hour-tip.flip { left: auto; right: calc(100% + 8px); }
++.day-zero .hour-mark { opacity: .4; }
++.hour-bar.day-zero .hour-stack { border-bottom: 1px dashed rgba(124, 130, 145, .35); }
++.hour-bar:hover .hour-tip { opacity: 1; visibility: visible; transform: none; }
++.hour-tip strong { display: block; font-size: 12px; margin-bottom: 4px; font-weight: 600; }
++.hour-tip-row { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
++.hour-tip-row i { width: 8px; height: 8px; border-radius: 2px; flex: none; }
++.hour-tip-row b { margin-left: auto; font-weight: 500; font-variant-numeric: tabular-nums; }
++.hour-tip-row.empty { color: var(--muted, #818696); }
++@media (max-width: 720px) {
++  .hour-plot, .hour-yaxis { height: 130px; }
++  .hour-tip { min-width: 140px; font-size: 10px; }
++  .usage-legend { font-size: 11px; gap: 10px; }
++}
++.heading-actions .icon-only{padding:9px 10px;gap:0}
++
++/* 对话里的表格：无外框，只有横线；表头浅灰，数字列用等宽数字方便对齐 */
++.message .bubble .md-table {
++  white-space: normal;
++  margin: 8px 0;
++  max-width: 100%;
++  overflow-x: auto;
++}
++.message .bubble .md-table table {
++  border-collapse: collapse;
++  font-size: 12.5px;
++  line-height: 1.55;
++}
++.message .bubble .md-table th,
++.message .bubble .md-table td {
++  border: 0;
++  border-bottom: 1px solid var(--line);
++  padding: 7px 14px 7px 0;
++  vertical-align: top;
++  text-align: left;
++}
++.message .bubble .md-table th:last-child,
++.message .bubble .md-table td:last-child { padding-right: 0; }
++.message .bubble .md-table th {
++  color: var(--muted);
++  font-weight: 500;
++  font-size: 11.5px;
++  white-space: nowrap;
++  border-bottom-color: #dfe2ea;
++}
++.message .bubble .md-table tbody tr:last-child td { border-bottom: 0; }
++.message .bubble .md-table th[style*="right"],
++.message .bubble .md-table td[style*="right"] { font-variant-numeric: tabular-nums; }
++.message .bubble .md-table td:first-child { white-space: normal; }
++@media (max-width: 720px) {
++  .message .bubble .md-table table { font-size: 12px; }
++  .message .bubble .md-table th,
++  .message .bubble .md-table td { padding: 6px 9px 6px 0; }
++}
++
++/* 行内语法：粗体 / 行内代码 / 删除线 —— 勘 20261116 */
++.message .bubble strong {
++  font-weight: 650;
++  color: var(--ink);
++}
++.message .bubble code {
++  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
++  font-size: 0.92em;
++  padding: 1px 5px;
++  border-radius: 4px;
++  background: rgba(0, 0, 0, 0.055);
++  border: 1px solid rgba(0, 0, 0, 0.04);
++}
++.message .bubble del {
++  color: var(--muted);
++  text-decoration-thickness: 1px;
++}
++
++/* 块级排版：标题 / 列表 / 引用 / 分割线 / 代码围栏 / 链接 / 斜体 */
++.message .bubble h3,
++.message .bubble h4,
++.message .bubble h5,
++.message .bubble h6 {
++  margin: 12px 0 6px;
++  line-height: 1.35;
++  color: var(--ink);
++  font-weight: 650;
++}
++.message .bubble h3 { font-size: 1.08em; }
++.message .bubble h4 { font-size: 1.02em; }
++.message .bubble h5,
++.message .bubble h6 { font-size: 0.98em; color: var(--muted); }
++.message .bubble > :first-child,
++.message .bubble .md-table + p { margin-top: 0; }
++.message .bubble ul,
++.message .bubble ol {
++  margin: 6px 0;
++  padding-left: 20px;
++}
++.message .bubble ul { list-style: disc; }
++.message .bubble ol { list-style: decimal; }
++.message .bubble ul ul { list-style: circle; margin: 3px 0; }
++.message .bubble li { margin: 2px 0; }
++.message .bubble li > ul,
++.message .bubble li > ol { margin: 3px 0 0; }
++.message .bubble blockquote {
++  margin: 8px 0;
++  padding: 2px 0 2px 11px;
++  border-left: 2px solid var(--line, rgba(0, 0, 0, 0.14));
++  color: var(--muted);
++}
++.message .bubble hr {
++  margin: 12px 0;
++  border: 0;
++  border-top: 1px solid var(--line, rgba(0, 0, 0, 0.12));
++}
++.message .bubble a {
++  color: var(--accent, #2563eb);
++  text-decoration: underline;
++  text-underline-offset: 2px;
++}
++.message .bubble em { font-style: italic; }
++.message .bubble .md-pre {
++  margin: 8px 0;
++  padding: 9px 11px;
++  border-radius: 6px;
++  background: rgba(0, 0, 0, 0.045);
++  border: 1px solid rgba(0, 0, 0, 0.05);
++  overflow-x: auto;
++}
++.message .bubble .md-pre code {
++  padding: 0;
++  border: 0;
++  background: none;
++  font-size: 0.9em;
++  line-height: 1.5;
++  white-space: pre;
++}
++
++/* 回复末尾「本轮文件」：程序核验过的写入才出现在这里（勘 2026-11-17）。 */
++.msg-files { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
++.msg-file { font-size: 12px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 999px; color: var(--accent); text-decoration: none; }
++.msg-file:hover { border-color: var(--accent); }
++.msg-file.failed { color: var(--muted); }
++
++
++/* 气泡末尾的「念」按钮 */
++.bubble .say-row { display: flex; justify-content: flex-end; margin-top: 8px; }
++.bubble .say-btn {
++  width: 26px;
++  height: 26px;
++  padding: 0;
++  display: grid;
++  place-items: center;
++  font-size: 13px;
++  line-height: 1;
++  border-radius: 8px;
++  border: 1px solid rgba(127, 127, 127, 0.3);
++  background: transparent;
++  color: var(--muted, #797e8c);
++  cursor: pointer;
++  opacity: 0.5;
++  transition: opacity 0.15s, border-color 0.15s, color 0.15s;
++}
++.bubble .say-btn svg { display: block; }
++.bubble .say-btn:hover {
++  opacity: 1;
++  color: #7c5cff;
++  border-color: rgba(124, 92, 255, 0.5);
++}
++.bubble .say-btn:disabled {
++  opacity: 1;
++  cursor: default;
++}
+diff --git a/core/ui/views.js b/core/ui/views.js
+index 7884c7e..cc5944b 100644
+--- a/core/ui/views.js
++++ b/core/ui/views.js
+@@ -120,13 +120,15 @@ export function renderBindings(app) {
+   const sessionSettings = `<section class="panel panel-body" style="margin-bottom:22px"><h2>当前会话</h2><p>正在使用：<strong>${e(sessionName(app.state))}</strong> <small>${e(app.state.session)}</small></p><div class="row context-session-select"><label for="active-session">切换到</label><select id="active-session" ${app.state.chatBusy ? "disabled" : ""}>${sessions.map(item => `<option value="${e(item.id)}" ${item.id === app.state.session ? "selected" : ""}>${e(item.name || item.id)}${item.id === app.state.session ? "（正在使用）" : ""}</option>`).join("")}</select><button id="apply-session" class="btn primary small" type="button" disabled>切换会话</button><button id="new-session" class="btn small" type="button" ${app.state.chatBusy ? "disabled" : ""}>${icon("plus")}新建并使用</button></div><p class="hint">选好后点击“切换会话”才生效。网页和跟随当前会话的插件共用此选择，正在处理的请求仍留在原会话。浏览记忆档案不会切换这里。</p><p id="session-switch-error" class="form-error" role="alert"></p></section>`;
+   const activePersona = c.activePersona || app.state.status?.persona || "";
+   const personaSettings = `<label class="form-field"><span>当前聊天人格</span><select id="active-persona" name="activePersona" required ${app.state.chatBusy || !c.personas.length ? "disabled" : ""}>${!activePersona ? '<option value="">请选择人格</option>' : ""}${c.personas.map((p) => `<option value="${e(p.id)}" ${p.id === activePersona ? "selected" : ""}>${e(p.name)}</option>`).join("")}</select></label><p id="active-persona-routing" class="hint" style="margin-top:16px">${e(personaRoutingText(c, activePersona))}</p><p class="hint" style="margin-top:12px">与模型选择一起保存后生效。切换人格保持当前会话和聊天记录；请等待当前回复结束后切换。</p><a href="#personas" class="btn tonal" style="margin-top:18px">编辑人格 ${icon("arrow")}</a>`;
+-  const options = (type, selected, inherit = false) =>
+-    `<option value="">${inherit ? "使用工作空间的对话模型" : "未配置"}</option>` +
++  const options = (type, selected, inherit = false) => {
++    // 日记整理借用对话模型那一类；模型本身没有 type=diary。
++    const kind = type === "diary" ? "chat" : type;
++    return `<option value="">${inherit ? "使用工作空间的对话模型" : "未配置"}</option>` +
+     c.models
+       .filter(
+         (m) =>
+-          m.type === type &&
+-          (type !== "chat" || coreChatModel(c, m)) &&
++          m.type === kind &&
++          (kind !== "chat" || coreChatModel(c, m)) &&
+           m.enabled &&
+           !m.configuration_error &&
+           c.providers.find((p) => p.id === m.provider)?.enabled,
+@@ -136,9 +138,10 @@ export function renderBindings(app) {
+           `<option value="${e(m.id)}" ${m.id === selected ? "selected" : ""}>${e(m.name)} · ${e(c.providers.find((p) => p.id === m.provider)?.name || m.provider)}</option>`,
+       )
+       .join("");
++  };
+   const field = (type, description) =>
+     `<div class="binding-row"><div class="row">${icon(typeIcon(type))}<h3>${typeNames[type]}模型</h3></div><select name="binding_${type}" aria-label="${typeNames[type]}模型">${options(type, c.bindings[type])}</select><p>${description}</p></div>`;
+-  return `<div class="page-heading"><div><div class="eyebrow">MODEL ROUTING</div><h1>使用配置</h1><p>明确选择每种能力使用的模型。未配置的用途保持关闭。</p></div><div class="heading-actions"><button type="submit" form="bindings-form" class="btn primary" id="save-bindings">${icon("check")}保存配置</button></div></div><div class="info-banner">${icon("info")}选择已启用的模型，保存后从下一次请求开始生效。</div>${sessionSettings}<form id="bindings-form"><div class="bindings-grid"><section class="panel"><div class="panel-header"><h2>工作空间模型</h2><a href="#models" class="btn small link">管理模型 ${icon("arrow")}</a></div><div class="panel-body">${field("chat", "用于鲸鲸的日常对话和会话摘要。")}${field("embedding", "供插件使用的向量模型。当前支持配置与接口测试；检索由插件实现。")}${field("rerank", "供重排序插件使用的模型选择，可留空。")}<details style="margin-top:20px"><summary class="muted">更多模型用途</summary><div style="margin-top:20px">${field("image", "图像生成服务的模型选择。")}${field("stt", "语音识别服务的模型选择。")}${field("tts", "语音合成服务的模型选择。")}<p class="hint" style="margin-top:16px">这里保存模型选择，图像、语音与重排序的具体调用由对应插件实现。</p></div></details></div></section><section class="panel"><div class="panel-header"><h2>人格配置</h2></div><div class="panel-body">${personaSettings}${timeSettings}</div></section></div><p id="bindings-error" class="form-error" role="alert"></p></form>`;
++  return `<div class="page-heading"><div><div class="eyebrow">MODEL ROUTING</div><h1>使用配置</h1><p>明确选择每种能力使用的模型。未配置的用途保持关闭。</p></div><div class="heading-actions"><button type="submit" form="bindings-form" class="btn primary" id="save-bindings">${icon("check")}保存配置</button></div></div><div class="info-banner">${icon("info")}选择已启用的模型，保存后从下一次请求开始生效。</div>${sessionSettings}<form id="bindings-form"><div class="bindings-grid"><section class="panel"><div class="panel-header"><h2>工作空间模型</h2><a href="#models" class="btn small link">管理模型 ${icon("arrow")}</a></div><div class="panel-body">${field("chat", "用于鲸鲸的日常对话和会话摘要。")}${field("diary", "日记整理单独使用的模型。留空则沿用对话模型。")}${field("embedding", "供插件使用的向量模型。当前支持配置与接口测试；检索由插件实现。")}${field("rerank", "供重排序插件使用的模型选择，可留空。")}<details style="margin-top:20px"><summary class="muted">更多模型用途</summary><div style="margin-top:20px">${field("image", "图像生成服务的模型选择。")}${field("stt", "语音识别服务的模型选择。")}${field("tts", "语音合成服务的模型选择。")}<p class="hint" style="margin-top:16px">这里保存模型选择，图像、语音与重排序的具体调用由对应插件实现。</p></div></details></div></section><section class="panel"><div class="panel-header"><h2>人格配置</h2></div><div class="panel-body">${personaSettings}${timeSettings}</div></section></div><p id="bindings-error" class="form-error" role="alert"></p></form>`;
+ }
+ export function bindBindings(app) {
+   app.bindingsDirty = false;
+@@ -184,7 +187,7 @@ export function bindBindings(app) {
+     button.disabled = true;
+     const next = app.configDraft();
+     if (selectedPersona) next.activePersona = selectedPersona;
+-    for (const key of ["chat", "embedding", "rerank", "image", "stt", "tts"])
++    for (const key of ["chat", "diary", "embedding", "rerank", "image", "stt", "tts"])
+       next.bindings[key] = data.get("binding_" + key) || null;
+     try {
+       await app.saveConfig(next);
+@@ -208,7 +211,8 @@ export function bindPlugins(app) {
+ export function renderChat(app) {
+   const model = activeChat(app);
+   const personaName = app.state.status.personaName || "助手";
+-  return `<div class="page-heading"><div><div class="eyebrow">PLAYGROUND</div><h1>和${e(personaName)}聊聊</h1><p>测试当前人格的回复，也可以要求记下一条事实。</p></div><div class="heading-actions"><a class="btn" href="#bindings">当前会话：${e(sessionName(app.state))} ${icon("sliders")}</a></div></div><section class="panel chat-panel"><div class="chat-header"><span class="avatar">${e(personaName.slice(0, 1))}</span><div><h3>${e(app.state.status.personaName || "鲸鲸")}</h3><small>${e(model?.name || "请先选择对话模型")} <span>·</span> ${e(app.state.status.persona)}</small></div><div class="spacer"></div><a href="#bindings" class="btn small link">更换模型 ${icon("sliders")}</a></div><div id="chat-context">${renderContextMeter(app.state.sessionContext, true)}</div><div id="messages" class="messages" aria-live="polite"></div><form id="chat-form" class="composer"><textarea id="chat-input" aria-label="聊天消息" placeholder="和${e(personaName)}说点什么…" rows="2"></textarea><div class="composer-footer"><small>Enter 发送 · Shift + Enter 换行</small><button id="send" class="btn primary small" type="submit" ${app.state.chatBusy || !app.chatConnected || !model ? "disabled" : ""}>${app.state.chatBusy ? "正在回复…" : "发送"} ${icon("send")}</button></div></form></section>`;
++  return `<div class="page-heading"><div><div class="eyebrow">PLAYGROUND</div><h1>和${e(personaName)}聊聊</h1><p>测试当前人格的回复，也可以要求记下一条事实。</p></div><div class="heading-actions"><a class="btn" href="#bindings">当前会话：${e(sessionName(app.state))} ${icon("sliders")}</a><button type="button" class="btn icon-only" id="rename-session" title="给当前会话改名" aria-label="给当前会话改名">${icon("edit")}</button></div></div><section class="panel chat-panel"><div class="chat-header"><span class="avatar">${e(personaName.slice(0, 1))}</span><div><h3>${e(app.state.status.personaName || "鲸鲸")}</h3><small>${e(model?.name || "请先选择对话模型")} <span>·</span> ${e(app.state.status.persona)}</small></div><div class="spacer"></div><a href="#bindings" class="btn small link">更换模型 ${icon("sliders")}</a></div><div id="chat-context">${renderContextMeter(app.state.sessionContext, true)}</div><div class="chat-body"><aside id="chat-rail" class="chat-rail" hidden></aside><div id="messages" class="messages" aria-live="polite"></div></div><form id="chat-form" class="composer"><textarea id="chat-input" aria-label="聊天消息" placeholder="和${e(personaName)}说点什么…" rows="2"></textarea><div id="composer-images" class="composer-images" hidden></div>
++<div class="composer-footer"><small>Enter 发送 · Shift + Enter 换行</small><label class="btn small attach" title="添加图片（也可直接粘贴或拖进来）">图片<input id="image-input" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden></label><button id="send" class="btn primary small" type="submit" ${app.state.chatBusy || !app.chatConnected || !model ? "disabled" : ""}>${app.state.chatBusy ? "正在回复…" : "发送"} ${icon("send")}</button></div></form></section>`;
+ }
+ export function bindChat(app) {
+   app.refreshSessionContext();
+@@ -216,6 +220,9 @@ export function bindChat(app) {
+   const input = document.querySelector("#chat-input");
+   input.value = app.state.chatDraft || "";
+   input.oninput = () => (app.state.chatDraft = input.value);
++  app.bindImageComposer();
++  const renameBtn = document.querySelector("#rename-session");
++  if (renameBtn) renameBtn.onclick = () => app.renameSession();
+   input.onkeydown = (event) => {
+     if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+       event.preventDefault();
