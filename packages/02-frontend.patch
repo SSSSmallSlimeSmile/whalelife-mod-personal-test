@@ -11,7 +11,7 @@ index 7d430e0..42d04f3 100644
    rerank: "重排序",
    image: "图像生成",
 diff --git a/core/ui/app.js b/core/ui/app.js
-index 55ade77..f30c1c1 100644
+index 55ade77..879b295 100644
 --- a/core/ui/app.js
 +++ b/core/ui/app.js
 @@ -31,6 +31,8 @@ const pages = {
@@ -363,7 +363,7 @@ index 55ade77..f30c1c1 100644
          return;
        }
        if (data.type === "chunk") {
-@@ -387,6 +654,10 @@ class ConsoleApp {
+@@ -387,7 +654,14 @@ class ConsoleApp {
            this.state.messages.push(this.reply);
          }
          this.reply.text += data.text;
@@ -372,9 +372,13 @@ index 55ade77..f30c1c1 100644
 +          return;
 +        }
        } else if (data.type === "done" || data.type === "error") {
++        // 这一轮正文里出现过工具协议标记，后端已把它换成了说明：
++        // 只在气泡下面加一行灰字，不往正文里塞任何内容。
++        if (data.type === "done" && data.protocol === "projected" && this.reply) this.reply.protocolNote = true;
          if (data.type === "error") {
            this.state.messages.push({ role: "error", text: data.error });
-@@ -457,26 +728,35 @@ class ConsoleApp {
+           this.toast(data.error, true);
+@@ -457,26 +731,35 @@ class ConsoleApp {
            m.id === (persona?.model || this.state.config.bindings.chat) &&
            m.enabled,
        );
@@ -419,7 +423,7 @@ index 55ade77..f30c1c1 100644
      this.replyPersonaName = this.state.status.personaName;
      this.chatWS.send(
        JSON.stringify({
-@@ -484,11 +764,98 @@ class ConsoleApp {
+@@ -484,11 +767,98 @@ class ConsoleApp {
          expectedSession: this.state.session,
          text,
          persona: this.state.status.persona,
@@ -518,7 +522,7 @@ index 55ade77..f30c1c1 100644
    async newSession() {
      if (this.state.chatBusy || this.sessionChanging) return;
      this.sessionChanging = true;
-@@ -504,21 +871,60 @@ class ConsoleApp {
+@@ -504,21 +874,60 @@ class ConsoleApp {
        this.updateChatControls();
      }
    }
@@ -538,7 +542,7 @@ index 55ade77..f30c1c1 100644
        .map(
          (m) =>
 -          `<div class="message ${m.role === "user" ? "user" : m.role === "error" ? "error" : ""}"><span class="mini-avatar" title="${e(m.personaName || "助手")}">${m.role === "user" ? "你" : m.role === "error" ? "!" : e((m.personaName || "助手").slice(0, 1))}</span><div class="bubble">${e(m.text)}</div></div>`,
-+          `<div class="message ${m.role === "user" ? "user" : m.role === "error" ? "error" : ""}${m.nudge ? " nudge" : ""}"><span class="mini-avatar" title="${e(m.personaName || "助手")}">${m.role === "user" ? "你" : m.role === "error" ? "!" : e((m.personaName || "助手").slice(0, 1))}</span><div class="bubble">${renderRich(m.text)}${(m.images || []).map((url) => `<img class="msg-media" src="${url}" alt="图片">`).join("")}${renderFiles(m.files)}${m.role === "user" || m.role === "error" ? "" : '<div class="say-row"><button class="say-btn" title="念出来"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4V5Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg></button></div>'}</div></div>`,
++          `<div class="message ${m.role === "user" ? "user" : m.role === "error" ? "error" : ""}${m.nudge ? " nudge" : ""}"><span class="mini-avatar" title="${e(m.personaName || "助手")}">${m.role === "user" ? "你" : m.role === "error" ? "!" : e((m.personaName || "助手").slice(0, 1))}</span><div class="bubble">${renderRich(m.text)}${(m.images || []).map((url) => `<img class="msg-media" src="${url}" alt="图片">`).join("")}${renderFiles(m.files)}${m.protocolNote ? '<div class="protocol-note">本轮模型把工具调用写成了文字，已替换为说明，没有执行任何工具。</div>' : ""}${m.role === "user" || m.role === "error" ? "" : '<div class="say-row"><button class="say-btn" title="念出来"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4V5Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg></button></div>'}</div></div>`,
        )
        .join("");
 -    box.scrollTop = box.scrollHeight;
@@ -581,7 +585,7 @@ index 55ade77..f30c1c1 100644
    }
    filteredLogs() {
      return this.state.logs.filter(
-@@ -544,5 +950,379 @@ class ConsoleApp {
+@@ -544,5 +953,379 @@ class ConsoleApp {
        `显示 ${lines.length} / ${this.state.logs.length} 条 · ${this.logConnected ? "实时推送中" : "正在重新连接"}`;
    }
  }
@@ -1050,7 +1054,7 @@ index 0000000..c6984b9
 +  console.log("styles.css 已更新");
 +}
 diff --git a/core/ui/styles.css b/core/ui/styles.css
-index 5251c75..2560a6c 100644
+index 5251c75..ae0ceb2 100644
 --- a/core/ui/styles.css
 +++ b/core/ui/styles.css
 @@ -812,7 +812,7 @@ main {
@@ -1062,7 +1066,7 @@ index 5251c75..2560a6c 100644
  }
  .chat-empty {
    height: 100%;
-@@ -1393,3 +1393,358 @@ dialog::backdrop {
+@@ -1393,3 +1393,367 @@ dialog::backdrop {
  }
  .extension-panel { overflow: hidden; min-height: 480px; }
  .extension-frame { display: block; width: 100%; height: max(480px, calc(100dvh - 230px)); border: 0; background: white; }
@@ -1420,6 +1424,15 @@ index 5251c75..2560a6c 100644
 +.bubble .say-btn:disabled {
 +  opacity: 1;
 +  cursor: default;
++}
++
++/* 正文里出现过工具协议标记时，气泡下面的一行灰字。不参与正文，也不进历史。 */
++.protocol-note {
++  margin-top: 6px;
++  font-size: 12px;
++  line-height: 1.5;
++  color: var(--muted, #8a8a8a);
++  opacity: 0.85;
 +}
 diff --git a/core/ui/views.js b/core/ui/views.js
 index 7884c7e..cc5944b 100644

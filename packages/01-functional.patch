@@ -498,6 +498,29 @@ index bb49f28..4f4fd95 100644
      this.watchdog.unref();
      const kernel = Object.freeze({
        ctx,
+diff --git a/core/provenance.ts b/core/provenance.ts
+index 706dda6..2383754 100644
+--- a/core/provenance.ts
++++ b/core/provenance.ts
+@@ -3,6 +3,7 @@
+  * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
+  */
+ import { messageTime } from "./time.ts";
++import { stripToolProtocol } from "./tool-protocol.ts";
+ /** Descriptive metadata, never routing, permissions or model instructions. */
+ export type Origin = { plugin?: string; channel?: string; platform?: string; action?: string };
+ export type OriginDetails = Pick<Origin, "platform" | "action">;
+@@ -72,7 +73,9 @@ export function renderHistory(rows: any[], zone?: string, reference = false) {
+   const messages = rows.map((row) => {
+     const label = historyLabel(row, zone), prefix = label !== previous ? `【历史来源 ${label}】\n` : "";
+     previous = label;
+-    return { role: row.role, content: prefix + row.content };
++    // 旧会话里存过的协议标记在这里剔除，磁盘原文不动。
++    const body = row.role === "assistant" ? stripToolProtocol(String(row.content ?? "")).text : row.content;
++    return { role: row.role, content: prefix + body };
+   });
+   return reference && messages.length
+     ? [{ role: "user", content: HISTORY_REFERENCE + JSON.stringify(messages) + "\n【历史引用结束】" }]
 diff --git a/core/receipts.ts b/core/receipts.ts
 new file mode 100644
 index 0000000..141d4ed
@@ -659,14 +682,16 @@ index 0000000..0aad606
 +  return loaded;
 +}
 diff --git a/core/session.ts b/core/session.ts
-index 754b582..89603ac 100644
+index 754b582..d17b7a4 100644
 --- a/core/session.ts
 +++ b/core/session.ts
-@@ -15,8 +15,15 @@ import { shortSummaryKey, shortContext, compressShort, consolidateLong, shouldDe
+@@ -15,8 +15,17 @@ import { shortSummaryKey, shortContext, compressShort, consolidateLong, shouldDe
  import { attribution, historyTail, originNote, originOf, renderHistory } from "./provenance.ts";
  import { SessionQueue, type QueuePolicy } from "./session-queue.ts";
  import { TRANSIENT_REPLY, type ToolTurn } from "./tool-retention.ts";
-+import { salvageToolCallFromText, stripToolProtocol } from "./tool-protocol.ts";
++import { salvageToolCallFromText } from "./tool-protocol.ts";
++import { requestsProtocolExample, ToolProtocolStream } from "./tool-protocol-stream.ts";
++import { TOOL_TEXT_NOTICE } from "./tool-protocol-text.ts";
 +import { receiptPath, verifiedFiles, type WriteReceipt } from "./receipts.ts";
  import type { TurnInput } from "./turn-input.ts";
 +/** 一轮里随消息一起送进模型的图片（已由 Web 层校验并落盘）。 */
@@ -678,7 +703,7 @@ index 754b582..89603ac 100644
  import { diaryContext, diaryRequestPlan, writeDiary } from "./memory-diary.ts";
  import { contextFrame, diaryPrefix, fittingDiaryPrefix, historyEntry, recalledMaterial, supportsContextPrefix } from "./context-material.ts";
  import {
-@@ -26,6 +33,11 @@ import {
+@@ -26,6 +35,11 @@ import {
    requestUsage,
    memoryWindow,
  } from "./session-context.ts";
@@ -690,7 +715,7 @@ index 754b582..89603ac 100644
  export class Sessions {
    memoryMaintenance = false;
    blockedSessions = new Set<string>();
-@@ -114,12 +126,25 @@ export class Sessions {
+@@ -114,12 +128,25 @@ export class Sessions {
      const history = matchingHistory(rows, p.revision, policy.history_scope);
      const last = rows.findLast((row: any) => row.role === "assistant" && !row.delivery_id);
      const usage = last?.request_usage;
@@ -718,7 +743,7 @@ index 754b582..89603ac 100644
      const legacy = policy.memory_mode === "legacy";
      const window = legacy ? memoryWindow(history, policy)
        : { short: history.filter((row: any) => row.type === "message"), long: [] };
-@@ -191,9 +216,9 @@ export class Sessions {
+@@ -191,9 +218,9 @@ export class Sessions {
        usage: matches
          ? {
              ...usage,
@@ -731,7 +756,7 @@ index 754b582..89603ac 100644
                : null,
              settings_changed:
                JSON.stringify(last.context_policy) !== JSON.stringify(policy) ||
-@@ -248,9 +273,11 @@ export class Sessions {
+@@ -248,9 +275,11 @@ export class Sessions {
      route?: ChannelRoute,
      transient = false,
      queue?: QueuePolicy,
@@ -744,7 +769,7 @@ index 754b582..89603ac 100644
    }
    /** Capture arrival metadata before any asynchronous routing or queue wait. */
    async outgoingIdentity(id: string, route: ChannelRoute) {
-@@ -291,6 +318,7 @@ export class Sessions {
+@@ -291,6 +320,7 @@ export class Sessions {
      transient = false,
      turn: ToolTurn = { transient: false },
      input?: TurnInput,
@@ -752,7 +777,7 @@ index 754b582..89603ac 100644
    ) {
      signal.throwIfAborted();
      if (this.memoryMaintenance) throw Error("记忆恢复中，请稍后重试");
-@@ -302,6 +330,10 @@ export class Sessions {
+@@ -302,6 +332,10 @@ export class Sessions {
      if (this.memoryMaintenance || this.blockedSessions.has(id))
        throw Error("会话维护中，请稍后重试");
      if (!text.trim() || text.length > 16000) throw Error("请输入 1–16000 字");
@@ -763,7 +788,7 @@ index 754b582..89603ac 100644
      const receivedAt = route?.receivedAt ?? new Date().toISOString(), zone = route?.timezone ?? timezone(this.config.timezone);
      const { memory, memoryEngine: engine, llm, tools, logger } = this.services;
      const execution = await this.services.executionArchive?.start(id, {
-@@ -328,6 +360,19 @@ export class Sessions {
+@@ -328,6 +362,19 @@ export class Sessions {
        signal.throwIfAborted();
        const p = await persona(this.root, this.config, channel.persona);
        this.identities.set(id, { persona_id: p.id, persona_name: p.name, persona_revision: p.revision, timezone: zone });
@@ -783,7 +808,7 @@ index 754b582..89603ac 100644
        await execution?.write("context", { persona: p.id, provider: p.provider.id, model: p.provider.model });
        if (expectedPersona && expectedPersona !== p.id)
          throw Error("当前人格已在其他窗口切换，请刷新后重试");
-@@ -356,6 +401,24 @@ export class Sessions {
+@@ -356,6 +403,24 @@ export class Sessions {
          personaId: p.id,
          permission: channel.permission ?? p.permission,
          signal,
@@ -808,7 +833,7 @@ index 754b582..89603ac 100644
        };
        const storedHistory = (engine ? await engine.contextRows(id) : conversationRows(await memory.readSession(id))).filter(
          (row: any) => row.type !== "channel_receipt",
-@@ -463,18 +526,27 @@ export class Sessions {
+@@ -463,18 +528,27 @@ export class Sessions {
        const reserve = this.outputReserve(p.provider, legacy);
        const requestBudget = limit.tokens ? Math.max(1, limit.tokens - reserve) : Infinity;
        const stablePrefix = !legacy && supportsContextPrefix(p.provider);
@@ -838,7 +863,7 @@ index 754b582..89603ac 100644
        );
        let recentTokens = tail(recent, Infinity).tokens;
        const overBudget = () => recentTokens > capacity();
-@@ -500,24 +572,62 @@ export class Sessions {
+@@ -500,24 +574,62 @@ export class Sessions {
            const inputTokens = estimateTokens(promptText(assembled()) + JSON.stringify(toolList));
            const target = limit.tokens * policy.compression_target_percent! / 100 - reserve;
            // Output is a request ceiling, not a forced diary length or a source truncation limit.
@@ -911,15 +936,30 @@ index 754b582..89603ac 100644
            }
          }
        }
-@@ -540,6 +650,7 @@ export class Sessions {
+@@ -540,6 +652,14 @@ export class Sessions {
          after: { materials: materials(), history: recent, input: text, transient,
            history_scope: policy.history_scope, context_limit: limit.tokens, request_budget: Number.isFinite(requestBudget) ? requestBudget : null } });
        let final = "";
++      // 工具协议投影（作者 2026-11-19）：模型把调用写成正文时，流式扣住、整块换成一句说明，
++      // 绝不从文字里重建调用。勘保留一个救回开关，默认关——见 config.agent.recover_leaked_calls。
++      let literalExample = requestsProtocolExample(text);
++      const recoverLeaked = this.config.agent?.recover_leaked_calls === true;
++      const offeredNames = new Set<string>((toolList ?? [])
++        .map((t: any) => String(t?.name ?? t?.function?.name ?? ""))
++        .filter(Boolean));
 +      const receipts: { tool: string; ok: boolean; args?: string }[] = [];
        let measured: any = null;
        let memoryWriteRejected = false;
        const mediaSignals: AbortSignal[] = [];
-@@ -564,16 +675,51 @@ export class Sessions {
+@@ -551,6 +671,7 @@ export class Sessions {
+         if (!input) return;
+         for (const message of await input.take()) {
+           signal.throwIfAborted();
++          literalExample ||= requestsProtocolExample(message.text);
+           // A real person's additions remain history even after transient tools.
+           const row = { type: "message", ...source, ...context,
+             origin: { ...source.origin, action: "接收消息" }, session: id, role: "user",
+@@ -564,16 +685,51 @@ export class Sessions {
              received_at: message.receivedAt, timezone: message.timezone });
          }
        };
@@ -972,19 +1012,53 @@ index 754b582..89603ac 100644
          if (
            estimateTokens(promptText(messages) + JSON.stringify(activeTools)) >
            requestBudget
-@@ -612,9 +758,46 @@ export class Sessions {
+@@ -597,24 +753,75 @@ export class Sessions {
+           }
+         }
+         diagnostics?.event("context.change", { operation: "refresh", source: "clock", after: requestTime, round: turn.round });
+-        const reply = await llm.chat({
+-          provider: p.provider,
+-          messages,
+-          tools: activeTools,
+-          onChunk,
+-          signal: requestSignal,
+-        });
++        // 用户明确要示例/原样输出时，不做投影——那时候的标记是正文，不是泄漏。
++        const stream = activeTools.length && !literalExample ? new ToolProtocolStream(onChunk) : undefined;
++        let reply;
++        try {
++          reply = await llm.chat({
++            provider: p.provider,
++            messages,
++            tools: activeTools,
++            onChunk: stream ? stream.push : onChunk,
++            signal: requestSignal,
++          });
++        } catch (error) {
++          // 被截断的流没有最后的工具清单；只有短的一小截没判定的前缀才安全放出去。
++          if (!requestSignal.aborted) stream?.interrupted();
++          throw error;
++        }
+         await execution?.write("model_result", { round: turn.round, elapsed_ms: Date.now() - modelStarted,
+           usage: reply.usage, tool_calls: reply.toolCalls.length, final_reply: !reply.toolCalls.length });
+         measured = requestUsage(reply.usage, p.provider, limit.tokens);
+         if (engine) await engine.usage(id, "chat", reply.usage);
+         requestSignal.throwIfAborted();
++        // 结构化的调用才是权威：正文里就算也写了标记，也不据文字造调用。
++        if (reply.toolCalls.length) stream?.flushUnclassified();
          if (!reply.toolCalls.length) {
            // Seal synchronously after the last await. Unsent candidates never enter history.
-           if (input && !input.tryFinish()) continue;
+-          if (input && !input.tryFinish()) continue;
 -          final = reply.text;
 -          break;
++          if (input && !input.tryFinish()) { stream?.flushUnclassified(); continue; }
 +          // 上游省略开始包装、却把完整 invoke 块写进正文时，那其实是一个合法调用，
 +          // 只是走错了通道。先试救；名字必须在本轮声明的工具里，救不了才剥。
 +          // 见 core/tool-protocol.ts 的 salvageToolCallFromText 与 vllm #49117。
 +          const declared = (toolList ?? [])
 +            .map((t: any) => String(t?.name ?? t?.function?.name ?? ""))
 +            .filter(Boolean);
-+          const salvaged = salvageToolCallFromText(reply.text ?? "", declared);
++          const salvaged = recoverLeaked ? salvageToolCallFromText(reply.text ?? "", declared) : null;
 +          // 救回也要过下面那道 reasoning_content 检查。若这道检查会拒（思考模式、
 +          // 上游没回传 reasoning_content），就别救——否则整轮直接抛错，比只剥更糟。
 +          const salvageable = salvaged &&
@@ -995,6 +1069,8 @@ index 754b582..89603ac 100644
 +            logger.warn("工具协议恢复", { session: id, tool: salvaged.name, args: Object.keys(salvaged.args).length });
 +            // 告诉界面层：这轮是救回来的，别把"异常"显示出去（勘 2026-11-19）。
 +            onContext?.({ toolProtocolRecovered: salvaged.name });
++            // 扣住的那块是要执行的调用，不该当正文显示。
++            stream?.discard();
 +            reply.text = salvaged.rest;
 +            reply.toolCalls = [{
 +              id: "call_salvaged_" + Date.now().toString(36),
@@ -1004,15 +1080,16 @@ index 754b582..89603ac 100644
 +            // 不 break：落到下面按正常工具调用执行。
 +            // 下面那条 reasoning_content 检查照样适用——救回不等于绕过安全检查。
 +          } else {
-+            // 协议标记不进历史：存进去就成了下一轮的"示范"。
-+            const stored = stripToolProtocol(reply.text ?? "");
-+            if (stored.broken) logger.warn("工具协议异常", { session: id, reason: "dsml_in_content_stored", shape: stored.shape });
-+            // 整段正文就是一个泄漏的调用块时，剥完是空串。别让它掉进下面的
++            // 协议标记不进历史：存进去就成了下一轮的"示范"。整块换成一句说明，不是删掉——
++            // 删掉会让模型以为自己什么都没说过。
++            const projected = stream ? stream.finish(reply.text ?? "", offeredNames) : (reply.text ?? "");
++            if (projected !== reply.text) {
++              logger.warn("工具协议投影", { session: id, round: turn.round });
++              onContext?.({ toolProtocolProjected: true });
++            }
++            // 整段正文就是一个泄漏的调用块时，投影后只剩那句话，不会掉进下面的
 +            // 「模型未返回最终回复」——那会把一次可解释的协议故障变成聊天失败。
-+            final = stored.text.trim() || !stored.broken
-+              ? stored.text
-+              : "（本轮上游把工具调用写成了正文，已拦下，没有执行。再发一次。）";
-+
++            final = projected.trim() || TOOL_TEXT_NOTICE;
 +            break;
 +          }
          }
@@ -1021,7 +1098,7 @@ index 754b582..89603ac 100644
          if (historyReference && typeof reply.reasoning_content !== "string")
            throw Error("思考模式工具响应缺少 reasoning_content，未执行本次工具调用");
          messages.push({
-@@ -638,6 +821,8 @@ export class Sessions {
+@@ -638,6 +845,8 @@ export class Sessions {
            const toolOrigin = tools.entries?.get(call.name)?.origin;
            let result;
            superseded ||= input?.hasPending() ?? false;
@@ -1030,7 +1107,7 @@ index 754b582..89603ac 100644
            if (superseded) {
              result = { ok: false, executed: false, reason: "user_input_appended",
                result: "未执行：用户补充了消息，请结合补充内容重新判断是否仍需调用此工具。" };
-@@ -645,6 +830,20 @@ export class Sessions {
+@@ -645,6 +854,20 @@ export class Sessions {
                status: "skipped", result });
              await execution?.write("tool_skipped", { round: turn.round, tool_call_id: call.id,
                tool: turn.transient && !toolOrigin ? "[未注册工具]" : call.name, reason: "user_input_appended" });
@@ -1051,7 +1128,7 @@ index 754b582..89603ac 100644
            } else try {
              result = await tools.call(
                call.name,
-@@ -661,6 +860,8 @@ export class Sessions {
+@@ -661,6 +884,8 @@ export class Sessions {
                tool: turn.transient && !toolOrigin ? "[未注册工具]" : call.name, error: result.result,
                ...(turn.transient ? {} : { arguments: call.arguments }) });
            }
@@ -1060,7 +1137,7 @@ index 754b582..89603ac 100644
            if (!superseded && !result.ok && ["remember_fact", "edit_facts"].includes(call.name))
              memoryWriteRejected = true;
            await memory.appendEvent({
-@@ -695,6 +896,14 @@ export class Sessions {
+@@ -695,6 +920,14 @@ export class Sessions {
          messages.push(...attachments);
          if (attachments.length) diagnostics?.event("context.change", { operation: "append", source: "tool_attachments", after: attachments });
        }
@@ -1075,7 +1152,7 @@ index 754b582..89603ac 100644
        if (!final) throw Error("模型未返回最终回复，请重试");
        await memory.appendEvent({
          type: "message",
-@@ -704,6 +913,7 @@ export class Sessions {
+@@ -704,6 +937,7 @@ export class Sessions {
          role: "assistant",
          // User-facing conversation is primary history. Technical plugin runs retain their opt-in privacy.
          text: transient && turn.transient ? TRANSIENT_REPLY : final,
@@ -1083,7 +1160,7 @@ index 754b582..89603ac 100644
          ...(transient && turn.transient ? { transient: true } : {}),
          ...context,
          request_usage: measured,
-@@ -716,6 +926,8 @@ export class Sessions {
+@@ -716,6 +950,8 @@ export class Sessions {
            provider: p.provider, limit: limit.tokens, signal, timezone: zone,
            rows: matchingHistory(currentRows, p.revision, policy.history_scope), policy, revision: p.revision });
        }
@@ -1092,6 +1169,308 @@ index 754b582..89603ac 100644
        executionStatus = "completed";
        return final;
      } catch (error: any) {
+diff --git a/core/tool-protocol-stream.ts b/core/tool-protocol-stream.ts
+new file mode 100644
+index 0000000..60f0278
+--- /dev/null
++++ b/core/tool-protocol-stream.ts
+@@ -0,0 +1,84 @@
++/*! Copyright (c) 2026 iinukami and contributors.
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
++ */
++import { projectToolProtocolText, TOOL_TEXT_ROOT_PREFIXES } from "./tool-protocol-text.ts";
++
++// A request for literal output can legitimately produce a bare protocol example.
++export function requestsProtocolExample(input: string) {
++  if (!/DSML|工具调用|工具协议|tool[ _-]?calls?/iu.test(input)) return false;
++  return input.split(/[。！？!?\n]/u).some(sentence =>
++    /DSML|工具调用|工具协议|tool[ _-]?calls?/iu.test(sentence) &&
++    /示例|样例|举例|演示|原样|逐字|语法|格式|example|verbatim|syntax|literal/iu.test(sentence) &&
++    !/(?:不要|别再?|不用|禁止|do not|don't)\s*(?:再|给我)?\s*(?:输出|发|展示|给|贴|show|print)/iu.test(sentence));
++}
++
++/** Only delay a possible marker and what follows it. The structured tool list
++ * can arrive in the last SSE frame, so classify once the provider has finished. */
++export class ToolProtocolStream {
++  private partial = "";
++  private held?: string[];
++  private sent = 0;
++  private send: (text: string) => void;
++
++  constructor(send: (text: string) => void) { this.send = send; }
++
++  push = (chunk: string) => {
++    if (this.held) { this.held.push(chunk); return; }
++    const data = this.partial + chunk;
++    this.partial = "";
++    let start = data.length;
++    for (const prefix of TOOL_TEXT_ROOT_PREFIXES) {
++      const pos = data.indexOf(prefix);
++      if (pos !== -1) start = Math.min(start, pos);
++    }
++    if (start < data.length) {
++      this.held = [data.slice(start)];
++    } else {
++      const last = data.lastIndexOf("<");
++      if (last >= 0 && TOOL_TEXT_ROOT_PREFIXES.some(p => p.startsWith(data.slice(last)))) {
++        start = last;
++        this.partial = data.slice(last);
++      }
++    }
++    if (start) {
++      this.sent += start;
++      this.send(data.slice(0, start));
++    }
++  };
++
++  finish(text: string, names: ReadonlySet<string>) {
++    const projected = projectToolProtocolText(text, names);
++    const pending = this.held?.join("") ?? this.partial;
++    this.held = undefined;
++    this.partial = "";
++    if (pending) {
++      // 勘 2026-11-19：上游在多处把兜底写成 pending——流式文本与最终文本不一致时，
++      // 那会把整块原始标记原样放出去。这里改成优先按投影结果切，实在切不出才用 pending。
++      const tail = text.slice(this.sent) === pending
++        ? projected.slice(this.sent)
++        : projected.slice(this.sent) || pending;
++      if (tail) this.send(tail);
++    }
++    return projected;
++  }
++
++  /** 勘 2026-11-19：这段扣住的标记要被当成调用执行，不显示，也不再放出去。 */
++  discard() {
++    this.held = undefined;
++    this.partial = "";
++  }
++
++  flushUnclassified() {
++    const pending = this.held?.join("") ?? this.partial;
++    this.held = undefined;
++    this.partial = "";
++    if (pending) this.send(pending);
++  }
++
++  interrupted() {
++    // With a truncated SSE response there is no final tool-call metadata.
++    // Only a short undecided prefix (e.g. a trailing '<') is safe to flush.
++    if (!this.held) this.flushUnclassified();
++  }
++}
+diff --git a/core/tool-protocol-text.ts b/core/tool-protocol-text.ts
+new file mode 100644
+index 0000000..339ee0b
+--- /dev/null
++++ b/core/tool-protocol-text.ts
+@@ -0,0 +1,206 @@
++/*! Copyright (c) 2026 iinukami and contributors.
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
++ */
++export const TOOL_TEXT_NOTICE = "［此处是模型写出的工具调用标记，标记本身未执行任何工具。］";
++export const TOOL_TEXT_ROOT_PREFIXES = ["<｜｜DSML｜｜", "<｜DSML｜", "<||DSML||", "<|DSML|"] as const;
++
++// Sticky matches start at the cursor. Unknown children or attributes invalidate the entire block.
++const tagPattern = /[ \t\r\n]*<(\/?)(｜{1,2}|\|{1,2})DSML\2 ?(tool_calls|toolcalls|calls|invoke|parameter)(?: name="([^\s"<>]+)")?(?: string="(true|false)")?>/y;
++function tagAt(text: string, start: number, bars?: string) {
++  tagPattern.lastIndex = start;
++  const match = tagPattern.exec(text);
++  if (!match || (bars && match[2] !== bars)) return;
++  const [, slash, delimiter, kind, name, string] = match;
++  if ((slash || (kind !== "invoke" && kind !== "parameter")) && (name || string)) return;
++  if (kind === "invoke" && string) return;
++  return { closing: !!slash, bars: delimiter, kind, name, at: start + match[0].indexOf("<"), end: tagPattern.lastIndex };
++}
++
++const nextProtocol = /[ \t\r\n]*<\/?[｜|]+DSML/iy;
++const blankLine = /(?:\r\n|\r(?!\n)|\n)[ \t]*(?:\r\n|\r(?!\n)|\n)/;
++
++function blockEnd(text: string, start: number, names: ReadonlySet<string> | undefined, wrappedOnly: boolean) {
++  const root = tagAt(text, start);
++  if (!root || root.closing || root.kind === "parameter") return;
++  if (wrappedOnly && root.kind !== "tool_calls" && root.kind !== "calls") return;
++  const bare = root.kind === "invoke";
++  let tag = bare ? root : tagAt(text, root.end, root.bars);
++  let invokeEnd: number | undefined;
++  while (tag && !tag.closing && tag.kind === "invoke") {
++    if (!tag.name || !/^[A-Za-z0-9_-]{1,64}$/.test(tag.name) || (names && !names.has(tag.name))) return;
++    tag = tagAt(text, tag.end, root.bars);
++    while (tag && !tag.closing && tag.kind === "parameter") {
++      if (!tag.name) return;
++      // Values are opaque text. Never search past another tag for a missing terminator.
++      const next = text.indexOf("<", tag.end);
++      if (next < 0) return;
++      tag = tagAt(text, next, root.bars);
++      if (!tag?.closing || tag.kind !== "parameter") return;
++      tag = tagAt(text, tag.end, root.bars);
++    }
++    if (!tag?.closing || tag.kind !== "invoke") return;
++    invokeEnd = tag.end;
++    tag = tagAt(text, tag.end, root.bars);
++    if (bare && tag && blankLine.test(text.slice(invokeEnd, tag.at))) {
++      // A blank line ends a standalone run. The next paragraph may be an indented example.
++      return invokeEnd;
++    }
++  }
++  if (invokeEnd === undefined) return;
++  if (tag?.closing && (tag.kind === (bare ? "tool_calls" : root.kind) ||
++      (root.kind === "toolcalls" && tag.kind === "tool_calls"))) return tag.end;
++  if (!bare) return;
++  // A further DSML child or unmatched terminator makes an unwrapped run ambiguous.
++  nextProtocol.lastIndex = invokeEnd;
++  if (!nextProtocol.test(text) || (tag && !tag.closing && tag.kind !== "parameter")) return invokeEnd;
++}
++
++type Backticks = { at: number; next: number; escaped: boolean };
++const exampleLead = /(?:示例|样例|例子|举例|例如|比如|语法)(?:如下|所示)?[：:，,。.]?$|(?:格式|写法)如下[：:，,。.]?$|\b(?:for example|for instance|example|sample|syntax)(?: below| follows)?[：:,.-]?$/i;
++
++// Resolve inline code within each Markdown paragraph. Linking equal-length backtick runs
++// avoids rescanning the rest of the answer for every unmatched opening delimiter.
++function candidateStarts(text: string, barriers?: number[]) {
++  const starts: number[] = [], paragraph: number[] = [], ticks: Backticks[] = [];
++  const previous = new Map<number, number>();
++  let fence = "", quoted = false, list = false, inParagraph = false, example = false;
++  function endParagraph() {
++    let index = 0;
++    for (let i = 0; i < ticks.length && (barriers || index < paragraph.length); i++) {
++      const open = ticks[i];
++      if (open.escaped || open.next < 0) continue;
++      barriers?.push(open.at, ticks[open.next].at);
++      while (index < paragraph.length && paragraph[index] < open.at) starts.push(paragraph[index++]);
++      while (index < paragraph.length && paragraph[index] < ticks[open.next].at) index++;
++      i = open.next;
++    }
++    while (index < paragraph.length) starts.push(paragraph[index++]);
++    paragraph.length = ticks.length = 0;
++    previous.clear();
++    inParagraph = false;
++  }
++  for (const match of text.matchAll(/([^\r\n]*)(?:\r\n?|\n|$)/g)) {
++    const line = match[1], start = match.index;
++    const end = start + match[0].length;
++    const marker = /^ {0,3}(`{3,}|~{3,})/.exec(line);
++    if (fence) {
++      barriers?.push(start, end);
++      if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length &&
++          /^[ \t]*$/.test(line.slice(marker[0].length))) fence = "";
++      continue;
++    }
++    if (/^[ \t]*$/.test(line)) { endParagraph(); quoted = false; continue; }
++    if (/^ {0,3}(?:[-+*]|\d{1,9}[.)])[ \t]/.test(line)) {
++      endParagraph(); barriers?.push(start, end); list = true; example = exampleLead.test(line.trimEnd().slice(-100)); continue;
++    }
++    if (list && /^[ \t]/.test(line)) { barriers?.push(start, end); continue; }
++    list = false;
++    if (/^ {0,3}>/.test(line)) { endParagraph(); barriers?.push(start, end); quoted = true; continue; }
++    if (marker && (marker[1][0] === "~" || !line.slice(marker[0].length).includes("`"))) {
++      endParagraph(); barriers?.push(start, end); quoted = false; example = false; fence = marker[1]; continue;
++    }
++    if (quoted || (!inParagraph && /^(?: {4}| {0,3}\t)/.test(line))) { barriers?.push(start, end); continue; }
++    inParagraph = true;
++    const prefix = /^ {0,3}(?=<[｜|])/.exec(line);
++    if (prefix && !example) paragraph.push(start + prefix[0].length);
++    example = exampleLead.test(line.trimEnd().slice(-100));
++    for (const run of line.matchAll(/`+/g)) {
++      let slash = run.index;
++      while (slash > 0 && line[slash - 1] === "\\") slash--;
++      const length = run[0].length, last = previous.get(length);
++      if (last !== undefined) ticks[last].next = ticks.length;
++      previous.set(length, ticks.length);
++      ticks.push({ at: start + run.index, next: -1, escaped: (run.index - slash) % 2 === 1 });
++    }
++  }
++  endParagraph();
++  return starts;
++}
++
++// Classify boundaries even for malformed tags and Markdown-protected starts. Only the
++// strict parser above can accept a block. An inner invoke of a rejected block must
++// never be retried as if its outer opener had been missing.
++function independentStarts(text: string, candidates: number[], barriers: number[]) {
++  type Opening = { start: number; close: number; continuation: boolean };
++  const openings: Opening[] = [];
++  const roots: Opening[] = [], invokes: Opening[] = [], parameters: Opening[] = [], unknown: Opening[] = [];
++  const looseTag = /<(\/?)(?:[｜|]+DSML[｜|]*[ \t]*([\w-]*)[^<>\r\n]*>?|(pre|code)\b[^<>]*>)/gi;
++  let previousEnd = 0, afterRootClose = true, barrier = 0, html = "";
++  for (const match of text.matchAll(looseTag)) {
++    while (barrier < barriers.length && match.index >= barriers[barrier + 1]) {
++      roots.length = invokes.length = parameters.length = unknown.length = 0;
++      afterRootClose = true;
++      barrier += 2;
++    }
++    if (barrier < barriers.length && match.index >= barriers[barrier]) continue;
++    if (match[3]) {
++      const kind = match[3].toLowerCase();
++      if (!html && !match[1]) html = kind;
++      else if (html === kind && match[1]) html = "";
++      continue;
++    }
++    if (html) continue;
++    const kind = match[2].toLowerCase();
++    const stack = kind === "invoke" ? invokes : kind === "parameter" ? parameters :
++      kind === "tool_calls" || kind === "toolcalls" || kind === "calls" ? roots : unknown;
++    if (match[1]) {
++      const open = stack.pop() ?? (stack === roots ? unknown.pop() : undefined);
++      if (open) {
++        open.close = match.index;
++        if (stack === roots) {
++          for (const children of [invokes, parameters, unknown]) {
++            while (children.length && children[children.length - 1].start > open.start) children.pop();
++          }
++        }
++      }
++    } else {
++      const gap = text.slice(previousEnd, match.index);
++      const inside = roots.length || invokes.length || parameters.length || unknown.length;
++      const continuation = stack === invokes && !/[^ \t\r\n]/.test(gap) &&
++        (!!inside || (!afterRootClose && !blankLine.test(gap)));
++      const open = { start: match.index, close: 0, continuation };
++      openings.push(open);
++      stack.push(open);
++    }
++    afterRootClose = !!match[1] && stack === roots;
++    previousEnd = match.index + match[0].length;
++  }
++  let candidate = 0, enclosedUntil = 0;
++  const independent: number[] = [];
++  for (const open of openings) {
++    while (candidate < candidates.length && candidates[candidate] < open.start) candidate++;
++    if (candidates[candidate] === open.start && open.start >= enclosedUntil && !open.continuation) {
++      independent.push(open.start);
++    }
++    enclosedUntil = Math.max(enclosedUntil, open.close);
++  }
++  return independent;
++}
++
++function project(text: string, names: ReadonlySet<string> | undefined, wrappedOnly: boolean): string {
++  if (names?.size === 0 || !TOOL_TEXT_ROOT_PREFIXES.some(prefix => text.includes(prefix))) return text;
++  const parts: string[] = [];
++  let copied = 0;
++  const barriers = wrappedOnly ? undefined : [];
++  const candidates = candidateStarts(text, barriers);
++  if (!candidates.length) return text;
++  for (const start of barriers ? independentStarts(text, candidates, barriers) : candidates) {
++    if (start < copied) continue;
++    const end = blockEnd(text, start, names, wrappedOnly);
++    if (end === undefined) continue;
++    parts.push(text.slice(copied, start), TOOL_TEXT_NOTICE);
++    copied = end;
++  }
++  return parts.length ? parts.join("") + text.slice(copied) : text;
++}
++
++/** Online callers pass the tools offered in this response. Historical review can lack that snapshot. */
++export function projectToolProtocolText(text: string, names?: ReadonlySet<string>): string {
++  return project(text, names, false);
++}
++
++/** Reproduce the exact projection approved by historical wrapper-only confirmations. */
++export function projectWrappedToolProtocolText(text: string): string {
++  return project(text, undefined, true);
++}
 diff --git a/core/tool-protocol.ts b/core/tool-protocol.ts
 new file mode 100644
 index 0000000..20cb41d
@@ -1595,10 +1974,10 @@ index 0000000..df37097
 +  return () => disposers.forEach(dispose => dispose());
 +}
 diff --git a/core/web.ts b/core/web.ts
-index 1d8286d..5bb4d63 100644
+index 1d8286d..3f4f46b 100644
 --- a/core/web.ts
 +++ b/core/web.ts
-@@ -3,22 +3,189 @@
+@@ -3,22 +3,67 @@
   * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
   */
  import { createServer } from "node:http";
@@ -1616,128 +1995,6 @@ index 1d8286d..5bb4d63 100644
 +import { toolContentSnapshot } from "./tool-content.ts";
  import { PluginWebRegistry } from "./plugin-web.ts";
 +import { TurnInput } from "./turn-input.ts";
-+import { findProtocolIndex, hasLeakEvidence, protocolEndIndex, protocolShape } from "./tool-protocol.ts";
-+
-+/**
-+ * 流式正文守卫。
-+ * 工具调用退化成正文时，会带出工具协议标记（DSML 一类）。这类文本发到界面
-+ * 会被当成普通回复，用户分不清是坏了还是在说话。这里拦下来并明说。
-+ * 标记可能跨 chunk，所以尾部留 64 字节做哨兵，其余即时放行。
-+ */
-+/**
-+ * 流式正文守卫（2026-11-19 改：先扣住，等回合结束再定）。
-+ *
-+ * 旧版一见到协议标记就立刻往界面发「工具协议异常」。可是 session 层随后可能
-+ * 把这段完整 invoke 块救回来、真的执行——于是用户同时看到「异常」和「工具跑了」，
-+ * 自相矛盾。
-+ *
-+ * 新版：标记一出现就把后面扣住不发（那段本来就是坏文本，不显示更好），
-+ * 等调用方 settle() 告知结果，再决定显示什么：
-+ *   recovered → 一句轻提示「已恢复执行」
-+ *   broken    → 明确说这轮的工具调用没执行
-+ * 泄漏块一旦闭合，后面的正文恢复放行，最终回复照常流式出来。
-+ */
-+export function guardStream(send: (value: any) => void) {
-+  const keep = 64;
-+  let tail = "";
-+  // 扣住的泄漏段；闭合之后清空，后续正文照常放行。
-+  let held = "";
-+  let holding = false;
-+  let captured = "";
-+  let leaked = false;
-+  let outcome: "unknown" | "recovered" | "broken" = "unknown";
-+
-+  const drainHeld = (final: boolean) => {
-+    if (!holding) return;
-+    // 泄漏块闭合点：closing 标签之后就是正文了。未闭合就一直扣到最后。
-+    const end = protocolEndIndex(held);
-+    if (end < 0) {
-+      if (!final) return;
-+      holding = false;
-+      // 没有闭合也没证据：这就是正常讨论里提到了标记，原样放出去。
-+      if (!leaked && held) send({ type: "chunk", text: held });
-+      held = "";
-+      return;
-+    }
-+    holding = false;
-+    const rest = held.slice(end);
-+    held = "";
-+    if (!rest) return;
-+    if (final) {
-+      send({ type: "chunk", text: rest });
-+      return;
-+    }
-+    // 回到正常模式，尾部留哨兵
-+    if (rest.length > keep) {
-+      send({ type: "chunk", text: rest.slice(0, rest.length - keep) });
-+      tail = rest.slice(rest.length - keep);
-+    } else tail = rest;
-+  };
-+
-+  return {
-+    get broken() {
-+      return leaked && outcome !== "recovered";
-+    },
-+    /** 命中的原文片段，只给日志认形态用。 */
-+    get captured() {
-+      return captured;
-+    },
-+    get outcome() {
-+      return leaked ? outcome : "clean";
-+    },
-+    /** 调用方在拿到回合结果后告知：救回来了还是没救回来。 */
-+    settle(value: { recovered?: string | null }) {
-+      if (!leaked) return;
-+      outcome = value && value.recovered ? "recovered" : "broken";
-+    },
-+    push(text: string) {
-+      if (holding) {
-+        held += text;
-+        if (!leaked && hasLeakEvidence(held)) leaked = true;
-+        if (captured.length < 200) captured = held.slice(0, 200);
-+        drainHeld(false);
-+        return;
-+      }
-+      const joint = tail + text;
-+      const at = findProtocolIndex(joint);
-+      if (at >= 0) {
-+        const head = joint.slice(0, at);
-+        if (head) send({ type: "chunk", text: head });
-+        holding = true;
-+        held = joint.slice(at);
-+        // 只是提到标记不算，看到闭合标签或带参数的 invoke 才认定是泄漏。
-+        leaked = hasLeakEvidence(held);
-+        tail = "";
-+        captured = held.slice(0, 200);
-+        drainHeld(false);
-+        return;
-+      }
-+      if (joint.length > keep) {
-+        send({ type: "chunk", text: joint.slice(0, joint.length - keep) });
-+        tail = joint.slice(joint.length - keep);
-+      } else {
-+        tail = joint;
-+      }
-+    },
-+    flush() {
-+      // 没 settle 就收尾 → 按没救回来处理，并扣住残余。
-+      if (leaked && outcome === "unknown") outcome = "broken";
-+      drainHeld(true);
-+      if (!holding && tail) send({ type: "chunk", text: tail });
-+      tail = "";
-+      held = "";
-+      if (leaked) {
-+        send({
-+          type: "chunk",
-+          text:
-+            outcome === "recovered"
-+              ? "\n\n（本轮有一次工具调用混进了正文，已按调用恢复执行。）\n"
-+              : "\n\n[工具协议异常] 这一轮的工具调用没有真正执行，上面的内容不可信。请重发指令，或换个会话再试。\n",
-+        });
-+      }
-+    },
-+  };
-+}
 +
  export async function startWeb(config: any, services: any, runtime: any) {
    const { logger, memory, sessions } = services;
@@ -1790,7 +2047,7 @@ index 1d8286d..5bb4d63 100644
    const register = (method: string, path: string, handler: any) => routes.register("", lifetime.signal, method, path, handler);
    let origin = `http://${host}:${port}`;
    const assets = new Set([
-@@ -100,7 +267,7 @@ export async function startWeb(config: any, services: any, runtime: any) {
+@@ -100,7 +145,7 @@ export async function startWeb(config: any, services: any, runtime: any) {
            "Cache-Control": "no-store",
            "X-Frame-Options": "DENY",
            "Content-Security-Policy":
@@ -1799,7 +2056,7 @@ index 1d8286d..5bb4d63 100644
          });
          res.end(await readFile(new URL("./ui/index.html", import.meta.url)));
          return;
-@@ -345,7 +512,24 @@ export async function startWeb(config: any, services: any, runtime: any) {
+@@ -345,7 +390,24 @@ export async function startWeb(config: any, services: any, runtime: any) {
        if (req.method === "GET" && req.url?.startsWith("/api/session?")) {
          const id = new URL(req.url, origin).searchParams.get("id");
          if (!id) return send(400, { error: "请提供会话 ID" });
@@ -1825,7 +2082,7 @@ index 1d8286d..5bb4d63 100644
        }
        if (req.method === "GET" && req.url === "/api/status")
          return send(200, {
-@@ -365,6 +549,90 @@ export async function startWeb(config: any, services: any, runtime: any) {
+@@ -365,6 +427,90 @@ export async function startWeb(config: any, services: any, runtime: any) {
            pluginPages: routes.pages(),
            diagnostics: services.diagnostics?.status(),
          });
@@ -1916,7 +2173,7 @@ index 1d8286d..5bb4d63 100644
        if (req.method === "GET" && req.url === "/api/logs")
          return send(200, logger.lines);
        if (req.method === "POST" && req.url === "/api/plugin") {
-@@ -388,7 +656,7 @@ export async function startWeb(config: any, services: any, runtime: any) {
+@@ -388,7 +534,7 @@ export async function startWeb(config: any, services: any, runtime: any) {
        else res.end();
      }
    });
@@ -1925,7 +2182,7 @@ index 1d8286d..5bb4d63 100644
    server.on("upgrade", (req, socket, head) => {
      if (
        !allowedOrigin(req) ||
-@@ -421,24 +689,77 @@ export async function startWeb(config: any, services: any, runtime: any) {
+@@ -421,24 +567,70 @@ export async function startWeb(config: any, services: any, runtime: any) {
      }
      let busy = false;
      ws.on("message", async (raw) => {
@@ -1980,18 +2237,16 @@ index 1d8286d..5bb4d63 100644
 +          timezone: timezone(config.timezone),
 +        }, lifetime.signal);
 +        webInboxes.set(String(data.session), inbox);
-+        const guard = guardStream(send);
-+        // 本轮若把混进正文的调用救回来了，session 会通过 context 告诉我们，
-+        // 守卫据此决定收尾显示「已恢复执行」还是「异常未执行」。
-+        let recovered: string | null = null;
++        // 工具协议标记的扣住与投影都在 session 层做（core/tool-protocol-stream.ts）；
++        // 这里只负责把结果告诉界面：投影过就渲染一条灰提示，正文里一个字都不加。
++        let projected = false;
 +        try {
 +          await channels.web(
 +            data.session,
 +            marked,
-+            (text: string) => guard.push(text),
++            (text: string) => send({ type: "chunk", text }),
 +            (context: any) => {
-+              if (context?.toolProtocolRecovered)
-+                recovered = String(context.toolProtocolRecovered);
++              if (context?.toolProtocolProjected) projected = true;
 +              send({ type: "context", ...context });
 +            },
 +            typeof data.persona === "string" ? data.persona : undefined,
@@ -1999,16 +2254,11 @@ index 1d8286d..5bb4d63 100644
 +            inbox,
 +          );
 +        } finally {
-+          guard.settle({ recovered });
-+          guard.flush();
 +          inbox.closeInput();
 +          if (webInboxes.get(String(data.session)) === inbox) webInboxes.delete(String(data.session));
 +        }
-+        if (guard.outcome === "recovered")
-+          logger.warn("工具协议恢复", { session: data.session, tool: recovered, shape: protocolShape(guard.captured) });
-+        else if (guard.broken)
-+          logger.warn("工具协议异常", { session: data.session, reason: "dsml_in_content", shape: protocolShape(guard.captured) });
-+        send({ type: "done", protocolBroken: guard.broken, protocol: guard.outcome });
++        // session 层已经记过日志；这里只把状态给前端。
++        send({ type: "done", protocol: projected ? "projected" : "clean" });
        } catch (error: any) {
          logger.error("聊天失败", { error });
          send({
@@ -2108,6 +2358,19 @@ index 3ae11a3..c0778e8 100644
    assert.deepEqual((await f.engine.state("one")).diaries![0], firstDiary);
    await assert.rejects(f.sessions.retryDiary("one"), /先启用/);
    await f.sessions.updateContext("one", { ...(await f.sessions.contextStatus("one")).policy, history_enabled: false });
+diff --git a/tests/model-config.test.ts b/tests/model-config.test.ts
+index a418b0b..9633f3f 100644
+--- a/tests/model-config.test.ts
++++ b/tests/model-config.test.ts
+@@ -598,7 +598,7 @@ test("legacy DeepSeek embedding mistakes stay visible and unchanged but cannot b
+   const invalid = snapshot.models.find(
+     (m: any) => m.id === "model_421e97a26ccc",
+   );
+-  assert.match(invalid.configuration_error, /DeepSeek 官方接口仅支持对话/);
++  assert.match(invalid.configuration_error, /DeepSeek 官方接口不提供 Embedding/);
+   assert.equal(invalid.provider, "selected");
+   const edit = f.input();
+   edit.providers[0].name = "修改另一提供商";
 diff --git a/tests/model-usage.test.ts b/tests/model-usage.test.ts
 index 03a97c7..a602ef4 100644
 --- a/tests/model-usage.test.ts
@@ -2130,6 +2393,23 @@ index 03a97c7..a602ef4 100644
    }
    close(details({ prompt_cache_hit_tokens: 750 }, { ...provider, model: "deepseek-v4-pro" }).cost!.amount!, 0.0025875);
    close(details({ prompt_cache_hit_tokens: 1, prompt_tokens: 1, completion_tokens: 0 }).cost!.amount!, 0.00000002);
+diff --git a/tests/plugin-model-connection.test.ts b/tests/plugin-model-connection.test.ts
+index 989e89a..d15c2cb 100644
+--- a/tests/plugin-model-connection.test.ts
++++ b/tests/plugin-model-connection.test.ts
+@@ -119,7 +119,11 @@ test("known service/type mismatches remain invalid for connection access", async
+   const f = await fixture(t);
+   await f.edit((disk) => { disk.providers[0].base_url = "https://api.deepseek.com/v1"; });
+   assert.throws(() => f.models.connection("embedding-config"), /DeepSeek/);
+-  assert.equal(f.models.list().length, 1);
++  // DeepSeek 官方只不提供 Embedding；对话与语音合成都可用，所以这里不再钉死数量。
++  const listed = f.models.list().map((m) => m.id);
++  assert.ok(!listed.includes("embedding-config"), "DeepSeek 不提供 Embedding，该项不可借用连接");
++  assert.ok(listed.includes("chat-config"));
++  assert.ok(listed.includes("tts-config"), "DeepSeek 的语音合成可用");
+   await f.edit((disk) => { disk.providers[0].base_url = "https://dashscope.aliyuncs.com/api/v1"; disk.providers[0].protocol = "dashscope"; });
+   assert.equal(f.models.connection("embedding-config").protocol, "dashscope");
+   assert.throws(() => f.models.connection("chat-config"), /DashScope/);
 diff --git a/tests/receipts.test.ts b/tests/receipts.test.ts
 new file mode 100644
 index 0000000..202b4f7
@@ -2248,6 +2528,199 @@ index 6b09d51..a36826a 100644
    assert.doesNotMatch(renderContextPanel(app), /400 \/ 200|仅供查看/);
    const compact = renderContextMeter(app.state.memoryContext, true);
    assert.match(compact, /chat-context-compact/);
+diff --git a/tests/tool-protocol-text.test.ts b/tests/tool-protocol-text.test.ts
+new file mode 100644
+index 0000000..737d93e
+--- /dev/null
++++ b/tests/tool-protocol-text.test.ts
+@@ -0,0 +1,187 @@
++import assert from "node:assert/strict";
++import { test } from "node:test";
++import { projectToolProtocolText, TOOL_TEXT_NOTICE } from "../core/tool-protocol-text.ts";
++
++const names = new Set(["hands_write", "read_archive"]);
++const marker = "｜｜DSML｜｜";
++const block = [
++  `<${marker} calls>`,
++  `<${marker} invoke name="hands_write">`,
++  `<${marker} parameter name="path" string="true">tmp/a.md</${marker} parameter>`,
++  `</${marker} invoke>`,
++  `</${marker} calls>`,
++].join("\n");
++const emptyInvoke = `<${marker}invoke name="read_archive"></${marker}invoke>`;
++const compact = `<${marker}tool_calls>${emptyInvoke}</${marker}tool_calls>`;
++const orphan = [
++  `<${marker}invoke name="hands_write">`,
++  `<${marker}parameter name="path" string="true">tmp/a.md</${marker}parameter>`,
++  `<${marker}parameter name="text" string="true">第一行\n第二行</${marker}parameter>`,
++  `</${marker}invoke>`,
++].join("\n");
++const rootClose = `</${marker}tool_calls>`;
++const typoOpen = `<${marker}toolcalls>`;
++const typoClose = `</${marker}toolcalls>`;
++
++test("both observed block spellings are replaced in place with adjacent bytes preserved", () => {
++  const windows = block.replaceAll("\n", "\r\n");
++  const before = "\t正文 <p> 保留</p>\r\n  ", between = "同一行的后文🙂\r", after = "\n\n尾注  ";
++  assert.equal(projectToolProtocolText(before + windows + between + compact + after, names),
++    before + TOOL_TEXT_NOTICE + between + TOOL_TEXT_NOTICE + after);
++});
++
++test("all invokes and each parameter must close with the same delimiter", () => {
++  const two = block.replace(`</${marker} invoke>`, `<${marker} parameter name="count" string="false">0</${marker} parameter>
++</${marker} invoke>${emptyInvoke}`);
++  for (const bars of ["｜", "||", "｜｜", "|"]) {
++    assert.equal(projectToolProtocolText(two.replaceAll(marker, bars + "DSML" + bars), names), TOOL_TEXT_NOTICE);
++  }
++  assert.equal(projectToolProtocolText(two, new Set(["hands_write"])), two);
++});
++
++test("unknown, partial or malformed markup survives verbatim", () => {
++  const inputs = [
++    "", "DSML calls", block.replaceAll("<", "").replaceAll(">", ""), block.slice(0, -1),
++    "工具示例 " + compact, "\\" + compact,
++    compact.replace(emptyInvoke, ""), compact.replace("read_archive", "other"),
++    block.replace(`</${marker} parameter>`, ""), block.replace(`</${marker} invoke>`, ""),
++    block.replace(`</${marker} calls>`, `</${marker}tool_calls>`),
++    block.replace(' name="hands_write"', ""), block.replace(' name="path"', ""),
++    block.replace(' string="true"', ' string="sometimes"'), block.replace("tmp/a.md", "<b>extra</b>"),
++    block.replace("path", "path\" stray=\"yes"), block.replace(marker, "｜DSML||"),
++    block.replace(`</${marker} parameter>`, "</|DSML| parameter>"),
++    block.replace(`</${marker} calls>`, `ordinary text</${marker} calls>`),
++    compact.replace("invoke", "invoke_more"), compact.replace("DSML", "dsml"),
++  ];
++  for (const input of inputs) assert.equal(projectToolProtocolText(input, names), input);
++});
++
++test("omitting historical tool definitions still requires a valid tool name and full structure", () => {
++  const historical = compact.replace("read_archive", "uninstalled_0");
++  assert.equal(projectToolProtocolText(historical), TOOL_TEXT_NOTICE);
++  assert.equal(projectToolProtocolText(historical, new Set()), historical);
++  for (const bad of ["", "x y", "x.js()", "a".repeat(65)]) {
++    const input = historical.replace("uninstalled_0", bad);
++    assert.equal(projectToolProtocolText(input), input);
++  }
++});
++
++test("fences, inline and multiline code, indented code, and quotes remain readable", () => {
++  const excerpts = [
++    ["````xml", block, "```", compact, "````"].join("\n"),
++    ["  ~~~", block, "  ~~~~  "].join("\n"),
++    ["引述双反引号 `` 内容", "`", block, "`` 结束"].join("\n"),
++    ["参见 `", compact + "`"].join("\n"),
++    ["> " + compact, compact].join("\n"), block.split("\n").map(l => "    " + l).join("\n"),
++    block.split("\n").map(l => "\t" + l).join("\n"), ["```", block].join("\n"),
++    ["- ```xml", "  " + compact, "  ```"].join("\n"),
++    ["1. 示例", "   > 引用", "   " + compact].join("\n"),
++  ];
++  for (const input of excerpts) assert.equal(projectToolProtocolText(input, names), input);
++  const closed = excerpts[0] + "\n", unmatched = "普通正文有一个未配对的 `\n";
++  assert.equal(projectToolProtocolText(closed + compact, names), closed + TOOL_TEXT_NOTICE);
++  assert.equal(projectToolProtocolText(unmatched + compact, names), unmatched + TOOL_TEXT_NOTICE);
++});
++
++test("an explicit literal example introduction protects an unfenced sample", () => {
++  for (const lead of ["下面给出一个示例：", "语法如下：", "例如，", "For example,", "Example:", "Here is the syntax:"]) {
++    const excerpt = lead + "\n\n" + block + "\n\n接下来调用工具。\n";
++    assert.equal(projectToolProtocolText(excerpt + compact, names), excerpt + TOOL_TEXT_NOTICE);
++  }
++});
++
++test("orphan invokes and the observed toolcalls spelling preserve surrounding prose in place", () => {
++  const variants = [
++    emptyInvoke, orphan, orphan + "\n" + rootClose,
++    [typoOpen, orphan, emptyInvoke, rootClose].join("\n"),
++    [typoOpen, orphan, emptyInvoke, typoClose].join("\n"),
++  ];
++  const before = "回复开头🙂\r\n  ";
++  for (const variant of variants) {
++    for (const after of ["同一行继续\t\r\n\r\n尾注  ", "\r\n\t保留缩进的尾注  "]) {
++      const input = before + variant.replaceAll("\n", "\r\n") + after;
++      assert.equal(projectToolProtocolText(input, names), before + TOOL_TEXT_NOTICE + after);
++    }
++  }
++});
++
++test("orphan and misspelled-root calls use offered names online and valid names in historical previews", () => {
++  for (const variant of [orphan, orphan + "\n" + rootClose, [typoOpen, orphan, rootClose].join("\n")]) {
++    const historical = variant.replace("hands_write", "old_tool-2");
++    assert.equal(projectToolProtocolText(historical), TOOL_TEXT_NOTICE);
++    assert.equal(projectToolProtocolText(historical, names), historical);
++    assert.equal(projectToolProtocolText(variant, new Set()), variant);
++    for (const invalid of ["", "bad/name", "x".repeat(65)]) {
++      const input = variant.replace("hands_write", invalid);
++      assert.equal(projectToolProtocolText(input), input);
++    }
++  }
++});
++
++test("unsupported endings, incomplete invokes and rejected outer blocks survive as a whole", () => {
++  const callsClose = `</${marker}calls>`;
++  const unknown = orphan.replace("hands_write", "other");
++  const malformed = orphan.replace(`</${marker}parameter>`, `</${marker}param>`);
++  const rejected = [
++    orphan + "\n" + callsClose, orphan + "\n" + typoClose,
++    orphan + "\n" + rootClose.replaceAll(marker, "|DSML|"),
++    malformed, orphan.replace(`</${marker}invoke>`, ""),
++    orphan.replace(' name="hands_write"', ' name="hands_write" extra="yes"'),
++    [typoOpen, emptyInvoke, unknown, rootClose].join("\n"),
++    [typoOpen, malformed, emptyInvoke, rootClose].join("\n"),
++    [typoOpen, emptyInvoke, callsClose].join("\n"),
++    [`<${marker}tool_calls>`, emptyInvoke, typoClose].join("\n"),
++    [`<${marker}tool_call>`, emptyInvoke, rootClose].join("\n"),
++    [typoOpen, emptyInvoke].join("\n"),
++    [typoOpen, emptyInvoke, rootClose.replaceAll(marker, "|DSML|")].join("\n"),
++  ];
++  const tail = "\r\n\r\n正常正文继续。\r\n";
++  for (const text of rejected) {
++    assert.equal(projectToolProtocolText(text + tail + compact, names), text + tail + TOOL_TEXT_NOTICE);
++  }
++});
++
++test("new variants remain literal inside Markdown code and quotation contexts", () => {
++  for (const variant of [orphan, orphan + "\n" + rootClose, [typoOpen, emptyInvoke, rootClose].join("\n")]) {
++    const excerpts = [
++      ["```xml", variant, "```"].join("\n"),
++      ["~~~", variant, "~~~"].join("\n"),
++      ["<pre><code>", variant, "</code></pre>"].join("\n"),
++      ["语法写作 ``", variant, "``。"].join("\n"),
++      "> 引用中的下一行\n" + variant,
++      variant.split("\n").map(line => "    " + line).join("\n"),
++      ["- ```xml", ...variant.split("\n").map(line => "  " + line), "  ```"].join("\n"),
++      "正文提及 " + variant,
++    ];
++    for (const excerpt of excerpts) {
++      const prefix = excerpt + "\n\n结束引述。\n";
++      assert.equal(projectToolProtocolText(prefix + variant, names), prefix + TOOL_TEXT_NOTICE);
++    }
++  }
++  for (const code of [emptyInvoke, rootClose]) {
++    const suffix = "\n\n    " + code;
++    assert.equal(projectToolProtocolText(orphan + suffix, names), TOOL_TEXT_NOTICE + suffix);
++  }
++  const fencedOpening = ["```xml", `<${marker}tool_calls>`, "```", "继续处理。", ""].join("\n");
++  assert.equal(projectToolProtocolText(fencedOpening + orphan + "\n" + rootClose, names),
++    fencedOpening + TOOL_TEXT_NOTICE);
++});
++
++test("all invokes in an explicitly introduced unfenced example remain literal", () => {
++  for (const example of [
++    [emptyInvoke, emptyInvoke].join("\n"),
++    [orphan, emptyInvoke, rootClose].join("\n"),
++    [typoOpen, orphan, emptyInvoke, rootClose].join("\n"),
++  ]) {
++    const prefix = "For example,\n\n" + example + "\n\n接下来调用工具。\n";
++    assert.equal(projectToolProtocolText(prefix + orphan, names), prefix + TOOL_TEXT_NOTICE);
++  }
++});
++
++test("malformed repeated roots, unterminated parameters and long fence runs keep later prose", () => {
++  const unfinished = block.slice(0, block.indexOf("tmp/a.md")) + "x".repeat(128) + "\n";
++  const text = unfinished.repeat(5000) + "`".repeat(20000) + "\u2028x\n";
++  assert.equal(projectToolProtocolText(text, names), text);
++  const broken = `<${marker}calls>\n`.repeat(10000);
++  assert.equal(projectToolProtocolText(broken + compact, names), broken + TOOL_TEXT_NOTICE);
++});
 diff --git a/tests/tool-protocol.test.ts b/tests/tool-protocol.test.ts
 new file mode 100644
 index 0000000..1e75a96
