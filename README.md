@@ -8,6 +8,25 @@
 
 成品插件在另一个库：[`whalelife-mod-personal`](https://github.com/SSSSmallSlimeSmile/whalelife-mod-personal)
 
+> ### 强烈推荐安装前端渲染组件
+>
+> 就是 `packages/02-frontend.patch`（只改 `core/ui/` 六个文件，不碰后端）。
+>
+> **不装**：聊天页只认纯文本，模型回一张表格，你看到的是满屏竖线；粗体、标题、列表、代码块、链接全是原样符号。
+> **装上**：Markdown 表格、标题、列表、引用、分割线、链接、粗斜体、行内代码、代码围栏都在页面上正常显示。
+>
+> 顺带还带了三样用着舒服的：
+>
+> - 思考中的颜文字提示，不再是干等
+> - 左侧会话栏的等距刻度与悬浮卡
+> - 回复前的念话按钮（喇叭图标）
+>
+> 聊天里回表格、贴代码是常事，不装就是看着难受。
+>
+> **注意**：它和 `01-functional.patch` 不重叠，可以单独 apply；如果只想要界面好看、不动后端，只装这一份就行。
+
+---
+
 **不是 WhaleLife 官方项目。** 上游是 [`iinukami/whalelife`](https://github.com/iinukami/whalelife)，AGPL-3.0 加附加条款，原文在 `上游许可/`。
 
 ---
